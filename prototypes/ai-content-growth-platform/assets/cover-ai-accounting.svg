@@ -1,0 +1,19 @@
+<svg width="960" height="540" viewBox="0 0 960 540" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="960" height="540" fill="#10232B"/>
+  <rect x="56" y="52" width="848" height="436" rx="28" fill="#F5F8F7"/>
+  <rect x="88" y="84" width="360" height="372" rx="22" fill="#FFFFFF" stroke="#D7E2E2" stroke-width="3"/>
+  <rect x="124" y="122" width="180" height="24" rx="12" fill="#2FB6A3"/>
+  <rect x="124" y="172" width="270" height="18" rx="9" fill="#D7E2E2"/>
+  <rect x="124" y="212" width="230" height="18" rx="9" fill="#D7E2E2"/>
+  <rect x="124" y="252" width="300" height="18" rx="9" fill="#D7E2E2"/>
+  <rect x="124" y="326" width="92" height="82" rx="14" fill="#F2B84B"/>
+  <rect x="240" y="296" width="92" height="112" rx="14" fill="#2FB6A3"/>
+  <rect x="356" y="260" width="92" height="148" rx="14" fill="#10232B"/>
+  <circle cx="680" cy="236" r="112" fill="#2FB6A3"/>
+  <circle cx="680" cy="236" r="72" fill="#F5F8F7"/>
+  <path d="M635 236h90M680 191v90" stroke="#10232B" stroke-width="18" stroke-linecap="round"/>
+  <path d="M560 386c34-42 74-63 120-63s86 21 120 63" stroke="#10232B" stroke-width="22" stroke-linecap="round"/>
+  <text x="520" y="124" fill="#10232B" font-family="Arial, sans-serif" font-size="42" font-weight="800">AI 记账</text>
+  <text x="520" y="178" fill="#10232B" font-family="Arial, sans-serif" font-size="34" font-weight="700">先改造最重复的财务工作</text>
+  <text x="520" y="438" fill="#5A6B70" font-family="Arial, sans-serif" font-size="24">给小微企业老板的财务效率提醒</text>
+</svg>

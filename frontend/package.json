@@ -1,0 +1,28 @@
+{
+  "name": "ai-content-growth-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "max dev",
+    "build": "max build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@ant-design/icons": "^5.5.2",
+    "@umijs/max": "^4.4.12",
+    "antd": "^5.22.7",
+    "dayjs": "^1.11.13",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.1.0",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

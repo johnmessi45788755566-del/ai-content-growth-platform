@@ -1,0 +1,568 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 新媒体工作平台原型</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <div class="brand">
+          <div class="brand-mark">AI</div>
+          <div>
+            <strong>新媒体工作平台</strong>
+            <span>产品原型 v0.2</span>
+          </div>
+        </div>
+
+        <nav class="nav-list">
+          <button class="nav-item active" data-view="hotspots">热点话题推荐</button>
+          <button class="nav-item" data-view="ai-topic">AI 选题</button>
+          <button class="nav-item" data-view="creation">内容创作</button>
+          <button class="nav-item" data-view="tasks">任务中心</button>
+          <button class="nav-item" data-view="drafts">草稿箱</button>
+          <button class="nav-item" data-view="review">数据复盘</button>
+          <button class="nav-item" data-view="accounts">账号管理</button>
+        </nav>
+
+        <div class="tenant-box">
+          <span class="eyebrow">当前组织</span>
+          <strong>好财集团内容团队</strong>
+          <p>已接入：公众号、小红书、视频号、抖音</p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+
+        <section class="view active" id="view-hotspots">
+          <div class="section-heading">
+          </div>
+
+          <div class="tabs">
+            <button class="tab active">推荐</button>
+            <button class="tab">政务</button>
+            <button class="tab">教育</button>
+            <button class="tab">科技</button>
+            <button class="tab">法律</button>
+            <button class="tab">医疗</button>
+            <button class="tab">新闻媒体</button>
+            <button class="tab">旅游</button>
+            <button class="tab custom-industry" data-action="custom-industry">自定义行业</button>
+          </div>
+
+          <div class="layout-two">
+            <div class="panel">
+              <div class="panel-title">
+                <h3>各行业最近热点</h3>
+                <span>选择热点后先确认标题，再进入内容创作</span>
+              </div>
+              <div class="topic-list">
+                <article class="topic-card selected">
+                  <div class="rank">1</div>
+                  <div class="topic-main">
+                    <h4>AI 正在重塑小微企业财务效率</h4>
+                    <p>企业服务 / 适合公众号文章 / 可引出 AI 记账自动化。</p>
+                    <div class="meta-row">
+                      <span>热度 92</span>
+                      <span>转化 91</span>
+                      <span>风险 低</span>
+                    </div>
+                  </div>
+                  <button class="small-button">确认标题</button>
+                </article>
+
+                <article class="topic-card">
+                  <div class="rank">2</div>
+                  <div class="topic-main">
+                    <h4>暑期公共服务预约量增长</h4>
+                    <p>政务 / 适合攻略型文章 / 可做流程提醒和避坑清单。</p>
+                    <div class="meta-row">
+                      <span>热度 89</span>
+                      <span>转化 72</span>
+                      <span>风险 中</span>
+                    </div>
+                  </div>
+                  <button class="small-button">确认标题</button>
+                </article>
+
+                <article class="topic-card">
+                  <div class="rank">3</div>
+                  <div class="topic-main">
+                    <h4>AI 工具进入中小企业日常经营</h4>
+                    <p>科技 / 适合观点型文章 / 可引出老板的 AI 认知焦虑。</p>
+                    <div class="meta-row">
+                      <span>热度 84</span>
+                      <span>转化 86</span>
+                      <span>风险 低</span>
+                    </div>
+                  </div>
+                  <button class="small-button">确认标题</button>
+                </article>
+              </div>
+            </div>
+
+            <aside class="panel detail-panel">
+              <div class="score-ring">
+                <strong>86</strong>
+                <span>推荐分</span>
+              </div>
+              <h3>标题确认</h3>
+              <label>推荐标题</label>
+              <input value="为什么小微企业老板应该先用 AI 改造记账" />
+              <label>标题方向</label>
+              <input value="AI 焦虑 + 财务降本 + 小微企业老板" />
+              <button class="primary-button full-width">确定标题并创作</button>
+              <dl class="detail-list">
+                <div>
+                  <dt>共同出口</dt>
+                  <dd>热点话题推荐和 AI 选题都会先汇合到标题确认，再进入内容创作。</dd>
+                </div>
+              </dl>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="view-ai-topic">
+          <div class="section-heading"></div>
+
+          <div class="chat-layout">
+            <section class="panel chat-panel">
+              <h3>和 AI 说明你想写什么</h3>
+              <div class="chat-message assistant">
+                <strong>AI</strong>
+                <p>你想写给谁看？希望读者看完做什么？有没有要推广的产品或服务？</p>
+              </div>
+              <div class="chat-message user">
+                <strong>用户</strong>
+                <p>我想写给小微企业老板看，希望他们对 AI 记账感兴趣，后续私信进群。</p>
+              </div>
+              <div class="chat-message assistant">
+                <strong>AI</strong>
+                <p>我会围绕“AI 焦虑、财务人力成本、票据流水自动化”给你推荐选题。</p>
+              </div>
+              <div class="chat-input-row">
+                <input value="继续补充：文章要更偏焦虑、干货还是案例？" />
+                <button class="primary-button">发送</button>
+              </div>
+            </section>
+
+            <section class="panel">
+              <h3>AI 推荐话题</h3>
+              <div class="option-card selected">
+                <strong>为什么小微企业老板应该先用 AI 改造记账</strong>
+                <p>推荐理由：能把 AI 焦虑落到财务成本和经营效率。</p>
+                <button class="small-button">确认标题</button>
+              </div>
+              <div class="option-card">
+                <strong>发票、流水、账本三件事，正在被 AI 重新做一遍</strong>
+                <p>推荐理由：适合讲清楚自动化路径，降低理解门槛。</p>
+                <button class="small-button">确认标题</button>
+              </div>
+              <div class="option-card">
+                <strong>小微企业财务自动化，从这 5 个环节开始</strong>
+                <p>推荐理由：清单型文章更适合收藏和转发。</p>
+                <button class="small-button">确认标题</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-creation">
+          <div class="section-heading"></div>
+
+          <div class="workflow-strip">
+            <div class="step done">标题确认</div>
+            <div class="step active">生成文章</div>
+            <div class="step">生成图片</div>
+            <div class="step">文章排版</div>
+            <div class="step">发布</div>
+          </div>
+
+          <div class="autosave-note">每一步都会实时自动保存到草稿箱，可从草稿恢复到对应步骤继续创作。</div>
+
+          <div class="creation-stage active" data-stage-panel="article">
+            <section class="panel editor-panel">
+              <h3>公众号文章创作</h3>
+              <label>已确认标题</label>
+              <input value="为什么小微企业老板应该先用 AI 改造记账" />
+              <div class="paragraph-list">
+                <section class="paragraph-card">
+                  <span>第 1 段 / 开头钩子</span>
+                  <textarea>很多小微企业老板已经感受到，AI 不是遥远概念，而是在改变企业里最重复、最耗人力的工作。</textarea>
+                </section>
+                <section class="paragraph-card">
+                  <span>第 2 段 / 痛点放大</span>
+                  <textarea>财务人力成本高、票据流水处理慢、月底才知道盈亏，这些问题单独看不大，但每个月都会消耗老板的时间和现金流。</textarea>
+                </section>
+                <section class="paragraph-card">
+                  <span>第 3 段 / 解决路径</span>
+                  <textarea>财务记账适合先被 AI 改造，因为票据、流水、分类、对账都有清晰流程。老板不需要先做复杂系统升级，可以先从高频重复环节开始。</textarea>
+                </section>
+                <section class="paragraph-card">
+                  <span>第 4 段 / 结尾 CTA</span>
+                  <textarea>如果你也想了解 AI 记账怎么帮小微企业省人省钱，可以私信关键词【AI记账】，我们邀请你进入老板 AI 咨询群。</textarea>
+                </section>
+              </div>
+              <div class="step-nav-row">
+                <button class="secondary-button" data-action="prev-creation-step">上一步</button>
+                <button class="primary-button full-width" data-action="next-creation-step">文章完成，生成图片</button>
+              </div>
+            </section>
+          </div>
+
+          <div class="creation-stage" data-stage-panel="images">
+            <section class="panel">
+              <h3>图片生成</h3>
+              <p class="muted-copy">基于已生成文章统一生成封面图和正文配图。点击"重新生图"将在右侧追加新图片，勾选你想使用的图片。</p>
+
+              <div class="image-section">
+                <div class="image-section-header">
+                  <h4>公众号封面图</h4>
+                  <button class="secondary-button" data-action="regenerate-image" data-type="cover">重新生图</button>
+                </div>
+                <div class="image-gallery" data-gallery="cover">
+                  <div class="image-thumb selected">
+                    <img src="./assets/cover-ai-accounting.svg" alt="封面图方案1" />
+                    <div class="thumb-check">&#10003;</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="image-section">
+                <div class="image-section-header">
+                  <h4>正文配图</h4>
+                  <button class="secondary-button" data-action="regenerate-image" data-type="inline">重新生图</button>
+                </div>
+                <div class="image-gallery" data-gallery="inline">
+                  <div class="image-thumb selected">
+                    <img src="./assets/inline-cost.svg" alt="正文配图方案1" />
+                    <div class="thumb-check">&#10003;</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="step-nav-row">
+                <button class="secondary-button" data-action="prev-creation-step">上一步</button>
+                <button class="primary-button full-width" data-action="next-creation-step">图片完成，进入文章排版</button>
+              </div>
+            </section>
+          </div>
+
+          <div class="creation-stage" data-stage-panel="layout">
+            <div class="layout-editor-grid">
+              <section class="panel layout-edit-panel">
+                <h3>编辑排版</h3>
+                <div class="layout-section-list">
+                  <div class="layout-section-item" data-section="title">
+                    <div class="section-item-head">
+                      <span class="section-label">标题</span>
+                      <div class="section-move-btns">
+                        <button class="ghost-icon-btn" data-action="move-section-up" title="上移">&#9650;</button>
+                        <button class="ghost-icon-btn" data-action="move-section-down" title="下移">&#9660;</button>
+                      </div>
+                    </div>
+                    <input value="为什么小微企业老板应该先用 AI 改造记账" />
+                  </div>
+                  <div class="layout-section-item" data-section="intro">
+                    <div class="section-item-head">
+                      <span class="section-label">引言</span>
+                      <div class="section-move-btns">
+                        <button class="ghost-icon-btn" data-action="move-section-up" title="上移">&#9650;</button>
+                        <button class="ghost-icon-btn" data-action="move-section-down" title="下移">&#9660;</button>
+                      </div>
+                    </div>
+                    <textarea rows="3">很多小微企业老板已经感受到，AI 不是遥远概念，而是在改变企业里最重复、最耗人力的工作。</textarea>
+                  </div>
+                  <div class="layout-section-item" data-section="body1">
+                    <div class="section-item-head">
+                      <span class="section-label">正文 1 / 痛点放大</span>
+                      <div class="section-move-btns">
+                        <button class="ghost-icon-btn" data-action="move-section-up" title="上移">&#9650;</button>
+                        <button class="ghost-icon-btn" data-action="move-section-down" title="下移">&#9660;</button>
+                      </div>
+                    </div>
+                    <textarea rows="4">财务人力成本高、票据流水处理慢、月底才知道盈亏，这些问题单独看不大，但每个月都会消耗老板的时间和现金流。</textarea>
+                    <div class="section-img-row">
+                      <img src="./assets/inline-cost.svg" alt="配图" />
+                      <span>正文配图</span>
+                    </div>
+                  </div>
+                  <div class="layout-section-item" data-section="body2">
+                    <div class="section-item-head">
+                      <span class="section-label">正文 2 / 解决路径</span>
+                      <div class="section-move-btns">
+                        <button class="ghost-icon-btn" data-action="move-section-up" title="上移">&#9650;</button>
+                        <button class="ghost-icon-btn" data-action="move-section-down" title="下移">&#9660;</button>
+                      </div>
+                    </div>
+                    <textarea rows="4">财务记账适合先被 AI 改造，因为票据、流水、分类、对账都有清晰流程。老板不需要先做复杂系统升级，可以先从高频重复环节开始。</textarea>
+                    <div class="section-img-row">
+                      <img src="./assets/inline-flow.svg" alt="配图" />
+                      <span>正文配图</span>
+                    </div>
+                  </div>
+                  <div class="layout-section-item" data-section="cta">
+                    <div class="section-item-head">
+                      <span class="section-label">结尾 CTA</span>
+                      <div class="section-move-btns">
+                        <button class="ghost-icon-btn" data-action="move-section-up" title="上移">&#9650;</button>
+                        <button class="ghost-icon-btn" data-action="move-section-down" title="下移">&#9660;</button>
+                      </div>
+                    </div>
+                    <textarea rows="2">如果你也想了解 AI 记账怎么帮小微企业省人省钱，可以私信关键词【AI记账】，我们邀请你进入老板 AI 咨询群。</textarea>
+                  </div>
+                </div>
+                <div class="step-nav-row">
+                  <button class="secondary-button" data-action="prev-creation-step">上一步</button>
+                  <button class="primary-button full-width" data-action="next-creation-step">排版完成，准备发布</button>
+                </div>
+              </section>
+
+              <section class="panel preview-panel">
+                <h3>排版预览</h3>
+                <article class="article-preview" id="layout-preview">
+                  <img src="./assets/cover-ai-accounting.svg" alt="封面图预览" />
+                  <h4>为什么小微企业老板应该先用 AI 改造记账</h4>
+                  <p class="preview-intro">很多小微企业老板已经感受到，AI 不是遥远概念，而是在改变企业里最重复、最耗人力的工作。</p>
+                  <img src="./assets/inline-cost.svg" alt="正文配图一预览" />
+                  <p>财务人力成本高、票据流水处理慢、月底才知道盈亏，这些问题每个月都会消耗老板的时间和现金流。</p>
+                  <img src="./assets/inline-flow.svg" alt="正文配图二预览" />
+                  <p>财务记账适合先被 AI 改造，因为票据、流水、分类、对账都有清晰流程。</p>
+                  <p class="preview-cta">私信关键词【AI记账】，邀请进老板 AI 咨询群。</p>
+                </article>
+              </section>
+            </div>
+          </div>
+
+          <div class="creation-stage" data-stage-panel="publish">
+            <section class="panel publish-panel">
+              <h3>发布确认</h3>
+              <p>文章、图片和排版已完成。请选择发布平台和账号后一键发布。</p>
+              <div class="publish-select-row">
+                <div class="publish-select-group">
+                  <label>发布平台</label>
+                  <select id="publish-platform">
+                    <option>微信公众号</option>
+                    <option>小红书</option>
+                    <option>视频号</option>
+                    <option>抖音</option>
+                    <option>全平台</option>
+                  </select>
+                </div>
+                <div class="publish-select-group">
+                  <label>发布账号</label>
+                  <select id="publish-account">
+                    <option>AI 记账工具公众号</option>
+                    <option>好财 AI 助手</option>
+                    <option>好财集团视频号</option>
+                    <option>好财 AI 记账</option>
+                  </select>
+                </div>
+              </div>
+              <div class="step-nav-row">
+                <button class="secondary-button" data-action="prev-creation-step">上一步</button>
+                <button class="primary-button full-width" data-action="next-creation-step">一键发布</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-tasks">
+          <div class="section-heading">
+            <button class="secondary-button">新建定时任务</button>
+          </div>
+
+          <div class="panel">
+            <h3>后续定时任务</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>任务</th>
+                  <th>平台</th>
+                  <th>频率</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>每日抓取行业热点</td>
+                  <td>全平台</td>
+                  <td>每天 09:00</td>
+                  <td><span class="status muted">预留</span></td>
+                </tr>
+                <tr>
+                  <td>每周生成选题池</td>
+                  <td>公众号</td>
+                  <td>每周一 10:00</td>
+                  <td><span class="status muted">预留</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="view" id="view-drafts">
+          <div class="section-heading">
+            <div class="filter-row">
+              <input type="date" value="2026-07-01" data-role="draft-start" />
+              <span class="filter-sep">至</span>
+              <input type="date" value="2026-07-02" data-role="draft-end" />
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>保存的创作状态</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>标题</th>
+                  <th>平台</th>
+                  <th>保存阶段</th>
+                  <th>更新时间</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>为什么小微企业老板应该先用 AI 改造记账</td>
+                  <td>微信公众号</td>
+                  <td><span class="status">文章已完成，待生成图片</span></td>
+                  <td>2026-07-02 14:20</td>
+                  <td><button class="small-button" data-action="restore-draft" data-index="0">编辑</button></td>
+                </tr>
+                <tr>
+                  <td>小微企业财务自动化，从这 5 个环节开始</td>
+                  <td>微信公众号</td>
+                  <td><span class="status muted">标题已确认</span></td>
+                  <td>2026-07-01 18:10</td>
+                  <td><button class="small-button" data-action="restore-draft" data-index="1">编辑</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="view" id="view-review">
+          <div class="section-heading">
+            <div class="filter-row">
+              <select>
+                <option>全部平台</option>
+                <option>微信公众号</option>
+                <option>小红书</option>
+                <option>视频号</option>
+                <option>抖音</option>
+              </select>
+              <select>
+                <option>按账号查看</option>
+                <option>按作品查看</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="metrics-grid">
+            <div class="metric-card">
+              <span>阅读/播放</span>
+              <strong>12,800</strong>
+            </div>
+            <div class="metric-card">
+              <span>互动</span>
+              <strong>936</strong>
+            </div>
+            <div class="metric-card">
+              <span>转发/分享</span>
+              <strong>214</strong>
+            </div>
+            <div class="metric-card">
+              <span>私信/线索</span>
+              <strong>46</strong>
+            </div>
+          </div>
+
+          <div class="layout-two">
+            <section class="panel">
+              <h3>账号数据</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>账号</th>
+                    <th>平台</th>
+                    <th>作品数</th>
+                    <th>线索</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>AI 记账工具公众号</td>
+                    <td>微信公众号</td>
+                    <td>8</td>
+                    <td>32</td>
+                  </tr>
+                  <tr>
+                    <td>好财 AI 助手</td>
+                    <td>小红书</td>
+                    <td>12</td>
+                    <td>9</td>
+                  </tr>
+                </tbody>
+              </table>
+            </section>
+
+            <section class="panel">
+              <h3>作品复盘</h3>
+              <ul class="learning-list">
+                <li>公众号文章适合看阅读、转发、私信关键词。</li>
+                <li>小红书重点看收藏、评论和私信。</li>
+                <li>视频号和抖音重点看播放、完播、评论和转发。</li>
+              </ul>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="view-accounts">
+          <div class="section-heading">
+            <button class="primary-button">添加账号</button>
+          </div>
+
+          <div class="account-grid">
+            <article class="account-card">
+              <strong>微信公众号</strong>
+              <p>AI 记账工具公众号</p>
+              <div class="account-actions">
+                <button class="secondary-button">编辑</button>
+                <button class="ghost-button">删除</button>
+              </div>
+            </article>
+            <article class="account-card">
+              <strong>小红书</strong>
+              <p>好财 AI 助手</p>
+              <div class="account-actions">
+                <button class="secondary-button">编辑</button>
+                <button class="ghost-button">删除</button>
+              </div>
+            </article>
+            <article class="account-card">
+              <strong>视频号</strong>
+              <p>好财集团视频号</p>
+              <div class="account-actions">
+                <button class="secondary-button">编辑</button>
+                <button class="ghost-button">删除</button>
+              </div>
+            </article>
+            <article class="account-card">
+              <strong>抖音</strong>
+              <p>好财 AI 记账</p>
+              <div class="account-actions">
+                <button class="secondary-button">编辑</button>
+                <button class="ghost-button">删除</button>
+              </div>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

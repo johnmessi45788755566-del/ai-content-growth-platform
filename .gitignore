@@ -1,0 +1,26 @@
+.DS_Store
+
+# dependencies
+.pnpm-store/
+node_modules/
+
+# build output
+dist/
+build/
+frontend/src/.umi/
+frontend/src/.umi-production/
+
+# environment
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# local data / uploads
+backend/data/*.db
+backend/uploads/
+.superpowers/
