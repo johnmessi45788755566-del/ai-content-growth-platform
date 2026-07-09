@@ -10,14 +10,26 @@ import type {
 
 export const API_BASE = process.env.UMI_APP_API_BASE || 'http://127.0.0.1:8000';
 
+export function formatApiError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  if (/failed to fetch|load failed|networkerror|fetch/i.test(message)) {
+    return '后端服务未启动或不可访问，请先启动 127.0.0.1:8000 后端服务。';
+  }
+  return message || '接口请求失败';
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options,
-  });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.detail || '接口请求失败');
-  return data as T;
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      ...options,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || '接口请求失败');
+    return data as T;
+  } catch (error) {
+    throw new Error(formatApiError(error));
+  }
 }
 
 export function assetUrl(url = '') {

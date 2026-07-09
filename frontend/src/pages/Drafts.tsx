@@ -1,4 +1,4 @@
-import { Button, Card, DatePicker, message, Popconfirm, Space, Table } from 'antd';
+import { Alert, Button, Card, DatePicker, message, Popconfirm, Space, Table } from 'antd';
 import { useEffect, useState } from 'react';
 import { MetricCards, Status } from '@/components/Common';
 import { api } from '@/services/api';
@@ -16,6 +16,7 @@ export default function Drafts() {
   const [drafts, setDrafts] = useState<Draft[]>([]);
   const [loading, setLoading] = useState(false);
   const [dates, setDates] = useState<[string, string]>(['', '']);
+  const [loadError, setLoadError] = useState('');
 
   async function loadDrafts() {
     setLoading(true);
@@ -25,8 +26,11 @@ export default function Drafts() {
       if (dates[1]) params.set('end_date', dates[1]);
       const data = await api.drafts(params);
       setDrafts(data.drafts || []);
+      setLoadError('');
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '读取草稿失败');
+      const text = error instanceof Error ? error.message : '读取草稿失败';
+      setLoadError(text);
+      message.error(text);
     } finally {
       setLoading(false);
     }
@@ -60,6 +64,7 @@ export default function Drafts() {
         title="内容创作草稿"
         extra={<span className="muted">内容创作任一步骤完成后都会自动保存到草稿箱。</span>}
       >
+        {loadError && <Alert className="block-gap" type="warning" showIcon message={loadError} />}
         <div className="toolbar">
           <Space wrap>
             <DatePicker placeholder="开始日期" onChange={(_, date) => setDates((prev) => [String(date || ''), prev[1]])} />

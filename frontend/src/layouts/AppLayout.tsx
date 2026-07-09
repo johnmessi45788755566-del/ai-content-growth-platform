@@ -40,9 +40,9 @@ export default function AppLayout() {
     <Layout className="app-shell">
       <Sider width={232} className="sidebar" theme="light">
         <div className="brand">
-          <div className="brand-mark">矩</div>
+          <div className="brand-mark">新</div>
           <div>
-            <strong>矩阵工作台</strong>
+            <strong>新媒体工作台</strong>
             <span>AI 内容运营</span>
           </div>
         </div>
@@ -55,10 +55,6 @@ export default function AppLayout() {
           }}
           className="main-menu"
         />
-        <div className="sidebar-footer">
-          <span>当前企业</span>
-          <strong>好财 AI 运营组</strong>
-        </div>
       </Sider>
       <Layout className="main">
         <Header className="topbar">

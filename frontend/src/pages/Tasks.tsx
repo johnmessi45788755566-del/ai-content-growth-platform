@@ -1,4 +1,4 @@
-import { Button, DatePicker, Drawer, Form, Input, message, Modal, Popconfirm, Select, Space, Table, TimePicker } from 'antd';
+import { Alert, Button, DatePicker, Drawer, Form, Input, message, Modal, Popconfirm, Select, Space, Table, TimePicker } from 'antd';
 import dayjs from 'dayjs';
 import { useEffect, useMemo, useState } from 'react';
 import { Detail, Platform, Status } from '@/components/Common';
@@ -49,6 +49,7 @@ export default function Tasks() {
   const [detailTask, setDetailTask] = useState<ScheduledTask | null>(null);
   const [retryMode, setRetryMode] = useState(false);
   const [selectedRetryIds, setSelectedRetryIds] = useState<number[]>([]);
+  const [loadError, setLoadError] = useState('');
 
   async function loadTasks() {
     setLoading(true);
@@ -59,8 +60,11 @@ export default function Tasks() {
       if (search) params.set('q', search);
       const data = await api.tasks(params);
       setTasks(data.tasks || []);
+      setLoadError('');
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '读取任务失败');
+      const text = error instanceof Error ? error.message : '读取任务失败';
+      setLoadError(text);
+      message.error(text);
     } finally {
       setLoading(false);
     }
@@ -148,6 +152,7 @@ export default function Tasks() {
   return (
     <>
       <div className="panel task-list-panel">
+        {loadError && <Alert className="block-gap" type="warning" showIcon message={loadError} />}
         <div className="toolbar">
           <Space wrap>
             <Select value={status} style={{ width: 150 }} onChange={setStatus} options={[

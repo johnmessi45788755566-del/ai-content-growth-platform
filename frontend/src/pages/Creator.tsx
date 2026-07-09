@@ -258,29 +258,41 @@ export default function Creator() {
       {step === 'title' && (
         <Card className="panel creator-chat" title="和 AI 说明你想写什么">
           <div className="chat-body">
-            {topicPrompt && <div className="chat-message user"><strong>用户</strong><p>{topicPrompt}</p></div>}
+            {!topicPrompt && !topicDirections.length && loading !== 'topics' && (
+              <div className="chat-message assistant">
+                <strong>AI 助手</strong>
+                <p>告诉我你想写什么内容、目标客户是谁、产品卖点是什么、希望读者看完做什么。我会先给你推荐选题方向和标题。</p>
+              </div>
+            )}
+            {topicPrompt && <div className="chat-message user"><strong>你</strong><p>{topicPrompt}</p></div>}
             {loading === 'topics' ? (
-              <Spin tip="正在生成选题方向和标题..." />
+              <div className="chat-message assistant">
+                <Spin size="small" />
+                <p>正在生成选题方向和标题...</p>
+              </div>
             ) : topicDirections.length ? (
-              topicDirections.map((direction) => (
-                <section className="topic-direction-card" key={direction.direction}>
-                  <h3>{direction.direction}</h3>
-                  <p className="muted">{direction.subtitle}</p>
-                  <div className="title-suggestions">
-                    {(direction.titles || []).map((title) => (
-                      <Button key={title} className="suggestion-card" onClick={() => confirmTitle(title, direction.direction)}>
-                        <span>推荐标题</span>
-                        <strong>{title}</strong>
-                      </Button>
-                    ))}
-                  </div>
-                </section>
-              ))
+              <div className="chat-message assistant wide">
+                <strong>AI 推荐选题</strong>
+                {topicDirections.map((direction) => (
+                  <section className="topic-direction-card" key={direction.direction}>
+                    <h3>{direction.direction}</h3>
+                    <p className="muted">{direction.subtitle}</p>
+                    <div className="title-suggestions">
+                      {(direction.titles || []).map((title) => (
+                        <Button key={title} className="suggestion-card" onClick={() => confirmTitle(title, direction.direction)}>
+                          <span>推荐标题</span>
+                          <strong>{title}</strong>
+                        </Button>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
             ) : (
-              <Empty description="输入你想写的内容、目标客户、产品卖点和转化目标，AI 会在这里生成选题方向和标题。" />
+              null
             )}
           </div>
-          <Space.Compact>
+          <Space.Compact className="chat-input-bar">
             <Input value={topicPrompt} onChange={(event) => setTopicPrompt(event.target.value)} placeholder="例如：写给本地餐饮老板，介绍暑期套餐如何提升到店复购" />
             <Button type="primary" loading={loading === 'topics'} onClick={generateTopics}>发送</Button>
           </Space.Compact>
