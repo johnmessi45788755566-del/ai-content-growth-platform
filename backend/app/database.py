@@ -72,10 +72,74 @@ class Database:
                 CREATE TABLE IF NOT EXISTS publish_packages (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
+                  account_id INTEGER,
                   platform TEXT NOT NULL,
                   account_name TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
                   status TEXT NOT NULL DEFAULT 'pending_publish',
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS platform_accounts (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  platform TEXT NOT NULL,
+                  name TEXT NOT NULL,
+                  external_id TEXT NOT NULL DEFAULT '',
+                  owner TEXT NOT NULL DEFAULT '未分配',
+                  tag TEXT NOT NULL DEFAULT '',
+                  auth_status TEXT NOT NULL DEFAULT '已授权',
+                  monitor_status TEXT NOT NULL DEFAULT '监测中',
+                  sync_status TEXT NOT NULL DEFAULT '已同步',
+                  role TEXT NOT NULL DEFAULT '',
+                  audience TEXT NOT NULL DEFAULT '',
+                  style TEXT NOT NULL DEFAULT '',
+                  taboo TEXT NOT NULL DEFAULT '',
+                  preference TEXT NOT NULL DEFAULT '',
+                  auth_method TEXT NOT NULL DEFAULT '扫码授权',
+                  qr_url TEXT NOT NULL DEFAULT '',
+                  last_sync_at TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS account_metric_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                  metric_date TEXT NOT NULL,
+                  fans INTEGER NOT NULL DEFAULT 0,
+                  reads INTEGER NOT NULL DEFAULT 0,
+                  recommends INTEGER NOT NULL DEFAULT 0,
+                  likes INTEGER NOT NULL DEFAULT 0,
+                  comments INTEGER NOT NULL DEFAULT 0,
+                  shares INTEGER NOT NULL DEFAULT 0,
+                  favorites INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS platform_works (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                  platform TEXT NOT NULL,
+                  account_name TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  content_type TEXT NOT NULL DEFAULT '图文',
+                  status TEXT NOT NULL DEFAULT '已发布',
+                  publish_url TEXT NOT NULL DEFAULT '',
+                  published_at TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS work_metric_snapshots (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  work_id INTEGER NOT NULL REFERENCES platform_works(id) ON DELETE CASCADE,
+                  metric_date TEXT NOT NULL,
+                  reads INTEGER NOT NULL DEFAULT 0,
+                  recommends INTEGER NOT NULL DEFAULT 0,
+                  likes INTEGER NOT NULL DEFAULT 0,
+                  comments INTEGER NOT NULL DEFAULT 0,
+                  shares INTEGER NOT NULL DEFAULT 0,
+                  favorites INTEGER NOT NULL DEFAULT 0,
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
@@ -90,6 +154,9 @@ class Database:
                   selected_title TEXT NOT NULL DEFAULT '',
                   title_direction TEXT NOT NULL DEFAULT '',
                   status TEXT NOT NULL DEFAULT '待执行',
+                  account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL,
+                  publish_result TEXT NOT NULL DEFAULT '',
+                  manual_takeover_url TEXT NOT NULL DEFAULT '',
                   execution_mode TEXT NOT NULL DEFAULT 'once',
                   repeat_rule TEXT NOT NULL DEFAULT '',
                   weekly_day INTEGER,
@@ -119,6 +186,10 @@ class Database:
                 """
             )
             for column_sql in [
+                "ALTER TABLE publish_packages ADD COLUMN account_id INTEGER",
+                "ALTER TABLE scheduled_tasks ADD COLUMN account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL",
+                "ALTER TABLE scheduled_tasks ADD COLUMN publish_result TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE scheduled_tasks ADD COLUMN manual_takeover_url TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'once'",
                 "ALTER TABLE scheduled_tasks ADD COLUMN article_requirements TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN selected_title TEXT NOT NULL DEFAULT ''",

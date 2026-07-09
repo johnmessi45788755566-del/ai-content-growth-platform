@@ -20,6 +20,15 @@ TASK_TYPE_WECHAT = "微信公众号图文生成"
 TASK_TYPE_WECHAT_LEGACY = "公众号文章创作"
 TASK_TYPE_XIAOHONGSHU_RESERVED = "小红书图文生成（预留）"
 TASK_TIME_FORMAT = "%Y-%m-%d %H:%M"
+PLATFORMS = ["微信公众号", "视频号", "小红书", "抖音"]
+PLATFORM_ALIASES = {
+    "公众号": "微信公众号",
+    "微信公众平台": "微信公众号",
+    "微信公众号": "微信公众号",
+    "视频号": "视频号",
+    "小红书": "小红书",
+    "抖音": "抖音",
+}
 
 
 class NotFoundError(RuntimeError):
@@ -303,6 +312,232 @@ class ContentService:
         self.db.execute("DELETE FROM draft_snapshots WHERE id = ?", (draft_id,))
         return {"deleted": True, "id": draft_id}
 
+    def start_account_auth(self, platform: str, account_name: str = "") -> dict[str, Any]:
+        normalized_platform = _normalize_platform(platform)
+        name = account_name.strip() or f"{normalized_platform}账号"
+        existing = self.db.fetch_one(
+            "SELECT id FROM platform_accounts WHERE platform = ? AND name = ?",
+            (normalized_platform, name),
+        )
+        qr_url = f"local-auth://{normalized_platform}/{name}"
+        if existing:
+            self.db.execute(
+                """
+                UPDATE platform_accounts
+                SET auth_status = '已授权', monitor_status = '监测中', sync_status = '同步中',
+                    qr_url = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (qr_url, existing["id"]),
+            )
+            account_id = int(existing["id"])
+        else:
+            account_id = self.db.execute(
+                """
+                INSERT INTO platform_accounts (
+                  platform, name, owner, tag, auth_status, monitor_status, sync_status,
+                  role, audience, style, taboo, preference, qr_url
+                )
+                VALUES (?, ?, '好财 AI 运营组', ?, '已授权', '监测中', '同步中', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized_platform,
+                    name,
+                    _default_tag(normalized_platform),
+                    _default_role(normalized_platform),
+                    _default_audience(normalized_platform),
+                    _default_style(normalized_platform),
+                    "避免夸大效果，避免承诺平台收益",
+                    "优先使用场景化标题和可验证数据",
+                    qr_url,
+                ),
+            )
+        sync = self.sync_account(account_id)
+        return {"qr_url": qr_url, "account": sync["account"], "synced": True}
+
+    def list_accounts(self, platform: str = "", auth_status: str = "", q: str = "") -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if platform and platform != "全部平台":
+            clauses.append("platform = ?")
+            params.append(_normalize_platform(platform))
+        if auth_status and auth_status != "全部授权状态":
+            clauses.append("auth_status = ?")
+            params.append(auth_status)
+        if q:
+            clauses.append("(name LIKE ? OR tag LIKE ? OR owner LIKE ?)")
+            keyword = f"%{q}%"
+            params.extend([keyword, keyword, keyword])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.db.fetch_all(
+            f"""
+            SELECT id, platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status,
+                   role, audience, style, taboo, preference, auth_method, qr_url, last_sync_at, created_at, updated_at
+            FROM platform_accounts
+            {where}
+            ORDER BY updated_at DESC, id DESC
+            """,
+            tuple(params),
+        )
+
+    def get_account(self, account_id: int) -> dict[str, Any]:
+        account = self.db.fetch_one(
+            """
+            SELECT id, platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status,
+                   role, audience, style, taboo, preference, auth_method, qr_url, last_sync_at, created_at, updated_at
+            FROM platform_accounts
+            WHERE id = ?
+            """,
+            (account_id,),
+        )
+        if not account:
+            raise NotFoundError("账号不存在")
+        return account
+
+    def sync_account(self, account_id: int) -> dict[str, Any]:
+        account = self.get_account(account_id)
+        now = datetime.now()
+        today = now.date().isoformat()
+        metrics = _sample_metrics(account["platform"], account["name"])
+        self.db.execute(
+            "DELETE FROM account_metric_snapshots WHERE account_id = ? AND metric_date = ?",
+            (account_id, today),
+        )
+        self.db.execute(
+            """
+            INSERT INTO account_metric_snapshots (
+              account_id, metric_date, fans, reads, recommends, likes, comments, shares, favorites
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_id,
+                today,
+                metrics["fans"],
+                metrics["reads"],
+                metrics["recommends"],
+                metrics["likes"],
+                metrics["comments"],
+                metrics["shares"],
+                metrics["favorites"],
+            ),
+        )
+        self._upsert_sample_works(account_id, account)
+        self.db.execute(
+            """
+            UPDATE platform_accounts
+            SET sync_status = '已同步', last_sync_at = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (_format_task_time(now), account_id),
+        )
+        return {"synced": True, "account": self.get_account(account_id)}
+
+    def sync_due_accounts(self, now: datetime | None = None) -> dict[str, Any]:
+        today = (now or datetime.now()).date().isoformat()
+        accounts = self.db.fetch_all(
+            """
+            SELECT id
+            FROM platform_accounts
+            WHERE auth_status = '已授权'
+              AND (last_sync_at = '' OR date(last_sync_at) < date(?))
+            """,
+            (today,),
+        )
+        for account in accounts:
+            self.sync_account(int(account["id"]))
+        return {"synced": len(accounts)}
+
+    def update_account(self, account_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        self.get_account(account_id)
+        self.db.execute(
+            """
+            UPDATE platform_accounts
+            SET owner = ?, tag = ?, monitor_status = ?, role = ?, audience = ?, style = ?, taboo = ?,
+                preference = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                str(payload.get("owner", "未分配")),
+                str(payload.get("tag", "")),
+                str(payload.get("monitor_status", "监测中")),
+                str(payload.get("role", "")),
+                str(payload.get("audience", "")),
+                str(payload.get("style", "")),
+                str(payload.get("taboo", "")),
+                str(payload.get("preference", "")),
+                account_id,
+            ),
+        )
+        return self.get_account(account_id)
+
+    def delete_account(self, account_id: int) -> dict[str, Any]:
+        self.get_account(account_id)
+        self.db.execute("DELETE FROM platform_accounts WHERE id = ?", (account_id,))
+        return {"deleted": True, "id": account_id}
+
+    def analytics_accounts(self, platform: str = "", q: str = "") -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if platform and platform != "全部平台":
+            clauses.append("a.platform = ?")
+            params.append(_normalize_platform(platform))
+        if q:
+            clauses.append("(a.name LIKE ? OR a.tag LIKE ?)")
+            keyword = f"%{q}%"
+            params.extend([keyword, keyword])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.db.fetch_all(
+            f"""
+            SELECT a.id AS account_id, a.name AS account_name, a.platform, a.owner, a.tag,
+                   a.last_sync_at, COALESCE(m.fans, 0) AS fans, COALESCE(m.reads, 0) AS reads,
+                   COALESCE(m.recommends, 0) AS recommends, COALESCE(m.likes, 0) AS likes,
+                   COALESCE(m.comments, 0) AS comments, COALESCE(m.shares, 0) AS shares,
+                   COALESCE(m.favorites, 0) AS favorites
+            FROM platform_accounts a
+            LEFT JOIN account_metric_snapshots m ON m.id = (
+                SELECT id FROM account_metric_snapshots
+                WHERE account_id = a.id
+                ORDER BY metric_date DESC, id DESC
+                LIMIT 1
+            )
+            {where}
+            ORDER BY a.last_sync_at DESC, a.id DESC
+            """,
+            tuple(params),
+        )
+
+    def analytics_works(self, platform: str = "", q: str = "") -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if platform and platform != "全部平台":
+            clauses.append("w.platform = ?")
+            params.append(_normalize_platform(platform))
+        if q:
+            clauses.append("(w.title LIKE ? OR w.account_name LIKE ?)")
+            keyword = f"%{q}%"
+            params.extend([keyword, keyword])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return self.db.fetch_all(
+            f"""
+            SELECT w.id AS work_id, w.account_id, w.platform, w.account_name, w.title, w.content_type,
+                   w.status, w.publish_url, w.published_at, w.updated_at,
+                   COALESCE(m.reads, 0) AS reads, COALESCE(m.recommends, 0) AS recommends,
+                   COALESCE(m.likes, 0) AS likes, COALESCE(m.comments, 0) AS comments,
+                   COALESCE(m.shares, 0) AS shares, COALESCE(m.favorites, 0) AS favorites
+            FROM platform_works w
+            LEFT JOIN work_metric_snapshots m ON m.id = (
+                SELECT id FROM work_metric_snapshots
+                WHERE work_id = w.id
+                ORDER BY metric_date DESC, id DESC
+                LIMIT 1
+            )
+            {where}
+            ORDER BY w.updated_at DESC, w.id DESC
+            """,
+            tuple(params),
+        )
+
     def list_tasks(self, status: str = "", platform: str = "", q: str = "") -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
@@ -311,7 +546,7 @@ class ContentService:
             params.append(status)
         if platform and platform != "全部平台":
             clauses.append("platform = ?")
-            params.append(platform)
+            params.append(_normalize_platform(platform))
         if q:
             clauses.append("(topic LIKE ? OR account_name LIKE ?)")
             keyword = f"%{q}%"
@@ -319,8 +554,8 @@ class ContentService:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return self.db.fetch_all(
             f"""
-            SELECT id, platform, account_name, execute_time, task_type, topic, article_requirements, selected_title, title_direction, status,
-                   execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason,
+            SELECT id, platform, account_id, account_name, execute_time, task_type, topic, article_requirements, selected_title, title_direction, status,
+                   publish_result, manual_takeover_url, execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason,
                    retry_count, content_project_id, publish_package_id, last_run_at, created_at, updated_at
             FROM scheduled_tasks
             {where}
@@ -357,13 +592,14 @@ class ContentService:
         task_id = self.db.execute(
             """
             INSERT INTO scheduled_tasks (
-              platform, account_name, execute_time, task_type, topic, article_requirements, selected_title, title_direction, status,
+              platform, account_id, account_name, execute_time, task_type, topic, article_requirements, selected_title, title_direction, status,
               execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 normalized["platform"],
+                normalized["account_id"],
                 normalized["account_name"],
                 normalized["execute_time"],
                 normalized["task_type"],
@@ -388,15 +624,16 @@ class ContentService:
         self.db.execute(
             """
             UPDATE scheduled_tasks
-            SET platform = ?, account_name = ?, execute_time = ?, task_type = ?, topic = ?, article_requirements = ?,
+            SET platform = ?, account_id = ?, account_name = ?, execute_time = ?, task_type = ?, topic = ?, article_requirements = ?,
                 selected_title = ?, title_direction = ?, status = '待执行',
                 execution_mode = ?, repeat_rule = ?, weekly_day = ?,
-                next_run_at = ?, failure_stage = '', failure_reason = '',
+                next_run_at = ?, failure_stage = '', failure_reason = '', publish_result = '', manual_takeover_url = '',
                 content_project_id = NULL, publish_package_id = NULL, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (
                 normalized["platform"],
+                normalized["account_id"],
                 normalized["account_name"],
                 normalized["execute_time"],
                 normalized["task_type"],
@@ -476,8 +713,9 @@ class ContentService:
             (started_at, task_id),
         )
         try:
-            if task["task_type"] not in {TASK_TYPE_WECHAT, TASK_TYPE_WECHAT_LEGACY}:
-                raise RuntimeError("小红书图文生成暂未开放真实执行")
+            account = self.get_account(int(task["account_id"])) if task.get("account_id") else None
+            if account and account["auth_status"] != "已授权":
+                raise RuntimeError("账号未授权，无法执行定时任务")
             title_choice = self._recommend_task_title(task)
             task_title = title_choice["title"]
             title_direction = title_choice["direction"]
@@ -492,7 +730,7 @@ class ContentService:
             project = self.create_project(
                 title=task_title,
                 title_direction=title_direction,
-                platform="微信公众号",
+                platform=task["platform"],
             )
             article = self.generate_article(project["id"])
             images = self.generate_images(project["id"])
@@ -517,7 +755,13 @@ class ContentService:
                     }
                 )
             self.save_layout(project["id"], layout_blocks)
-            package = self.create_publish_package(project["id"], platform="微信公众号", account_name=task["account_name"])
+            package = self.create_publish_package(
+                project["id"],
+                platform=task["platform"],
+                account_name=task["account_name"],
+                account_id=task.get("account_id"),
+                status="platform_draft",
+            )
             self._finish_task_success(task, run_id, project["id"], package["id"], current)
         except Exception as exc:
             stage = "任务类型未开放" if task["task_type"] == TASK_TYPE_XIAOHONGSHU_RESERVED else "执行失败"
@@ -527,7 +771,7 @@ class ContentService:
     def _recommend_task_title(self, task: dict[str, Any]) -> dict[str, str]:
         prompt = (
             "这是任务中心定时任务，请模拟内容创作第一步“标题确认”。"
-            f"平台：微信公众号；账号：{task['account_name']}；"
+            f"平台：{task['platform']}；账号：{task['account_name']}；"
             f"主题约束：{task['topic']}；"
             f"创作要求：{task.get('article_requirements') or '未填写'}。"
             "请结合主题约束、账号信息和创作要求，给出适合公众号图文的标题建议。"
@@ -549,7 +793,8 @@ class ContentService:
     ) -> None:
         finished_at = _format_task_time(now)
         next_run_at = ""
-        status = "成功"
+        status = "已生成平台草稿"
+        publish_result = "已生成平台草稿"
         if task["execution_mode"] == "repeat":
             status = "待执行"
             next_run_at = self._next_repeat_time(task, now)
@@ -557,18 +802,18 @@ class ContentService:
             """
             UPDATE scheduled_tasks
             SET status = ?, next_run_at = ?, failure_stage = '', failure_reason = '',
-                content_project_id = ?, publish_package_id = ?, updated_at = CURRENT_TIMESTAMP
+                publish_result = ?, manual_takeover_url = '', content_project_id = ?, publish_package_id = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (status, next_run_at, project_id, package_id, task["id"]),
+            (status, next_run_at, publish_result, project_id, package_id, task["id"]),
         )
         self.db.execute(
             """
             UPDATE task_runs
-            SET status = '成功', finished_at = ?, content_project_id = ?, publish_package_id = ?
+            SET status = ?, finished_at = ?, content_project_id = ?, publish_package_id = ?
             WHERE id = ?
             """,
-            (finished_at, project_id, package_id, run_id),
+            (publish_result, finished_at, project_id, package_id, run_id),
         )
 
     def _finish_task_failure(
@@ -583,10 +828,11 @@ class ContentService:
         self.db.execute(
             """
             UPDATE scheduled_tasks
-            SET status = '失败', failure_stage = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP
+            SET status = '失败', failure_stage = ?, failure_reason = ?,
+                manual_takeover_url = 'manual-takeover://task/' || ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (stage, reason, task_id),
+            (stage, reason, task_id, task_id),
         )
         self.db.execute(
             """
@@ -601,6 +847,13 @@ class ContentService:
         task_type = str(payload.get("task_type", TASK_TYPE_WECHAT)).strip() or TASK_TYPE_WECHAT
         if task_type == TASK_TYPE_WECHAT_LEGACY:
             task_type = TASK_TYPE_WECHAT
+        platform = _normalize_platform(str(payload.get("platform", "微信公众号")))
+        account_id = payload.get("account_id")
+        account_name = str(payload.get("account_name", "")).strip()
+        if account_id not in {None, ""}:
+            account = self.get_account(int(account_id))
+            platform = account["platform"]
+            account_name = account["name"]
         execution_mode = str(payload.get("execution_mode", "once")).strip() or "once"
         repeat_rule = str(payload.get("repeat_rule", "")).strip()
         if execution_mode != "repeat":
@@ -619,8 +872,9 @@ class ContentService:
             weekly_day = None
         status = "待执行" if force_pending else str(payload.get("status", "待执行"))
         return {
-            "platform": str(payload.get("platform", "公众号")),
-            "account_name": str(payload.get("account_name", "")),
+            "platform": platform,
+            "account_id": int(account_id) if account_id not in {None, ""} else None,
+            "account_name": account_name,
             "execute_time": execute_time,
             "task_type": task_type,
             "topic": str(payload.get("topic", "")),
@@ -647,7 +901,14 @@ class ContentService:
             next_time += timedelta(days=1)
         return _format_task_time(next_time)
 
-    def create_publish_package(self, project_id: int, platform: str, account_name: str) -> dict[str, Any]:
+    def create_publish_package(
+        self,
+        project_id: int,
+        platform: str,
+        account_name: str,
+        account_id: int | None = None,
+        status: str = "pending_publish",
+    ) -> dict[str, Any]:
         project = self.get_project(project_id)
         payload = {
             "project": project,
@@ -657,11 +918,13 @@ class ContentService:
         }
         package_id = self.db.execute(
             """
-            INSERT INTO publish_packages (project_id, platform, account_name, payload_json, status)
-            VALUES (?, ?, ?, ?, 'pending_publish')
+            INSERT INTO publish_packages (project_id, account_id, platform, account_name, payload_json, status)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (project_id, platform, account_name, json.dumps(payload, ensure_ascii=False)),
+            (project_id, account_id, platform, account_name, json.dumps(payload, ensure_ascii=False), status),
         )
+        if account_id:
+            self._create_work_from_project(int(account_id), platform, account_name, project)
         self._set_stage(project_id, "publish")
         self.autosave(project_id, stage="publish", restore_stage="layout")
         package = self.db.fetch_one("SELECT * FROM publish_packages WHERE id = ?", (package_id,))
@@ -712,6 +975,75 @@ class ContentService:
             (stage, project_id),
         )
 
+    def _upsert_sample_works(self, account_id: int, account: dict[str, Any]) -> None:
+        samples = _sample_works(account["platform"], account["name"])
+        today = datetime.now().date().isoformat()
+        for sample in samples:
+            existing = self.db.fetch_one(
+                "SELECT id FROM platform_works WHERE account_id = ? AND title = ?",
+                (account_id, sample["title"]),
+            )
+            if existing:
+                work_id = int(existing["id"])
+                self.db.execute(
+                    "UPDATE platform_works SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (sample["status"], work_id),
+                )
+            else:
+                work_id = self.db.execute(
+                    """
+                    INSERT INTO platform_works (account_id, platform, account_name, title, content_type, status, published_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        account_id,
+                        account["platform"],
+                        account["name"],
+                        sample["title"],
+                        sample["content_type"],
+                        sample["status"],
+                        today,
+                    ),
+                )
+            self.db.execute(
+                "DELETE FROM work_metric_snapshots WHERE work_id = ? AND metric_date = ?",
+                (work_id, today),
+            )
+            self.db.execute(
+                """
+                INSERT INTO work_metric_snapshots (
+                  work_id, metric_date, reads, recommends, likes, comments, shares, favorites
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    work_id,
+                    today,
+                    sample["reads"],
+                    sample["recommends"],
+                    sample["likes"],
+                    sample["comments"],
+                    sample["shares"],
+                    sample["favorites"],
+                ),
+            )
+
+    def _create_work_from_project(self, account_id: int, platform: str, account_name: str, project: dict[str, Any]) -> None:
+        work_id = self.db.execute(
+            """
+            INSERT INTO platform_works (account_id, platform, account_name, title, content_type, status, published_at)
+            VALUES (?, ?, ?, ?, '图文', '已生成平台草稿', ?)
+            """,
+            (account_id, platform, account_name, project["title"], _format_task_time(datetime.now())),
+        )
+        self.db.execute(
+            """
+            INSERT INTO work_metric_snapshots (work_id, metric_date)
+            VALUES (?, ?)
+            """,
+            (work_id, datetime.now().date().isoformat()),
+        )
+
 
 def _parse_task_time(value: str) -> datetime:
     normalized = value.strip().replace("T", " ")
@@ -747,3 +1079,84 @@ def _next_repeat_clock_time(value: str, repeat_rule: str, weekly_day: Any) -> da
 
 def _format_task_time(value: datetime) -> str:
     return value.replace(second=0, microsecond=0).strftime(TASK_TIME_FORMAT)
+
+
+def _normalize_platform(value: str) -> str:
+    platform = PLATFORM_ALIASES.get(value.strip(), value.strip())
+    if platform not in PLATFORMS:
+        raise RuntimeError("平台暂不支持")
+    return platform
+
+
+def _default_tag(platform: str) -> str:
+    return {
+        "微信公众号": "图文运营",
+        "视频号": "视频内容",
+        "小红书": "种草笔记",
+        "抖音": "短视频",
+    }.get(platform, "新媒体")
+
+
+def _default_role(platform: str) -> str:
+    return {
+        "微信公众号": "公众号图文内容号",
+        "视频号": "视频号内容账号",
+        "小红书": "小红书种草账号",
+        "抖音": "抖音短视频账号",
+    }.get(platform, "新媒体账号")
+
+
+def _default_audience(platform: str) -> str:
+    return {
+        "微信公众号": "企业老板、管理者、运营负责人",
+        "视频号": "微信生态内的潜在客户",
+        "小红书": "搜索种草用户和决策前用户",
+        "抖音": "短视频信息流用户",
+    }.get(platform, "目标客户")
+
+
+def _default_style(platform: str) -> str:
+    return {
+        "微信公众号": "专业、案例型、易懂",
+        "视频号": "口语化、场景化、节奏清晰",
+        "小红书": "清单型、强标题、强封面",
+        "抖音": "短句、冲突感、前三秒抓人",
+    }.get(platform, "清晰、有转化感")
+
+
+def _sample_metrics(platform: str, name: str) -> dict[str, int]:
+    seed = sum(ord(char) for char in f"{platform}{name}")
+    return {
+        "fans": 5000 + seed % 26000,
+        "reads": 18000 + seed % 160000,
+        "recommends": 32000 + seed % 280000,
+        "likes": 900 + seed % 12000,
+        "comments": 120 + seed % 1800,
+        "shares": 180 + seed % 2600,
+        "favorites": 500 + seed % 9000,
+    }
+
+
+def _sample_works(platform: str, account_name: str) -> list[dict[str, Any]]:
+    content_type = "图文" if platform == "微信公众号" else ("笔记" if platform == "小红书" else "视频")
+    base = _sample_metrics(platform, account_name)
+    titles = {
+        "微信公众号": ["为什么老板开始把财务交给 AI", "一个财务部少做 80% 重复录入的方法"],
+        "视频号": ["老板看懂 AI 记账，只需要 60 秒", "财务重复活，正在被 AI 接管"],
+        "小红书": ["AI记账到底适合哪些小公司", "5分钟自动整理票据流水，我试了一周"],
+        "抖音": ["手工记账一天，AI记账三分钟", "财务人最怕的重复活，AI已经会了"],
+    }.get(platform, ["新媒体内容表现样例"])
+    return [
+        {
+            "title": title,
+            "content_type": content_type,
+            "status": "已发布",
+            "reads": max(100, base["reads"] // (index + 2)),
+            "recommends": max(100, base["recommends"] // (index + 2)),
+            "likes": max(10, base["likes"] // (index + 2)),
+            "comments": max(1, base["comments"] // (index + 2)),
+            "shares": max(1, base["shares"] // (index + 2)),
+            "favorites": max(1, base["favorites"] // (index + 2)),
+        }
+        for index, title in enumerate(titles)
+    ]

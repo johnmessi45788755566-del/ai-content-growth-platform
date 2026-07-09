@@ -74,10 +74,28 @@ class MediaSelectionRequest(BaseModel):
 class PublishPackageRequest(BaseModel):
     platform: str = "微信公众号"
     account_name: str = "AI 记账工具公众号"
+    account_id: int | None = None
+
+
+class AccountAuthRequest(BaseModel):
+    platform: str = Field(min_length=1)
+    account_name: str = ""
+
+
+class AccountUpdateRequest(BaseModel):
+    owner: str = "未分配"
+    tag: str = ""
+    monitor_status: str = "监测中"
+    role: str = ""
+    audience: str = ""
+    style: str = ""
+    taboo: str = ""
+    preference: str = ""
 
 
 class TaskCreateRequest(BaseModel):
     platform: str = "公众号"
+    account_id: int | None = None
     account_name: str = Field(min_length=1)
     execute_time: str = Field(min_length=1)
     task_type: str = "微信公众号图文生成"
@@ -95,6 +113,7 @@ class TaskCreateRequest(BaseModel):
 
 class TaskUpdateRequest(BaseModel):
     platform: str = "公众号"
+    account_id: int | None = None
     account_name: str = Field(min_length=1)
     execute_time: str = Field(min_length=1)
     task_type: str = "微信公众号图文生成"
@@ -128,6 +147,7 @@ def create_app(
     async def task_scheduler_loop() -> None:
         while True:
             try:
+                service.sync_due_accounts()
                 service.execute_due_tasks()
             except Exception:
                 pass
@@ -261,6 +281,62 @@ def create_app(
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    @app.get("/api/accounts")
+    def list_accounts(platform: str = "", auth_status: str = "", q: str = "") -> dict[str, Any]:
+        try:
+            return {"accounts": service.list_accounts(platform=platform, auth_status=auth_status, q=q)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/accounts/auth/start")
+    def start_account_auth(payload: AccountAuthRequest) -> dict[str, Any]:
+        try:
+            return service.start_account_auth(payload.platform, payload.account_name)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/accounts/{account_id}")
+    def get_account(account_id: int) -> dict[str, Any]:
+        try:
+            return service.get_account(account_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/accounts/{account_id}/sync")
+    def sync_account(account_id: int) -> dict[str, Any]:
+        try:
+            return service.sync_account(account_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.patch("/api/accounts/{account_id}")
+    def update_account(account_id: int, payload: AccountUpdateRequest) -> dict[str, Any]:
+        try:
+            return service.update_account(account_id, payload.model_dump())
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/api/accounts/{account_id}")
+    def delete_account(account_id: int) -> dict[str, Any]:
+        try:
+            return service.delete_account(account_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/analytics/accounts")
+    def analytics_accounts(platform: str = "", q: str = "", range: str = "30d") -> dict[str, Any]:
+        try:
+            return {"range": range, "accounts": service.analytics_accounts(platform=platform, q=q)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/analytics/works")
+    def analytics_works(platform: str = "", q: str = "", range: str = "30d") -> dict[str, Any]:
+        try:
+            return {"range": range, "works": service.analytics_works(platform=platform, q=q)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.get("/api/tasks")
     def list_tasks(status: str = "", platform: str = "", q: str = "") -> dict[str, Any]:
         return {"tasks": service.list_tasks(status=status, platform=platform, q=q)}
@@ -297,7 +373,7 @@ def create_app(
     @app.post("/api/content-projects/{project_id}/publish-package")
     def publish_package(project_id: int, payload: PublishPackageRequest) -> dict[str, Any]:
         try:
-            return service.create_publish_package(project_id, payload.platform, payload.account_name)
+            return service.create_publish_package(project_id, payload.platform, payload.account_name, payload.account_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

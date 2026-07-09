@@ -4,8 +4,11 @@ import type {
   Draft,
   LayoutBlock,
   MediaAsset,
+  AccountAnalyticsRow,
+  PlatformAccount,
   ScheduledTask,
   TopicDirection,
+  WorkAnalyticsRow,
 } from '@/types';
 
 export const API_BASE = process.env.UMI_APP_API_BASE || 'http://127.0.0.1:8000';
@@ -108,6 +111,33 @@ export const api = {
   },
   deleteDraft(id: number) {
     return request(`/api/drafts/${id}`, { method: 'DELETE' });
+  },
+  accounts(params: URLSearchParams) {
+    const query = params.toString();
+    return request<{ accounts: PlatformAccount[] }>(`/api/accounts${query ? `?${query}` : ''}`);
+  },
+  startAccountAuth(payload: { platform: string; account_name?: string }) {
+    return request<{ qr_url: string; account: PlatformAccount; synced: boolean }>('/api/accounts/auth/start', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+  syncAccount(id: number) {
+    return request<{ synced: boolean; account: PlatformAccount }>(`/api/accounts/${id}/sync`, { method: 'POST' });
+  },
+  updateAccount(id: number, payload: Partial<PlatformAccount>) {
+    return request<PlatformAccount>(`/api/accounts/${id}`, { method: 'PATCH', body: JSON.stringify(payload) });
+  },
+  deleteAccount(id: number) {
+    return request(`/api/accounts/${id}`, { method: 'DELETE' });
+  },
+  analyticsAccounts(params: URLSearchParams) {
+    const query = params.toString();
+    return request<{ range: string; accounts: AccountAnalyticsRow[] }>(`/api/analytics/accounts${query ? `?${query}` : ''}`);
+  },
+  analyticsWorks(params: URLSearchParams) {
+    const query = params.toString();
+    return request<{ range: string; works: WorkAnalyticsRow[] }>(`/api/analytics/works${query ? `?${query}` : ''}`);
   },
   tasks(params: URLSearchParams) {
     const query = params.toString();

@@ -1,8 +1,60 @@
-import { Card, Input, Select, Space, Tabs, Table } from 'antd';
+import { Card, Empty, Input, message, Select, Space, Tabs, Table } from 'antd';
+import { useEffect, useMemo, useState } from 'react';
 import { MetricCards, Platform, Status } from '@/components/Common';
-import { accounts, works } from '@/data/mock';
+import { api } from '@/services/api';
+import type { AccountAnalyticsRow, WorkAnalyticsRow } from '@/types';
+
+const platformOptions = ['', '微信公众号', '视频号', '小红书', '抖音'];
+
+function formatNumber(value?: number) {
+  return Number(value || 0).toLocaleString('zh-CN');
+}
 
 export default function Analytics() {
+  const [accountRows, setAccountRows] = useState<AccountAnalyticsRow[]>([]);
+  const [workRows, setWorkRows] = useState<WorkAnalyticsRow[]>([]);
+  const [platform, setPlatform] = useState('');
+  const [search, setSearch] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  async function loadAnalytics() {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ range: '30d' });
+      if (platform) params.set('platform', platform);
+      if (search) params.set('q', search);
+      const [accountsData, worksData] = await Promise.all([
+        api.analyticsAccounts(params),
+        api.analyticsWorks(params),
+      ]);
+      setAccountRows(accountsData.accounts || []);
+      setWorkRows(worksData.works || []);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '读取数据失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadAnalytics();
+  }, [platform]);
+
+  const summary = useMemo(() => {
+    const reads = accountRows.reduce((sum, item) => sum + Number(item.reads || 0), 0);
+    const recommends = accountRows.reduce((sum, item) => sum + Number(item.recommends || 0), 0);
+    const interactions = accountRows.reduce(
+      (sum, item) => sum + Number(item.likes || 0) + Number(item.comments || 0) + Number(item.shares || 0) + Number(item.favorites || 0),
+      0,
+    );
+    return [
+      { label: '总推荐数', value: formatNumber(recommends), note: '近 30 天平台推荐' },
+      { label: '总阅读 / 播放', value: formatNumber(reads), note: '近 30 天消费数据' },
+      { label: '总互动', value: formatNumber(interactions), note: '点赞、评论、转发、收藏' },
+      { label: '同步账号', value: String(accountRows.length), note: '来自账号矩阵授权账号' },
+    ];
+  }, [accountRows]);
+
   return (
     <>
       <div className="toolbar">
@@ -15,51 +67,52 @@ export default function Analytics() {
           ]}
         />
         <Space wrap>
-          <Select defaultValue="近 7 天" options={['近 7 天', '近 30 天'].map((value) => ({ value }))} />
-          <Select defaultValue="全部平台" options={['全部平台', '公众号', '小红书'].map((value) => ({ value }))} />
-          <Input placeholder="搜索账号或作品" />
+          <Select value="近 30 天" options={[{ value: '近 30 天', label: '近 30 天' }]} />
+          <Select value={platform} onChange={setPlatform} options={platformOptions.map((value) => ({ value, label: value || '全部平台' }))} />
+          <Input.Search placeholder="搜索账号或作品" value={search} onChange={(event) => setSearch(event.target.value)} onSearch={loadAnalytics} />
         </Space>
       </div>
-      <MetricCards
-        items={[
-          { label: '总推荐数', value: '676,400', note: '较上周期 +14.6%' },
-          { label: '总阅读 / 播放', value: '299,300', note: '较上周期 +9.2%' },
-          { label: '总互动', value: '25,814', note: '点赞、评论、转发、收藏' },
-          { label: '规则变更', value: '7', note: '可查看依据并回滚' },
-        ]}
-      />
+      <MetricCards items={summary} />
       <Card className="panel">
         <Table
-          rowKey="name"
+          loading={loading}
+          rowKey="account_id"
           pagination={false}
-          dataSource={accounts}
+          locale={{ emptyText: <Empty description="暂无账号数据，请先在账号矩阵添加并同步账号" /> }}
+          dataSource={accountRows}
           columns={[
-            { title: '账号', dataIndex: 'name' },
+            { title: '账号', dataIndex: 'account_name' },
             { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
-            { title: '粉丝数', dataIndex: 'fans' },
-            { title: '阅读 / 播放', dataIndex: 'reads' },
-            { title: '推荐数', dataIndex: 'recommends' },
-            { title: '点赞', dataIndex: 'likes' },
-            { title: '评论', dataIndex: 'comments' },
-            { title: '转发', dataIndex: 'shares' },
-            { title: '收藏', dataIndex: 'favorites' },
-            { title: '更新时间', render: () => '10 分钟前' },
+            { title: '粉丝数', render: (_, row) => formatNumber(row.fans) },
+            { title: '阅读 / 播放', render: (_, row) => formatNumber(row.reads) },
+            { title: '推荐数', render: (_, row) => formatNumber(row.recommends) },
+            { title: '点赞', render: (_, row) => formatNumber(row.likes) },
+            { title: '评论', render: (_, row) => formatNumber(row.comments) },
+            { title: '转发', render: (_, row) => formatNumber(row.shares) },
+            { title: '收藏', render: (_, row) => formatNumber(row.favorites) },
+            { title: '更新时间', render: (_, row) => row.last_sync_at || '-' },
           ]}
         />
       </Card>
       <Card className="panel block-gap" title="作品分析">
         <Table
-          rowKey={(row) => row.join('-')}
+          loading={loading}
+          rowKey="work_id"
           pagination={false}
-          dataSource={works}
+          locale={{ emptyText: <Empty description="暂无作品数据，请先同步账号数据" /> }}
+          dataSource={workRows}
           columns={[
-            { title: '作品标题', render: (_, row) => row[2] },
-            { title: '平台', render: (_, row) => <Platform value={row[1]} /> },
-            { title: '账号', render: (_, row) => row[0] },
-            { title: '类型', render: (_, row) => row[3] },
-            { title: '阅读 / 播放', render: (_, row) => row[4] },
-            { title: '推荐数', render: (_, row) => row[5] },
-            { title: '状态', render: (_, row) => <Status value={row[10]} /> },
+            { title: '作品标题', dataIndex: 'title' },
+            { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
+            { title: '账号', dataIndex: 'account_name' },
+            { title: '类型', dataIndex: 'content_type' },
+            { title: '阅读 / 播放', render: (_, row) => formatNumber(row.reads) },
+            { title: '推荐数', render: (_, row) => formatNumber(row.recommends) },
+            { title: '点赞', render: (_, row) => formatNumber(row.likes) },
+            { title: '评论', render: (_, row) => formatNumber(row.comments) },
+            { title: '转发', render: (_, row) => formatNumber(row.shares) },
+            { title: '收藏', render: (_, row) => formatNumber(row.favorites) },
+            { title: '状态', render: (_, row) => <Status value={row.status} /> },
           ]}
         />
       </Card>

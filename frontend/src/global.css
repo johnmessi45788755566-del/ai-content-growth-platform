@@ -317,6 +317,12 @@ h3 {
   color: var(--blue);
 }
 
+.draft-stage-status {
+  border: 1px solid var(--line);
+  background: #f3f4f6;
+  color: var(--muted);
+}
+
 .draft-tip,
 .notice {
   min-height: 42px;

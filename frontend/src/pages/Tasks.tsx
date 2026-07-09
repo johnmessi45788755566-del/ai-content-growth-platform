@@ -2,21 +2,22 @@ import { Alert, Button, DatePicker, Drawer, Form, Input, message, Modal, Popconf
 import dayjs from 'dayjs';
 import { useEffect, useMemo, useState } from 'react';
 import { Detail, Platform, Status } from '@/components/Common';
-import { accounts } from '@/data/mock';
 import { api } from '@/services/api';
-import type { ScheduledTask } from '@/types';
+import type { PlatformAccount, ScheduledTask } from '@/types';
 import { buildTaskPayload } from '@/utils/taskPayload';
 
 const taskTypeOptions = [
   { value: '微信公众号图文生成', label: '微信公众号图文生成' },
-  { value: '小红书图文生成（预留）', label: '小红书图文生成（预留）' },
+  { value: '小红书图文生成', label: '小红书图文生成（本地内部）' },
+  { value: '视频号内容发布', label: '视频号内容发布（本地内部）' },
+  { value: '抖音内容发布', label: '抖音内容发布（本地内部）' },
 ];
+
+const platformOptions = ['', '微信公众号', '视频号', '小红书', '抖音'];
 
 function taskInitialValues(task?: ScheduledTask | null) {
   if (!task) {
     return {
-      platform: '公众号',
-      account_name: accounts[0].name,
       task_type: '微信公众号图文生成',
       execution_mode: 'once',
       repeat_rule: 'daily',
@@ -24,8 +25,7 @@ function taskInitialValues(task?: ScheduledTask | null) {
     };
   }
   return {
-    platform: task.platform,
-    account_name: task.account_name,
+    account_id: task.account_id || undefined,
     topic: task.topic,
     article_requirements: task.article_requirements,
     task_type: task.task_type,
@@ -40,6 +40,7 @@ function taskInitialValues(task?: ScheduledTask | null) {
 export default function Tasks() {
   const [form] = Form.useForm();
   const [tasks, setTasks] = useState<ScheduledTask[]>([]);
+  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState('');
   const [platform, setPlatform] = useState('');
@@ -70,6 +71,20 @@ export default function Tasks() {
     }
   }
 
+  async function loadAccounts() {
+    try {
+      const params = new URLSearchParams({ auth_status: '已授权' });
+      const data = await api.accounts(params);
+      setAccounts(data.accounts || []);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '读取账号失败');
+    }
+  }
+
+  useEffect(() => {
+    loadAccounts();
+  }, []);
+
   useEffect(() => {
     loadTasks();
   }, [status, platform]);
@@ -81,6 +96,11 @@ export default function Tasks() {
   }
 
   async function submitTask(values: any) {
+    const account = accounts.find((item) => item.id === values.account_id);
+    if (!account) {
+      message.warning('请先选择已授权账号');
+      return;
+    }
     const executionMode = values.execution_mode as 'once' | 'repeat';
     const executeAt =
       executionMode === 'repeat'
@@ -91,8 +111,9 @@ export default function Tasks() {
       return;
     }
     const payload = buildTaskPayload({
-      platform: values.platform,
-      accountName: values.account_name,
+      platform: account.platform,
+      accountId: account.id,
+      accountName: account.name,
       topic: values.topic,
       articleRequirements: values.article_requirements,
       taskType: values.task_type,
@@ -142,6 +163,10 @@ export default function Tasks() {
 
   const executionMode = Form.useWatch('execution_mode', form) || 'once';
   const repeatRule = Form.useWatch('repeat_rule', form) || 'daily';
+  const accountOptions = accounts.map((item) => ({
+    value: item.id,
+    label: `${item.name} / ${item.platform}`,
+  }));
 
   const rowSelection = useMemo(() => retryMode ? {
     selectedRowKeys: selectedRetryIds,
@@ -155,15 +180,16 @@ export default function Tasks() {
         {loadError && <Alert className="block-gap" type="warning" showIcon message={loadError} />}
         <div className="toolbar">
           <Space wrap>
-            <Select value={status} style={{ width: 150 }} onChange={setStatus} options={[
+            <Select value={status} style={{ width: 170 }} onChange={setStatus} options={[
               { value: '', label: '全部状态' },
               { value: '待执行', label: '待执行' },
               { value: '执行中', label: '执行中' },
-              { value: '成功', label: '成功' },
+              { value: '已生成平台草稿', label: '已生成平台草稿' },
+              { value: '已发布', label: '已发布' },
               { value: '失败', label: '失败' },
               { value: '已重试', label: '已重试' },
             ]} />
-            <Select value={platform} style={{ width: 150 }} onChange={setPlatform} options={['', '公众号', '小红书', '视频号', '抖音'].map((value) => ({ value, label: value || '全部平台' }))} />
+            <Select value={platform} style={{ width: 150 }} onChange={setPlatform} options={platformOptions.map((value) => ({ value, label: value || '全部平台' }))} />
             <Input.Search placeholder="搜索主题或账号" value={search} onChange={(event) => setSearch(event.target.value)} onSearch={loadTasks} style={{ width: 240 }} />
           </Space>
           <Space>
@@ -209,19 +235,21 @@ export default function Tasks() {
       </div>
       <Modal centered width={640} title={editingTask ? '编辑任务' : '新增任务'} open={drawerOpen} onCancel={() => setDrawerOpen(false)} footer={null}>
         <Form form={form} layout="vertical" onFinish={submitTask}>
-          <Form.Item label="配置平台" name="platform" rules={[{ required: true }]}><Select options={['公众号', '小红书'].map((value) => ({ value }))} /></Form.Item>
-          <Form.Item label="配置账号" name="account_name" rules={[{ required: true }]}><Select options={accounts.map((item) => ({ value: item.name }))} /></Form.Item>
+          {!accounts.length && <Alert className="block-gap" showIcon type="warning" message="请先在账号矩阵添加并授权账号，再创建定时任务。" />}
+          <Form.Item label="配置账号" name="account_id" rules={[{ required: true, message: '请选择已授权账号' }]}>
+            <Select showSearch optionFilterProp="label" options={accountOptions} placeholder="请选择已授权账号" />
+          </Form.Item>
           <Form.Item label="配置主题" name="topic" rules={[{ required: true, message: '请输入任务主题' }]}>
             <Input placeholder="请输入任务主题" />
           </Form.Item>
-          <p className="muted">主题只是选题约束，具体标题会在任务执行时由 AI 生成建议并自动选择。</p>
+          <p className="muted">主题只是选题约束，具体标题会在任务执行时结合账号信息和创作要求由 AI 自动选择。</p>
           <Form.Item label="创作要求（非必填）" name="article_requirements">
             <Input.TextArea placeholder="例如：面向小微企业老板，加入老板熬夜对账的例子，突出 AI 记账能把 8 小时压缩到 5 分钟。" />
           </Form.Item>
           <Form.Item label="配置任务类型" name="task_type" rules={[{ required: true }]}>
             <Select options={taskTypeOptions} />
           </Form.Item>
-          <p className="muted">当前仅微信公众号图文生成会真实执行，小红书为预留能力。</p>
+          <p className="muted">微信公众号优先走官方接口；视频号、小红书、抖音第一阶段按本地内部流程跑通，失败时提供人工接管。</p>
           <Form.Item label="执行方式" name="execution_mode" rules={[{ required: true }]}>
             <Select options={[
               { value: 'once', label: '单次执行' },
@@ -270,6 +298,8 @@ export default function Tasks() {
             <Detail label="执行时间" value={detailTask.execute_time} />
             <Detail label="执行方式" value={detailTask.execution_mode === 'repeat' ? '重复执行' : '单次执行'} />
             <Detail label="状态" value={<Status value={detailTask.status} />} />
+            <Detail label="发布结果" value={detailTask.publish_result || '-'} />
+            <Detail label="人工接管" value={detailTask.manual_takeover_url || '-'} />
             <Detail label="失败阶段" value={detailTask.failure_stage || '-'} />
             <Detail label="失败原因" value={detailTask.failure_reason || '-'} />
           </div>

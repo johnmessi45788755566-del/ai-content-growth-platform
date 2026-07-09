@@ -195,10 +195,79 @@ def test_api_task_center_flow(tmp_path: Path):
     assert retry_response.status_code == 200
     assert retry_response.json()["updated"] == 1
 
-    retried_response = client.get("/api/tasks", params={"status": "成功"})
+    retried_response = client.get("/api/tasks", params={"status": "已生成平台草稿"})
     assert retried_response.status_code == 200
-    assert retried_response.json()["tasks"][0]["status"] == "成功"
+    assert retried_response.json()["tasks"][0]["status"] == "已生成平台草稿"
     assert retried_response.json()["tasks"][0]["content_project_id"]
+
+
+def test_accounts_auth_sync_and_analytics_flow(tmp_path: Path):
+    app = create_app(database_path=tmp_path / "content.db", upload_dir=tmp_path / "uploads", ai_client=FakeAIClient())
+    client = TestClient(app)
+
+    auth_response = client.post(
+        "/api/accounts/auth/start",
+        json={"platform": "微信公众号", "account_name": "AI记账助手"},
+    )
+    assert auth_response.status_code == 200
+    account = auth_response.json()["account"]
+    assert account["platform"] == "微信公众号"
+    assert account["auth_status"] == "已授权"
+    assert auth_response.json()["qr_url"]
+
+    accounts_response = client.get("/api/accounts", params={"platform": "微信公众号"})
+    assert accounts_response.status_code == 200
+    assert accounts_response.json()["accounts"][0]["name"] == "AI记账助手"
+
+    sync_response = client.post(f"/api/accounts/{account['id']}/sync")
+    assert sync_response.status_code == 200
+    assert sync_response.json()["synced"] is True
+
+    account_analytics_response = client.get("/api/analytics/accounts", params={"range": "30d"})
+    assert account_analytics_response.status_code == 200
+    account_rows = account_analytics_response.json()["accounts"]
+    assert account_rows[0]["account_name"] == "AI记账助手"
+    assert account_rows[0]["reads"] > 0
+
+    work_analytics_response = client.get("/api/analytics/works", params={"range": "30d"})
+    assert work_analytics_response.status_code == 200
+    works = work_analytics_response.json()["works"]
+    assert works[0]["account_name"] == "AI记账助手"
+    assert works[0]["reads"] > 0
+
+
+def test_task_can_bind_authorized_account_and_create_platform_draft(tmp_path: Path):
+    app = create_app(database_path=tmp_path / "content.db", upload_dir=tmp_path / "uploads", ai_client=FakeAIClient())
+    client = TestClient(app)
+    account = client.post(
+        "/api/accounts/auth/start",
+        json={"platform": "微信公众号", "account_name": "AI记账助手"},
+    ).json()["account"]
+
+    task_response = client.post(
+        "/api/tasks",
+        json={
+            "platform": "微信公众号",
+            "account_id": account["id"],
+            "account_name": "AI记账助手",
+            "execute_time": "2026-07-08 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "AI 记账如何降低人工成本",
+        },
+    )
+    assert task_response.status_code == 200
+    assert task_response.json()["account_id"] == account["id"]
+
+    retry_response = client.post("/api/tasks/retry", json={"task_ids": []})
+    assert retry_response.status_code == 200
+
+    app.state.content_service.execute_due_tasks(datetime(2026, 7, 8, 9, 31))
+    detail_response = client.get(f"/api/tasks/{task_response.json()['id']}")
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail["status"] == "已生成平台草稿"
+    assert detail["publish_package"]["status"] == "platform_draft"
+    assert detail["publish_package"]["account_name"] == "AI记账助手"
 
 
 def make_task_service(tmp_path: Path) -> ContentService:
@@ -224,14 +293,14 @@ def test_due_wechat_task_generates_content_package_and_draft(tmp_path: Path):
 
     assert result["executed"] == 1
     detail = service.get_task(task["id"])
-    assert detail["status"] == "成功"
+    assert detail["status"] == "已生成平台草稿"
     assert detail["content_project_id"]
     assert detail["publish_package_id"]
     assert detail["selected_title"] == "8小时变5分钟"
     assert detail["content_project"]["title"] == "8小时变5分钟"
     assert detail["content_project"]["title_direction"] == "效率颠覆"
     assert detail["failure_reason"] == ""
-    assert detail["runs"][0]["status"] == "成功"
+    assert detail["runs"][0]["status"] == "已生成平台草稿"
     assert service.list_drafts()[0]["project_id"] == detail["content_project_id"]
 
 
@@ -250,7 +319,7 @@ def test_due_wechat_task_falls_back_to_topic_when_title_not_selected(tmp_path: P
     service.execute_due_tasks(datetime(2026, 7, 8, 9, 31))
 
     detail = service.get_task(task["id"])
-    assert detail["status"] == "成功"
+    assert detail["status"] == "已生成平台草稿"
     assert detail["content_project"]["title"] == "8小时变5分钟"
 
 
@@ -389,7 +458,7 @@ def test_api_task_edit_delete_detail_and_selected_retry(tmp_path: Path):
     assert retry_response.json()["updated"] == 1
     retried_detail = client.get(f"/api/tasks/{first_failed['id']}").json()
     untouched_detail = client.get(f"/api/tasks/{second_failed['id']}").json()
-    assert retried_detail["status"] == "成功"
+    assert retried_detail["status"] == "已生成平台草稿"
     assert retried_detail["retry_count"] == 1
     assert retried_detail["content_project_id"]
     assert untouched_detail["status"] == "失败"
@@ -443,7 +512,7 @@ def test_api_repeat_task_accepts_time_only_input(tmp_path: Path):
     assert create_response.json()["next_run_at"].endswith(" 09:30")
 
 
-def test_reserved_xiaohongshu_task_fails_without_generation(tmp_path: Path):
+def test_reserved_xiaohongshu_task_can_create_platform_draft_for_internal_rpa_flow(tmp_path: Path):
     service = make_task_service(tmp_path)
     task = service.create_task(
         {
@@ -459,6 +528,6 @@ def test_reserved_xiaohongshu_task_fails_without_generation(tmp_path: Path):
 
     assert result["executed"] == 1
     detail = service.get_task(task["id"])
-    assert detail["status"] == "失败"
-    assert detail["failure_stage"] == "任务类型未开放"
-    assert detail["content_project_id"] is None
+    assert detail["status"] == "已生成平台草稿"
+    assert detail["failure_stage"] == ""
+    assert detail["content_project_id"]

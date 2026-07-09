@@ -1,5 +1,6 @@
 export interface TaskFormValues {
   platform: string;
+  accountId?: number | null;
   accountName: string;
   topic: string;
   articleRequirements?: string;
@@ -13,6 +14,7 @@ export interface TaskFormValues {
 export function buildTaskPayload(values: TaskFormValues) {
   return {
     platform: values.platform,
+    account_id: values.accountId ?? null,
     account_name: values.accountName,
     topic: values.topic,
     article_requirements: values.articleRequirements || '',
@@ -26,8 +28,8 @@ export function buildTaskPayload(values: TaskFormValues) {
 }
 
 export function taskStatusClass(value = '') {
-  if (['已授权', '监测中', '成功', '已发布', '启用'].includes(value)) return 'ok';
-  if (['待执行', '执行中', '已重试'].includes(value)) return 'info';
+  if (['已授权', '监测中', '成功', '已发布', '已生成平台草稿', '已同步', '启用'].includes(value)) return 'ok';
+  if (['待执行', '执行中', '已重试', '同步中'].includes(value)) return 'info';
   if (['未授权', '未监测', '暂停'].includes(value)) return 'warn';
   return 'fail';
 }

@@ -58,6 +58,7 @@ export interface Draft {
 export interface ScheduledTask {
   id: number;
   platform: string;
+  account_id?: number | null;
   account_name: string;
   execute_time: string;
   next_run_at?: string;
@@ -67,6 +68,8 @@ export interface ScheduledTask {
   selected_title?: string;
   title_direction?: string;
   status: string;
+  publish_result?: string;
+  manual_takeover_url?: string;
   execution_mode?: 'once' | 'repeat';
   repeat_rule?: 'daily' | 'weekly' | '';
   weekly_day?: number | null;
@@ -89,4 +92,61 @@ export interface PublishPackage {
   id?: number;
   platform?: string;
   account_name?: string;
+  status?: string;
+}
+
+export interface PlatformAccount {
+  id: number;
+  platform: string;
+  name: string;
+  external_id?: string;
+  owner: string;
+  tag: string;
+  auth_status: string;
+  monitor_status: string;
+  sync_status: string;
+  role: string;
+  audience: string;
+  style: string;
+  taboo: string;
+  preference: string;
+  auth_method?: string;
+  qr_url?: string;
+  last_sync_at?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface AccountAnalyticsRow {
+  account_id: number;
+  account_name: string;
+  platform: string;
+  owner?: string;
+  tag?: string;
+  fans: number;
+  reads: number;
+  recommends: number;
+  likes: number;
+  comments: number;
+  shares: number;
+  favorites: number;
+  last_sync_at?: string;
+}
+
+export interface WorkAnalyticsRow {
+  work_id: number;
+  account_id: number;
+  platform: string;
+  account_name: string;
+  title: string;
+  content_type: string;
+  status: string;
+  reads: number;
+  recommends: number;
+  likes: number;
+  comments: number;
+  shares: number;
+  favorites: number;
+  published_at?: string;
+  updated_at?: string;
 }

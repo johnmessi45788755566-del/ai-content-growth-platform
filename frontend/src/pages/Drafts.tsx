@@ -1,6 +1,6 @@
 import { Alert, Button, Card, DatePicker, message, Popconfirm, Space, Table } from 'antd';
 import { useEffect, useState } from 'react';
-import { MetricCards, Status } from '@/components/Common';
+import { MetricCards } from '@/components/Common';
 import { api } from '@/services/api';
 import type { Draft } from '@/types';
 
@@ -79,7 +79,7 @@ export default function Drafts() {
           dataSource={drafts}
           columns={[
             { title: '草稿标题', dataIndex: 'title', render: (value) => <strong>{value}</strong> },
-            { title: '当前步骤', render: (_, row) => <Status value={row.stage} /> },
+            { title: '当前步骤', render: (_, row) => <span className="status draft-stage-status">{row.stage}</span> },
             { title: '内容平台', dataIndex: 'platform' },
             { title: '更新时间', render: (_, row) => formatTime(row.updated_at) },
             {
