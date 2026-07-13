@@ -106,7 +106,7 @@ class Database:
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
                   account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
-                  platform TEXT NOT NULL,
+                  platform TEXT NOT NULL CHECK(platform = '微信公众号'),
                   action TEXT NOT NULL CHECK(action IN ('draft', 'publish')),
                   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
                     'pending', 'checking_login', 'uploading_assets', 'filling_content',
@@ -115,12 +115,31 @@ class Database:
                   platform_draft_id TEXT NOT NULL DEFAULT '',
                   platform_publish_id TEXT NOT NULL DEFAULT '',
                   platform_url TEXT NOT NULL DEFAULT '',
-                  response_json TEXT NOT NULL DEFAULT '{}',
+                  response_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(response_json)),
                   requires_confirmation INTEGER NOT NULL DEFAULT 0 CHECK(requires_confirmation IN (0, 1)),
                   failure_stage TEXT NOT NULL DEFAULT '',
                   failure_reason TEXT NOT NULL DEFAULT '',
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  CHECK(
+                    status NOT IN ('platform_draft', 'published')
+                    OR (
+                      status = 'platform_draft'
+                      AND (
+                        length(trim(platform_draft_id)) > 0
+                        OR (json_valid(response_json) AND json_type(response_json) = 'object' AND json(response_json) <> '{}')
+                      )
+                    )
+                    OR (
+                      status = 'published'
+                      AND (
+                        length(trim(platform_publish_id)) > 0
+                        OR length(trim(platform_url)) > 0
+                        OR (json_valid(response_json) AND json_type(response_json) = 'object' AND json(response_json) <> '{}')
+                      )
+                    )
+                  ),
+                  CHECK(status <> 'awaiting_confirmation' OR requires_confirmation = 1)
                 );
 
                 CREATE TABLE IF NOT EXISTS account_metric_snapshots (
@@ -175,7 +194,7 @@ class Database:
                   selected_title TEXT NOT NULL DEFAULT '',
                   title_direction TEXT NOT NULL DEFAULT '',
                   status TEXT NOT NULL DEFAULT '待执行',
-                  publish_action TEXT NOT NULL DEFAULT 'publish',
+                  publish_action TEXT NOT NULL DEFAULT 'publish' CHECK(publish_action IN ('draft', 'publish')),
                   account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL,
                   publish_result TEXT NOT NULL DEFAULT '',
                   manual_takeover_url TEXT NOT NULL DEFAULT '',
@@ -229,6 +248,96 @@ class Database:
             ]:
                 with suppress(sqlite3.OperationalError):
                     conn.execute(column_sql)
+
+            conn.executescript(
+                """
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_insert
+                BEFORE INSERT ON publish_jobs
+                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_update
+                BEFORE UPDATE OF platform ON publish_jobs
+                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_account_insert
+                BEFORE INSERT ON publish_jobs
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM publish_jobs
+                  WHERE project_id = NEW.project_id AND account_id <> NEW.account_id
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs project_id must use one account_id');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_account_update
+                BEFORE UPDATE OF project_id, account_id ON publish_jobs
+                WHEN EXISTS (
+                  SELECT 1
+                  FROM publish_jobs
+                  WHERE id <> NEW.id AND project_id = NEW.project_id AND account_id <> NEW.account_id
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs project_id must use one account_id');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_result_insert
+                BEFORE INSERT ON publish_jobs
+                WHEN (
+                  (NEW.status = 'platform_draft' AND NOT (
+                    length(trim(COALESCE(NEW.platform_draft_id, ''))) > 0
+                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                  ))
+                  OR (NEW.status = 'published' AND NOT (
+                    length(trim(COALESCE(NEW.platform_publish_id, ''))) > 0
+                    OR length(trim(COALESCE(NEW.platform_url, ''))) > 0
+                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                  ))
+                  OR (NEW.status = 'awaiting_confirmation' AND COALESCE(NEW.requires_confirmation, 0) <> 1)
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs status requires platform evidence');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_result_update
+                BEFORE UPDATE OF status, platform_draft_id, platform_publish_id, platform_url, response_json, requires_confirmation ON publish_jobs
+                WHEN (
+                  (NEW.status = 'platform_draft' AND NOT (
+                    length(trim(COALESCE(NEW.platform_draft_id, ''))) > 0
+                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                  ))
+                  OR (NEW.status = 'published' AND NOT (
+                    length(trim(COALESCE(NEW.platform_publish_id, ''))) > 0
+                    OR length(trim(COALESCE(NEW.platform_url, ''))) > 0
+                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                  ))
+                  OR (NEW.status = 'awaiting_confirmation' AND COALESCE(NEW.requires_confirmation, 0) <> 1)
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs status requires platform evidence');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS scheduled_tasks_publish_action_insert
+                BEFORE INSERT ON scheduled_tasks
+                WHEN COALESCE(NEW.publish_action, '') NOT IN ('draft', 'publish')
+                BEGIN
+                  SELECT RAISE(ABORT, 'scheduled_tasks publish_action must be draft or publish');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS scheduled_tasks_publish_action_update
+                BEFORE UPDATE OF publish_action ON scheduled_tasks
+                WHEN COALESCE(NEW.publish_action, '') NOT IN ('draft', 'publish')
+                BEGIN
+                  SELECT RAISE(ABORT, 'scheduled_tasks publish_action must be draft or publish');
+                END;
+                """
+            )
 
     def fetch_one(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         with self.connect() as conn:

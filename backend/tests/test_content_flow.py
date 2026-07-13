@@ -1,4 +1,7 @@
+import sqlite3
 from pathlib import Path
+
+import pytest
 
 from app.ai import GeneratedImage, TopicRecommendation
 from app.database import Database
@@ -107,3 +110,117 @@ def test_publish_jobs_schema_and_default_task_action(tmp_path):
     assert service.db.fetch_one("SELECT publish_action FROM scheduled_tasks WHERE id = ?", (task_id,)) == {
         "publish_action": "publish",
     }
+
+
+def test_publish_jobs_rejects_non_wechat_platform(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("平台约束测试", platform="微信公众号")
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "浏览器授权账号"),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+            (project["id"], account_id, "小红书", "draft", "pending"),
+        )
+
+
+def test_publish_jobs_allow_retries_for_one_account_but_reject_account_switch(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("账号一致性测试", platform="微信公众号")
+    first_account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "第一个账号"),
+    )
+    second_account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "第二个账号"),
+    )
+
+    service.db.execute(
+        "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+        (project["id"], first_account_id, "微信公众号", "draft", "failed"),
+    )
+    retry_job_id = service.db.execute(
+        "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+        (project["id"], first_account_id, "微信公众号", "publish", "pending"),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+            (project["id"], second_account_id, "微信公众号", "publish", "pending"),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            "UPDATE publish_jobs SET account_id = ? WHERE id = ?",
+            (second_account_id, retry_job_id),
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "extra_columns"),
+    [
+        ("platform_draft", ""),
+        ("published", ""),
+        ("awaiting_confirmation", ", requires_confirmation"),
+    ],
+)
+def test_publish_jobs_reject_success_states_without_platform_evidence(tmp_path, status, extra_columns):
+    service = make_service(tmp_path)
+    project = service.create_project(f"证据约束测试-{status}", platform="微信公众号")
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "浏览器授权账号"),
+    )
+    columns = "project_id, account_id, platform, action, status" + extra_columns
+    placeholders = "?, ?, ?, ?, ?" + (", ?" if extra_columns else "")
+    params = (project["id"], account_id, "微信公众号", "publish", status) + ((0,) if extra_columns else ())
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            f"INSERT INTO publish_jobs ({columns}) VALUES ({placeholders})",
+            params,
+        )
+
+
+def test_publish_jobs_accept_platform_evidence_and_confirmation(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("证据通过测试", platform="微信公众号")
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "浏览器授权账号"),
+    )
+
+    for status, fields in [
+        ("platform_draft", {"platform_draft_id": "draft-1"}),
+        ("published", {"platform_url": "https://mp.weixin.qq.com/s/published"}),
+        ("awaiting_confirmation", {"requires_confirmation": 1}),
+    ]:
+        columns = ["project_id", "account_id", "platform", "action", "status", *fields]
+        values = [project["id"], account_id, "微信公众号", "publish", status, *fields.values()]
+        placeholders = ", ".join("?" for _ in columns)
+        service.db.execute(
+            f"INSERT INTO publish_jobs ({', '.join(columns)}) VALUES ({placeholders})",
+            tuple(values),
+        )
+
+
+def test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration(tmp_path):
+    database_path = tmp_path / "legacy.db"
+    with sqlite3.connect(database_path) as conn:
+        conn.execute("CREATE TABLE scheduled_tasks (id INTEGER PRIMARY KEY)")
+
+    db = Database(database_path)
+    db.init_schema()
+
+    task_id = db.execute("INSERT INTO scheduled_tasks (publish_action) VALUES (?)", ("draft",))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO scheduled_tasks (publish_action) VALUES (?)", ("invalid",))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("UPDATE scheduled_tasks SET publish_action = ? WHERE id = ?", ("invalid", task_id))
