@@ -300,6 +300,30 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
                 END;
 
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_account_platform_update
+                BEFORE UPDATE OF platform ON platform_accounts
+                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM publish_jobs
+                    WHERE account_id = NEW.id
+                  )
+                BEGIN
+                  SELECT RAISE(ABORT, 'referenced platform account must remain 微信公众号');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_project_platform_update
+                BEFORE UPDATE OF platform ON content_projects
+                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM publish_jobs
+                    WHERE project_id = NEW.id
+                  )
+                BEGIN
+                  SELECT RAISE(ABORT, 'referenced content project must remain 微信公众号');
+                END;
+
                 CREATE TRIGGER IF NOT EXISTS publish_jobs_account_insert
                 BEFORE INSERT ON publish_jobs
                 WHEN EXISTS (

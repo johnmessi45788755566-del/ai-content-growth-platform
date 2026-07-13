@@ -162,6 +162,28 @@ def test_publish_jobs_reject_non_wechat_account_and_project_on_insert_and_update
         service.db.execute("UPDATE publish_jobs SET project_id = ? WHERE id = ?", (xhs_project["id"], job_id))
 
 
+def test_publish_jobs_block_parent_platform_downgrades(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("父表平台保护测试", platform="微信公众号")
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "公众号账号"),
+    )
+    service.db.execute(
+        "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+        (project["id"], account_id, "微信公众号", "draft", "pending"),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute("UPDATE platform_accounts SET platform = ? WHERE id = ?", ("小红书", account_id))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute("UPDATE content_projects SET platform = ? WHERE id = ?", ("小红书", project["id"]))
+
+    service.db.execute("UPDATE platform_accounts SET name = ? WHERE id = ?", ("更新后的公众号账号", account_id))
+    service.db.execute("UPDATE content_projects SET title = ? WHERE id = ?", ("更新后的项目", project["id"]))
+
+
 def test_publish_jobs_allow_retries_for_one_account_but_reject_account_switch(tmp_path):
     service = make_service(tmp_path)
     project = service.create_project("账号一致性测试", platform="微信公众号")
