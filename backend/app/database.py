@@ -127,15 +127,20 @@ class Database:
                       status = 'platform_draft'
                       AND (
                         length(trim(platform_draft_id)) > 0
-                        OR (json_valid(response_json) AND json_type(response_json) = 'object' AND json(response_json) <> '{}')
+                        AND platform_url LIKE 'https://mp.weixin.qq.com/%'
+                        AND json_valid(response_json)
+                        AND json_type(response_json) = 'object'
+                        AND json(response_json) <> '{}'
                       )
                     )
                     OR (
                       status = 'published'
                       AND (
                         length(trim(platform_publish_id)) > 0
-                        OR length(trim(platform_url)) > 0
-                        OR (json_valid(response_json) AND json_type(response_json) = 'object' AND json(response_json) <> '{}')
+                        AND platform_url LIKE 'https://mp.weixin.qq.com/%'
+                        AND json_valid(response_json)
+                        AND json_type(response_json) = 'object'
+                        AND json(response_json) <> '{}'
                       )
                     )
                   ),
@@ -265,6 +270,36 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
                 END;
 
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_refs_insert
+                BEFORE INSERT ON publish_jobs
+                WHEN NOT EXISTS (
+                  SELECT 1
+                  FROM platform_accounts
+                  WHERE id = NEW.account_id AND platform = '微信公众号'
+                ) OR NOT EXISTS (
+                  SELECT 1
+                  FROM content_projects
+                  WHERE id = NEW.project_id AND platform = '微信公众号'
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_refs_update
+                BEFORE UPDATE OF project_id, account_id ON publish_jobs
+                WHEN NOT EXISTS (
+                  SELECT 1
+                  FROM platform_accounts
+                  WHERE id = NEW.account_id AND platform = '微信公众号'
+                ) OR NOT EXISTS (
+                  SELECT 1
+                  FROM content_projects
+                  WHERE id = NEW.project_id AND platform = '微信公众号'
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
+                END;
+
                 CREATE TRIGGER IF NOT EXISTS publish_jobs_account_insert
                 BEFORE INSERT ON publish_jobs
                 WHEN EXISTS (
@@ -292,12 +327,17 @@ class Database:
                 WHEN (
                   (NEW.status = 'platform_draft' AND NOT (
                     length(trim(COALESCE(NEW.platform_draft_id, ''))) > 0
-                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND json_valid(COALESCE(NEW.response_json, '{}'))
+                    AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
+                    AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
                   ))
                   OR (NEW.status = 'published' AND NOT (
                     length(trim(COALESCE(NEW.platform_publish_id, ''))) > 0
-                    OR length(trim(COALESCE(NEW.platform_url, ''))) > 0
-                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND json_valid(COALESCE(NEW.response_json, '{}'))
+                    AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
+                    AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
                   ))
                   OR (NEW.status = 'awaiting_confirmation' AND COALESCE(NEW.requires_confirmation, 0) <> 1)
                 )
@@ -310,12 +350,17 @@ class Database:
                 WHEN (
                   (NEW.status = 'platform_draft' AND NOT (
                     length(trim(COALESCE(NEW.platform_draft_id, ''))) > 0
-                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND json_valid(COALESCE(NEW.response_json, '{}'))
+                    AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
+                    AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
                   ))
                   OR (NEW.status = 'published' AND NOT (
                     length(trim(COALESCE(NEW.platform_publish_id, ''))) > 0
-                    OR length(trim(COALESCE(NEW.platform_url, ''))) > 0
-                    OR (json_valid(COALESCE(NEW.response_json, '{}')) AND json_type(COALESCE(NEW.response_json, '{}')) = 'object' AND json(COALESCE(NEW.response_json, '{}')) <> '{}')
+                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND json_valid(COALESCE(NEW.response_json, '{}'))
+                    AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
+                    AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
                   ))
                   OR (NEW.status = 'awaiting_confirmation' AND COALESCE(NEW.requires_confirmation, 0) <> 1)
                 )

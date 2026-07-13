@@ -127,6 +127,41 @@ def test_publish_jobs_rejects_non_wechat_platform(tmp_path):
         )
 
 
+def test_publish_jobs_reject_non_wechat_account_and_project_on_insert_and_update(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("跨表平台约束测试", platform="微信公众号")
+    xhs_project = service.create_project("小红书项目", platform="小红书")
+    wechat_account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "公众号账号"),
+    )
+    xhs_account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("小红书", "小红书账号"),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+            (project["id"], xhs_account_id, "微信公众号", "draft", "pending"),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+            (xhs_project["id"], wechat_account_id, "微信公众号", "draft", "pending"),
+        )
+
+    job_id = service.db.execute(
+        "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+        (project["id"], wechat_account_id, "微信公众号", "draft", "pending"),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute("UPDATE publish_jobs SET account_id = ? WHERE id = ?", (xhs_account_id, job_id))
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute("UPDATE publish_jobs SET project_id = ? WHERE id = ?", (xhs_project["id"], job_id))
+
+
 def test_publish_jobs_allow_retries_for_one_account_but_reject_account_switch(tmp_path):
     service = make_service(tmp_path)
     project = service.create_project("账号一致性测试", platform="微信公众号")
@@ -187,6 +222,49 @@ def test_publish_jobs_reject_success_states_without_platform_evidence(tmp_path, 
         )
 
 
+@pytest.mark.parametrize(
+    ("status", "platform_url", "platform_draft_id", "platform_publish_id", "response_json"),
+    [
+        ("platform_draft", "https://example.com/draft", "draft-1", "", '{"media_id":"draft-1"}'),
+        ("platform_draft", "https://mp.weixin.qq.com/draft/1", "", "", '{"media_id":"draft-1"}'),
+        ("platform_draft", "https://mp.weixin.qq.com/draft/1", "draft-1", "", "{}"),
+        ("published", "https://example.com/article", "", "publish-1", '{"publish_id":"publish-1"}'),
+        ("published", "https://mp.weixin.qq.com/s/1", "", "", '{"publish_id":"publish-1"}'),
+        ("published", "https://mp.weixin.qq.com/s/1", "", "publish-1", "{}"),
+    ],
+)
+def test_publish_jobs_reject_fake_url_or_incomplete_platform_evidence(
+    tmp_path, status, platform_url, platform_draft_id, platform_publish_id, response_json
+):
+    service = make_service(tmp_path)
+    project = service.create_project(f"严格证据测试-{status}", platform="微信公众号")
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "浏览器授权账号"),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        service.db.execute(
+            """
+            INSERT INTO publish_jobs (
+              project_id, account_id, platform, action, status,
+              platform_draft_id, platform_publish_id, platform_url, response_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                project["id"],
+                account_id,
+                "微信公众号",
+                "publish",
+                status,
+                platform_draft_id,
+                platform_publish_id,
+                platform_url,
+                response_json,
+            ),
+        )
+
+
 def test_publish_jobs_accept_platform_evidence_and_confirmation(tmp_path):
     service = make_service(tmp_path)
     project = service.create_project("证据通过测试", platform="微信公众号")
@@ -196,8 +274,22 @@ def test_publish_jobs_accept_platform_evidence_and_confirmation(tmp_path):
     )
 
     for status, fields in [
-        ("platform_draft", {"platform_draft_id": "draft-1"}),
-        ("published", {"platform_url": "https://mp.weixin.qq.com/s/published"}),
+        (
+            "platform_draft",
+            {
+                "platform_draft_id": "draft-1",
+                "platform_url": "https://mp.weixin.qq.com/draft/1",
+                "response_json": '{"media_id":"draft-1"}',
+            },
+        ),
+        (
+            "published",
+            {
+                "platform_publish_id": "publish-1",
+                "platform_url": "https://mp.weixin.qq.com/s/published",
+                "response_json": '{"publish_id":"publish-1"}',
+            },
+        ),
         ("awaiting_confirmation", {"requires_confirmation": 1}),
     ]:
         columns = ["project_id", "account_id", "platform", "action", "status", *fields]
