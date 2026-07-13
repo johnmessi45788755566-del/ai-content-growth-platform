@@ -78,3 +78,32 @@ def test_content_creation_flow_persists_article_images_draft_and_publish_package
     package = service.create_publish_package(project["id"], platform="微信公众号", account_name="AI 记账工具公众号")
     assert package["status"] == "pending_publish"
     assert package["platform"] == "微信公众号"
+
+
+def test_publish_jobs_schema_and_default_task_action(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("浏览器发布测试", platform="微信公众号")
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("微信公众号", "浏览器授权账号"),
+    )
+
+    job_id = service.db.execute(
+        "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+        (project["id"], account_id, "微信公众号", "draft", "pending"),
+    )
+    assert service.db.fetch_one("SELECT action, status FROM publish_jobs WHERE id = ?", (job_id,)) == {
+        "action": "draft",
+        "status": "pending",
+    }
+
+    task_id = service.db.execute(
+        """
+        INSERT INTO scheduled_tasks (platform, account_name, execute_time, task_type, topic)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        ("微信公众号", "浏览器授权账号", "2026-07-13 10:00", "微信公众号图文生成", "测试发布"),
+    )
+    assert service.db.fetch_one("SELECT publish_action FROM scheduled_tasks WHERE id = ?", (task_id,)) == {
+        "publish_action": "publish",
+    }

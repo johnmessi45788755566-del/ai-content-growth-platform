@@ -102,6 +102,27 @@ class Database:
                   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
+                CREATE TABLE IF NOT EXISTS publish_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
+                  account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+                  platform TEXT NOT NULL,
+                  action TEXT NOT NULL CHECK(action IN ('draft', 'publish')),
+                  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+                    'pending', 'checking_login', 'uploading_assets', 'filling_content',
+                    'platform_draft', 'publishing', 'awaiting_confirmation', 'published', 'failed'
+                  )),
+                  platform_draft_id TEXT NOT NULL DEFAULT '',
+                  platform_publish_id TEXT NOT NULL DEFAULT '',
+                  platform_url TEXT NOT NULL DEFAULT '',
+                  response_json TEXT NOT NULL DEFAULT '{}',
+                  requires_confirmation INTEGER NOT NULL DEFAULT 0 CHECK(requires_confirmation IN (0, 1)),
+                  failure_stage TEXT NOT NULL DEFAULT '',
+                  failure_reason TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
                 CREATE TABLE IF NOT EXISTS account_metric_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
@@ -154,6 +175,7 @@ class Database:
                   selected_title TEXT NOT NULL DEFAULT '',
                   title_direction TEXT NOT NULL DEFAULT '',
                   status TEXT NOT NULL DEFAULT '待执行',
+                  publish_action TEXT NOT NULL DEFAULT 'publish',
                   account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL,
                   publish_result TEXT NOT NULL DEFAULT '',
                   manual_takeover_url TEXT NOT NULL DEFAULT '',
@@ -188,6 +210,7 @@ class Database:
             for column_sql in [
                 "ALTER TABLE publish_packages ADD COLUMN account_id INTEGER",
                 "ALTER TABLE scheduled_tasks ADD COLUMN account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL",
+                "ALTER TABLE scheduled_tasks ADD COLUMN publish_action TEXT NOT NULL DEFAULT 'publish'",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_result TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN manual_takeover_url TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'once'",
