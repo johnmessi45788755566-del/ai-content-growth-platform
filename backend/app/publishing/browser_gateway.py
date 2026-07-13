@@ -1,13 +1,15 @@
 import base64
 import html
 import json
+import os
+import secrets
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -24,13 +26,13 @@ EDITOR_SELECTORS = (".ProseMirror[contenteditable='true']", "#ueditor_0", "[cont
 COVER_FILE_SELECTORS = (
     ".js_cover_area input[type='file']",
     ".js_cover_upload input[type='file']",
-    "input[type='file'][accept*='image']",
+    ".cover-upload input[type='file']",
 )
 INLINE_FILE_SELECTORS = (
     ".js_editor_insertimage input[type='file']",
     ".edui-for-insertimage input[type='file']",
     ".js_image_upload input[type='file']",
-    "input[type='file'][accept*='image']",
+    ".editor-image-upload input[type='file']",
 )
 NEW_ARTICLE_SELECTORS = (
     "a[href*='appmsg_edit']",
@@ -64,6 +66,17 @@ class BrowserSession:
     websocket_url: str
     process: subprocess.Popen[Any] | None = None
     url: str = WECHAT_HOME_URL
+    confirmation_screenshot: str = ""
+
+
+@dataclass
+class PendingConfirmation:
+    session: BrowserSession
+    account_key: str
+    profile_path: Path
+    title: str
+    baseline: dict[str, Any]
+    timer: Any
 
 
 class ChromeCDPBrowserGateway:
@@ -72,11 +85,21 @@ class ChromeCDPBrowserGateway:
         chrome_path: str | Path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         startup_timeout: float = 20,
         result_timeout: float = 45,
+        auth_timeout: float = 12,
+        upload_timeout: float = 30,
+        pending_timeout: float = 300,
+        timer_factory: Any = threading.Timer,
     ):
         self.chrome_path = Path(chrome_path)
         self.startup_timeout = startup_timeout
         self.result_timeout = result_timeout
+        self.auth_timeout = auth_timeout
+        self.upload_timeout = upload_timeout
+        self.pending_timeout = pending_timeout
+        self.timer_factory = timer_factory
         self._sessions: dict[str, BrowserSession] = {}
+        self._pending: dict[str, PendingConfirmation] = {}
+        self._lock = threading.Lock()
 
     def open_profile(self, profile_path: Path, url: str) -> BrowserSession:
         profile_path = profile_path.expanduser().resolve()
@@ -85,76 +108,125 @@ class ChromeCDPBrowserGateway:
         if not self.chrome_path.is_file():
             raise WeChatPublishingError("未找到 Google Chrome，无法打开微信公众号后台")
         port = self._free_port()
-        process = subprocess.Popen(
-            [
-                str(self.chrome_path),
-                f"--user-data-dir={profile_path}",
-                f"--remote-debugging-port={port}",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-allow-origins=*",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-sync",
-                "--new-window",
-                url,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        process = None
+        session = None
         try:
+            process = subprocess.Popen(
+                [
+                    str(self.chrome_path),
+                    f"--user-data-dir={profile_path}",
+                    f"--remote-debugging-port={port}",
+                    "--remote-debugging-address=127.0.0.1",
+                    "--remote-allow-origins=*",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-sync",
+                    "--new-window",
+                    url,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
             target = self._wait_for_target(port, process)
+            session = BrowserSession(
+                session_id=secrets.token_urlsafe(24),
+                profile_path=profile_path,
+                port=port,
+                target_id=str(target["id"]),
+                websocket_url=str(target["webSocketDebuggerUrl"]),
+                process=process,
+                url=str(target.get("url") or url),
+            )
+            self._sessions[session.session_id] = session
+            self.navigate(session, url)
+            return session
         except Exception:
-            if process.poll() is None:
-                process.terminate()
+            if session is not None:
+                self.close(session)
+            elif process is not None:
+                self._stop_process(process, graceful=False)
             raise
-        session = BrowserSession(
-            session_id=uuid.uuid4().hex,
-            profile_path=profile_path,
-            port=port,
-            target_id=str(target["id"]),
-            websocket_url=str(target["webSocketDebuggerUrl"]),
-            process=process,
-            url=str(target.get("url") or url),
-        )
-        self._sessions[session.session_id] = session
-        self.navigate(session, url)
-        return session
 
-    def resume_profile(self, profile_path: Path, job_context: Mapping[str, Any]) -> BrowserSession:
-        session_id = str(job_context.get("session_id") or "")
-        retained = self._sessions.get(session_id)
-        if retained and retained.profile_path == profile_path.expanduser().resolve():
-            self._refresh_target(retained)
-            return retained
-        try:
-            port = int(job_context["debug_port"])
-            target_id = str(job_context["target_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise WeChatPublishingError("扫码确认会话信息不完整，无法恢复") from exc
-        target = self._target(port, target_id)
-        if not target:
-            raise WeChatPublishingError("扫码确认浏览器会话已关闭，请重新发起发布")
-        session = BrowserSession(
-            session_id=session_id or uuid.uuid4().hex,
-            profile_path=profile_path.expanduser().resolve(),
-            port=port,
-            target_id=target_id,
-            websocket_url=str(target["webSocketDebuggerUrl"]),
-            url=str(target.get("url") or job_context.get("platform_url") or WECHAT_HOME_URL),
+    def retain_confirmation(
+        self,
+        session: BrowserSession,
+        account_key: str,
+        title: str,
+        baseline: Mapping[str, Any],
+    ) -> str:
+        self._require_session_host(session)
+        handle = secrets.token_urlsafe(32)
+        timer = self.timer_factory(
+            self.pending_timeout, lambda: self._expire_pending(handle)
         )
-        self._sessions[session.session_id] = session
-        return session
+        if hasattr(timer, "daemon"):
+            timer.daemon = True
+        pending = PendingConfirmation(
+            session=session,
+            account_key=account_key,
+            profile_path=session.profile_path.resolve(),
+            title=title,
+            baseline=dict(baseline),
+            timer=timer,
+        )
+        with self._lock:
+            self._pending[handle] = pending
+        timer.start()
+        return handle
+
+    def resume_profile(
+        self, profile_path: Path, resume_handle: str, account_key: str
+    ) -> tuple[BrowserSession, str, dict[str, Any]]:
+        with self._lock:
+            pending = self._pending.get(resume_handle)
+        if not pending:
+            raise WeChatPublishingError("扫码确认恢复句柄不存在或已过期")
+        if pending.account_key != account_key:
+            raise WeChatPublishingError("扫码确认恢复句柄与账号不匹配")
+        if pending.profile_path != profile_path.expanduser().resolve():
+            raise WeChatPublishingError("扫码确认恢复句柄与浏览器 Profile 不匹配")
+        self._require_session_host(pending.session)
+        with self._lock:
+            current = self._pending.pop(resume_handle, None)
+        if current is not pending:
+            raise WeChatPublishingError("扫码确认恢复句柄已被使用")
+        pending.timer.cancel()
+        return pending.session, pending.title, dict(pending.baseline)
+
+    def cancel_pending(self, resume_handle: str, account_key: str) -> None:
+        with self._lock:
+            pending = self._pending.get(resume_handle)
+            if not pending:
+                raise WeChatPublishingError("扫码确认恢复句柄不存在或已过期")
+            if pending.account_key != account_key:
+                raise WeChatPublishingError("扫码确认恢复句柄与账号不匹配")
+            self._pending.pop(resume_handle, None)
+        pending.timer.cancel()
+        self.close(pending.session)
+
+    def _expire_pending(self, resume_handle: str) -> None:
+        with self._lock:
+            pending = self._pending.pop(resume_handle, None)
+        if pending:
+            self.close(pending.session)
 
     def navigate(self, session: BrowserSession, url: str) -> None:
         self._cdp_call(session, "Page.navigate", {"url": url})
         self._wait_for_document(session)
 
     def evaluate(self, session: BrowserSession, expression: str) -> Any:
-        result = self._cdp_call(
+        payload = self._cdp_call(
             session,
             "Runtime.evaluate",
             {"expression": expression, "returnByValue": True, "awaitPromise": True},
-        ).get("result") or {}
+        )
+        exception = payload.get("exceptionDetails") or {}
+        if exception:
+            detail = exception.get("exception") or {}
+            raise WeChatPublishingError(
+                str(detail.get("description") or exception.get("text") or "微信页面脚本执行失败")
+            )
+        result = payload.get("result") or {}
         if result.get("subtype") == "error":
             raise WeChatPublishingError(str(result.get("description") or "微信页面脚本执行失败"))
         return result.get("value")
@@ -165,64 +237,131 @@ class ChromeCDPBrowserGateway:
         selector_candidates: Sequence[str],
         file_path: str | Path,
         label: str = "图片",
-    ) -> str:
+        role: str = "inline",
+    ) -> dict[str, Any]:
         path = Path(file_path).expanduser().resolve()
         if not path.is_file():
             raise WeChatPublishingError(f"{label}文件不存在：{path}")
-        expression = self._candidate_expression(selector_candidates, "node")
-        remote = self._cdp_call(
+        if role not in {"cover", "inline"}:
+            raise WeChatPublishingError("图片上传角色必须是 cover 或 inline")
+        before = set(self._remote_image_state(session, role).get("urls") or [])
+        expression = self._file_input_expression(selector_candidates)
+        payload = self._cdp_call(
             session,
             "Runtime.evaluate",
             {"expression": expression, "returnByValue": False},
-        ).get("result") or {}
+        )
+        exception = payload.get("exceptionDetails") or {}
+        if exception:
+            detail = exception.get("exception") or {}
+            message = str(detail.get("description") or exception.get("text") or "上传控件无效")
+            raise WeChatPublishingError(f"微信编辑器{label}上传控件无效：{message}")
+        remote = payload.get("result") or {}
         object_id = str(remote.get("objectId") or "")
         if not object_id:
             raise WeChatPublishingError(
                 f"微信编辑器未找到{label}上传控件，已尝试选择器：{', '.join(selector_candidates)}"
             )
         self._cdp_call(session, "DOM.setFileInputFiles", {"files": [str(path)], "objectId": object_id})
-        return str(self.evaluate(session, f"({expression}).selector") or "")
+        return self._wait_for_uploaded_image(session, role, before)
 
     def screenshot(self, session: BrowserSession, destination: str | Path | None = None) -> str:
-        path = Path(destination) if destination else Path(tempfile.gettempdir()) / f"wechat-confirm-{int(time.time())}.png"
+        if destination:
+            path = Path(destination)
+        else:
+            descriptor, raw_path = tempfile.mkstemp(prefix="wechat-confirm-", suffix=".png")
+            os.close(descriptor)
+            path = Path(raw_path)
         result = self._cdp_call(session, "Page.captureScreenshot", {"format": "png", "fromSurface": True})
         data = str(result.get("data") or "")
         if not data:
             raise WeChatPublishingError("微信确认页面截图失败")
         path.write_bytes(base64.b64decode(data))
+        path.chmod(0o600)
         return str(path)
 
     def close(self, session: BrowserSession) -> None:
         self._sessions.pop(session.session_id, None)
+        with self._lock:
+            handles = [
+                handle
+                for handle, pending in self._pending.items()
+                if pending.session is session
+            ]
+            pending_items = [self._pending.pop(handle) for handle in handles]
+        for pending in pending_items:
+            pending.timer.cancel()
+        graceful = False
         try:
             self._cdp_call(session, "Browser.close")
+            graceful = True
         except Exception:
-            if session.process and session.process.poll() is None:
-                session.process.terminate()
-
-    def session_context(self, session: BrowserSession) -> dict[str, Any]:
-        current_url = self._current_url(session)
-        return {
-            "session_id": session.session_id,
-            "debug_port": session.port,
-            "target_id": session.target_id,
-            "profile_path": str(session.profile_path),
-            "platform_url": current_url,
-        }
+            pass
+        if session.process:
+            self._stop_process(session.process, graceful=graceful)
+        if session.confirmation_screenshot:
+            try:
+                Path(session.confirmation_screenshot).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def require_authenticated(self, session: BrowserSession) -> None:
-        deadline = time.time() + 12
+        deadline = time.time() + self.auth_timeout
         last_url = ""
-        while time.time() < deadline:
+        while True:
             last_url = self._current_url(session)
-            if "/cgi-bin/" in last_url and "token=" in last_url:
+            parsed = urllib.parse.urlparse(last_url)
+            if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+                raise WeChatPublishingError("微信公众号当前页面不是 mp.weixin.qq.com，已终止发布")
+            token = urllib.parse.parse_qs(parsed.query).get("token", [""])[0].strip()
+            if (
+                parsed.path.startswith("/cgi-bin/")
+                and token
+                and self._dashboard_token_verified(session)
+            ):
                 return
             cookies = self._cdp_call(session, "Network.getAllCookies").get("cookies") or []
-            names = {str(cookie.get("name") or "") for cookie in cookies}
-            if names & {"slave_sid", "bizuin"}:
+            valid_names = {
+                str(cookie.get("name") or "")
+                for cookie in cookies
+                if self._valid_auth_cookie(cookie)
+            }
+            if {"slave_sid", "bizuin"}.issubset(valid_names):
                 return
+            if time.time() >= deadline:
+                break
             time.sleep(0.5)
         raise WeChatPublishingError(f"微信公众号登录态失效，请重新扫码（当前页面：{last_url or '未知'}）")
+
+    @staticmethod
+    def _valid_auth_cookie(cookie: Mapping[str, Any]) -> bool:
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "").strip()
+        domain = str(cookie.get("domain") or "").lstrip(".").lower()
+        try:
+            expires = float(cookie.get("expires") or 0)
+        except (TypeError, ValueError):
+            return False
+        not_expired = expires <= 0 or expires > time.time()
+        return (
+            name in {"slave_sid", "bizuin"}
+            and bool(value)
+            and domain == "mp.weixin.qq.com"
+            and not_expired
+        )
+
+    def _dashboard_token_verified(self, session: BrowserSession) -> bool:
+        expression = """
+        (() => {
+          const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          const dashboardSelectors = ['.weui-desktop-layout__main', '.weui-desktop-menu', '.weui-desktop-account', '.weui-desktop-account__nickname'];
+          const loginSelectors = ['.login__type__container__scan', '.login_qrcode', '[class*=login] [class*=qrcode]'];
+          const dashboard = dashboardSelectors.some((selector) => [...document.querySelectorAll(selector)].some(visible));
+          const login = loginSelectors.some((selector) => [...document.querySelectorAll(selector)].some(visible));
+          return dashboard && !login;
+        })()
+        """
+        return self.evaluate(session, expression) is True
 
     def open_article_editor(self, session: BrowserSession) -> None:
         current_url = self._current_url(session)
@@ -261,12 +400,23 @@ class ChromeCDPBrowserGateway:
             if content:
                 sections.append(f"<p>{html.escape(content).replace(chr(10), '<br>')}</p>")
         self._set_editor_html(session, "".join(sections))
-        self.set_file_input(session, COVER_FILE_SELECTORS, str(payload["cover_path"]), "封面图")
+        self.set_file_input(
+            session,
+            COVER_FILE_SELECTORS,
+            str(payload["cover_path"]),
+            "封面图",
+            "cover",
+        )
         for block in payload.get("blocks") or []:
             image_path = str(block.get("image_path") or "").strip()
             if image_path:
-                self.set_file_input(session, INLINE_FILE_SELECTORS, image_path, "正文配图")
-                time.sleep(0.5)
+                self.set_file_input(
+                    session,
+                    INLINE_FILE_SELECTORS,
+                    image_path,
+                    "正文配图",
+                    "inline",
+                )
 
     def click_save_draft(self, session: BrowserSession) -> None:
         self._click_first(session, SAVE_DRAFT_SELECTORS, "保存草稿按钮")
@@ -276,52 +426,156 @@ class ChromeCDPBrowserGateway:
         time.sleep(0.8)
         self._click_first(session, PUBLISH_CONFIRM_SELECTORS, "发表确认按钮", required=False)
 
-    def verify_draft(self, session: BrowserSession, title: str) -> dict[str, Any]:
-        return self._wait_for_receipt(session, title, kind="draft")
+    def capture_baseline(
+        self, session: BrowserSession, title: str, action: str
+    ) -> dict[str, Any]:
+        baseline_id = secrets.token_urlsafe(24)
+        self._install_operation_marker(session, baseline_id)
+        observation = self.evaluate(
+            session,
+            self._observation_expression(title, "draft" if action == "draft" else "publish"),
+        )
+        if not isinstance(observation, Mapping):
+            raise WeChatPublishingError("微信页面未返回操作前基线")
+        self._require_wechat_observation_url(str(observation.get("url") or ""))
+        receipts = [
+            receipt
+            for receipt in observation.get("receipts") or []
+            if isinstance(receipt, Mapping)
+            and str(receipt.get("id") or "").strip()
+            and str(receipt.get("title") or "").strip() == title.strip()
+            and receipt.get("source") in {"dom", "api"}
+        ]
+        return {
+            "baseline_id": baseline_id,
+            "receipt_ids": [str(receipt["id"]) for receipt in receipts],
+            "signal_kinds": [
+                str(signal.get("kind") or "")
+                for signal in observation.get("signals") or []
+                if isinstance(signal, Mapping)
+            ],
+            "url": str(observation.get("url") or ""),
+            "title": title,
+            "action": action,
+        }
 
-    def verify_publish_or_confirmation(self, session: BrowserSession, title: str) -> dict[str, Any]:
-        return self._wait_for_receipt(session, title, kind="publish")
+    def verify_draft(
+        self,
+        session: BrowserSession,
+        title: str,
+        baseline: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._wait_for_receipt(session, title, baseline, kind="draft")
 
-    def _wait_for_receipt(self, session: BrowserSession, title: str, kind: str) -> dict[str, Any]:
+    def verify_publish_or_confirmation(
+        self,
+        session: BrowserSession,
+        title: str,
+        baseline: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        return self._wait_for_receipt(session, title, baseline, kind="publish")
+
+    def _wait_for_receipt(
+        self,
+        session: BrowserSession,
+        title: str,
+        baseline: Mapping[str, Any],
+        kind: str,
+    ) -> dict[str, Any]:
+        expected_action = "draft" if kind == "draft" else "publish"
+        if baseline.get("action") != expected_action or baseline.get("title") != title:
+            raise WeChatPublishingError("微信操作基线与当前发布动作不匹配")
         deadline = time.time() + self.result_timeout
-        while time.time() < deadline:
-            observation = self.evaluate(session, self._receipt_expression(title, kind))
+        while True:
+            observation = self.evaluate(session, self._observation_expression(title, kind))
             if not isinstance(observation, dict):
-                time.sleep(0.5)
-                continue
-            platform_url = self._wechat_url(str(observation.get("evidenceUrl") or observation.get("url") or ""))
-            if kind == "publish" and observation.get("confirmation"):
+                observation = {}
+            platform_url = self._require_wechat_observation_url(
+                str(observation.get("url") or "")
+            )
+            same_baseline = str(observation.get("baseline_id") or "") == str(
+                baseline.get("baseline_id") or ""
+            )
+            if (
+                kind == "publish"
+                and same_baseline
+                and observation.get("confirmation")
+                and observation.get("confirmation_after_baseline")
+            ):
                 screenshot = self.screenshot(session)
+                session.confirmation_screenshot = screenshot
                 return {
                     "status": "awaiting_confirmation",
                     "platform_url": platform_url,
-                    "response": {
-                        "selector": observation.get("confirmationSelector"),
-                        "text": observation.get("confirmationText"),
-                        "url": observation.get("url"),
-                        "screenshot": screenshot,
+                    "baseline_id": baseline.get("baseline_id"),
+                    "confirmation": {
+                        "kind": "operator_qr",
+                        "screenshot_available": bool(screenshot),
                     },
                 }
-            platform_id = str(observation.get("platformId") or "").strip()
-            if platform_id and platform_url:
+            receipt = self._new_receipt(observation, baseline, title) if same_baseline else None
+            signal = self._post_action_signal(observation, baseline) if same_baseline else None
+            if receipt and signal:
+                platform_id = str(receipt["id"])
                 return {
                     "status": "platform_draft" if kind == "draft" else "published",
                     "draft_id" if kind == "draft" else "publish_id": platform_id,
                     "platform_url": platform_url,
-                    "response": {
-                        "selector": observation.get("selector"),
-                        "attribute": observation.get("attribute"),
-                        "value": platform_id,
-                        "text": observation.get("text"),
-                        "url": observation.get("url"),
+                    "baseline_id": baseline.get("baseline_id"),
+                    "receipt": {
+                        "id": platform_id,
+                        "title": title,
+                        "source": receipt.get("source"),
+                    },
+                    "post_action_signal": {
+                        "kind": signal.get("kind"),
+                        "observed_after_action": True,
                     },
                 }
+            if time.time() >= deadline:
+                break
             time.sleep(0.5)
         label = "草稿" if kind == "draft" else "发布"
         raise WeChatPublishingError(f"微信页面未返回可验证的{label}结果，请检查浏览器页面后重试")
 
+    def _install_operation_marker(
+        self, session: BrowserSession, baseline_id: str
+    ) -> None:
+        expression = f"""
+        (() => {{
+          window.__codexWechatOperation?.observer?.disconnect();
+          const changed = new WeakSet();
+          const markAncestors = (node) => {{
+            const element = node instanceof Element ? node : node?.parentElement;
+            if (!element) return;
+            let current = element;
+            for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) changed.add(current);
+          }};
+          const markAddedTree = (node) => {{
+            const element = node instanceof Element ? node : node?.parentElement;
+            if (!element) return;
+            markAncestors(element);
+            for (const child of element.querySelectorAll('*')) changed.add(child);
+          }};
+          const observer = new MutationObserver((records) => {{
+            for (const record of records) {{
+              if (record.type === 'childList') {{
+                for (const node of record.addedNodes) markAddedTree(node);
+              }} else {{
+                markAncestors(record.target);
+              }}
+            }}
+          }});
+          observer.observe(document.documentElement, {{subtree: true, childList: true, attributes: true, characterData: true}});
+          window.__codexWechatOperation = {{id: {json.dumps(baseline_id)}, changed, observer}};
+          return true;
+        }})()
+        """
+        if self.evaluate(session, expression) is not True:
+            raise WeChatPublishingError("微信页面无法建立本次发布操作基线")
+
     @staticmethod
-    def _receipt_expression(title: str, kind: str) -> str:
+    def _observation_expression(title: str, kind: str) -> str:
         title_json = json.dumps(title, ensure_ascii=False)
         id_attributes = ["data-draft-id", "data-media-id", "data-appmsgid", "data-id"] if kind == "draft" else ["data-publish-id", "data-msg-id", "data-id"]
         query_names = ["draft_id", "media_id", "appmsgid"] if kind == "draft" else ["publish_id", "msgid"]
@@ -337,42 +591,166 @@ class ChromeCDPBrowserGateway:
           const attributes = {json.dumps(id_attributes)};
           const queryNames = {json.dumps(query_names)};
           const confirmationSelectors = ['.js_qrcode', '.weui-desktop-qrcheck', '[class*=qrcode]', '[class*=qr_code]'];
+          const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          const operation = window.__codexWechatOperation;
+          const changed = (node) => !!operation?.changed?.has(node);
           const bodyText = document.body?.innerText || '';
           const confirmationText = ['管理员扫码', '微信扫码确认', '运营者扫码', '管理员确认'].find((text) => bodyText.includes(text));
+          let confirmation = false;
           if (confirmationText) {{
-            const confirmationNode = confirmationSelectors.map((selector) => [selector, document.querySelector(selector)]).find((item) => item[1]);
-            if (confirmationNode) return {{
-              url: location.href,
-              confirmation: true,
-              confirmationSelector: confirmationNode[0],
-              confirmationText
-            }};
+            confirmation = confirmationSelectors.some((selector) => [...document.querySelectorAll(selector)].some(visible));
           }}
+          const confirmationAfterBaseline = confirmationSelectors.some((selector) => [...document.querySelectorAll(selector)].some((node) => visible(node) && changed(node)));
+          const receipts = [];
           for (const selector of selectors) {{
             for (const node of document.querySelectorAll(selector)) {{
+              if (!visible(node)) continue;
               const container = node.closest('li, tr, article, .weui-desktop-panel, .appmsg, .publish_success') || node;
               const text = (container.innerText || node.innerText || '').trim();
-              if (expectedTitle && text && !text.includes(expectedTitle)) continue;
+              if (!text || !expectedTitle || !text.includes(expectedTitle)) continue;
+              let platformId = '';
               for (const attribute of attributes) {{
                 const value = node.getAttribute(attribute) || container.getAttribute?.(attribute);
-                if (value) return {{url: location.href, selector, attribute, platformId: value, text}};
+                if (value) {{ platformId = value; break; }}
               }}
-              const link = node.closest('a') || node.querySelector?.('a[href]') || container.querySelector?.('a[href]');
-              if (link?.href) {{
+              const link = node.closest('a[href]') || node.querySelector?.('a[href]') || container.querySelector?.('a[href]');
+              if (!platformId && link?.href) {{
                 const parsed = new URL(link.href, location.href);
                 for (const queryName of queryNames) {{
                   const value = parsed.searchParams.get(queryName);
-                  if (value) return {{url: location.href, evidenceUrl: parsed.href, selector, attribute: `href:${{queryName}}`, platformId: value, text}};
+                  if (value) {{ platformId = value; break; }}
                 }}
               }}
+              if (platformId) receipts.push({{id: platformId, title: expectedTitle, source: 'dom', observed_after_baseline: changed(node) || changed(container) || changed(link)}});
             }}
           }}
-          const current = new URL(location.href);
-          for (const queryName of queryNames) {{
-            const value = current.searchParams.get(queryName);
-            if (value) return {{url: location.href, evidenceUrl: location.href, selector: 'location.href', attribute: queryName, platformId: value, text: document.title}};
+          const successSelectors = ['.weui-desktop-toast', '.weui-desktop-tips', '[role=alert]', '.js_success', '.publish_success'];
+          const successWords = ['保存成功', '已保存', '发表成功', '发送成功', '群发成功'];
+          const successMessage = successSelectors.some((selector) => [...document.querySelectorAll(selector)].some((node) => visible(node) && changed(node) && successWords.some((word) => (node.innerText || '').includes(word))));
+          return {{
+            url: location.href,
+            baseline_id: operation?.id || '',
+            confirmation,
+            confirmation_after_baseline: confirmationAfterBaseline,
+            receipts: [...new Map(receipts.map((item) => [item.id, item])).values()],
+            signals: successMessage ? [{{kind: 'success_message', observed_after_baseline: true}}] : []
+          }};
+        }})()
+        """
+
+    @staticmethod
+    def _new_receipt(
+        observation: Mapping[str, Any], baseline: Mapping[str, Any], title: str
+    ) -> Mapping[str, Any] | None:
+        old_ids = {str(value) for value in baseline.get("receipt_ids") or []}
+        for receipt in observation.get("receipts") or []:
+            if not isinstance(receipt, Mapping):
+                continue
+            receipt_id = str(receipt.get("id") or "").strip()
+            receipt_title = str(receipt.get("title") or "").strip()
+            if (
+                receipt_id
+                and receipt_id not in old_ids
+                and receipt_title == title.strip()
+                and receipt.get("source") in {"dom", "api"}
+                and receipt.get("observed_after_baseline") is True
+            ):
+                return receipt
+        return None
+
+    @staticmethod
+    def _post_action_signal(
+        observation: Mapping[str, Any], baseline: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        old_kinds = {str(value) for value in baseline.get("signal_kinds") or []}
+        for signal in observation.get("signals") or []:
+            if not isinstance(signal, Mapping):
+                continue
+            kind = str(signal.get("kind") or "")
+            if (
+                kind in {"success_message", "api_response"}
+                and kind not in old_kinds
+                and signal.get("observed_after_baseline") is True
+            ):
+                return signal
+        return None
+
+    @staticmethod
+    def _require_wechat_observation_url(value: str) -> str:
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+            raise WeChatPublishingError("微信平台观察页面不是 mp.weixin.qq.com")
+        return value
+
+    def _remote_image_state(
+        self, session: BrowserSession, role: str
+    ) -> dict[str, Any]:
+        root_selectors = (
+            [".js_cover_area", ".js_cover_upload", ".cover-upload"]
+            if role == "cover"
+            else [".ProseMirror", "#ueditor_0", ".js_editor"]
+        )
+        expression = f"""
+        (() => {{
+          const roots = {json.dumps(root_selectors)}.flatMap((selector) => [...document.querySelectorAll(selector)]);
+          const urls = [];
+          let loading = false;
+          for (const root of roots) {{
+            loading ||= !!root.querySelector('[class*=loading], .weui-loading, [aria-busy=true]');
+            for (const image of root.querySelectorAll('img[src]')) {{
+              try {{
+                const parsed = new URL(image.src, location.href);
+                if (parsed.protocol === 'https:' && (parsed.hostname.endsWith('.qpic.cn') || parsed.hostname.endsWith('.qlogo.cn'))) urls.push(parsed.href);
+              }} catch (_) {{}}
+            }}
           }}
-          return {{url: location.href}};
+          return {{urls: [...new Set(urls)], loading}};
+        }})()
+        """
+        result = self.evaluate(session, expression)
+        return dict(result) if isinstance(result, Mapping) else {"urls": [], "loading": True}
+
+    def _wait_for_uploaded_image(
+        self, session: BrowserSession, role: str, before: set[str]
+    ) -> dict[str, Any]:
+        deadline = time.time() + self.upload_timeout
+        while True:
+            state = self._remote_image_state(session, role)
+            urls = {
+                str(value)
+                for value in state.get("urls") or []
+                if str(value).startswith("https://")
+            }
+            new_urls = sorted(urls - before)
+            if new_urls and not state.get("loading"):
+                return {
+                    "role": role,
+                    "remote_url": new_urls[0],
+                    "source": "wechat_dom",
+                }
+            if time.time() >= deadline:
+                break
+            time.sleep(0.25)
+        label = "封面图" if role == "cover" else "正文配图"
+        raise WeChatPublishingError(f"微信页面未确认上传完成（{label}），已终止保存")
+
+    @staticmethod
+    def _file_input_expression(selectors: Sequence[str]) -> str:
+        return f"""
+        (() => {{
+          const selectors = {json.dumps(list(selectors))};
+          const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          const visibleControl = (node) => visible(node) || visible(node.closest('label, [role=button], .weui-desktop-upload, .upload-box, [class*=upload]'));
+          for (const selector of selectors) {{
+            const matches = [...document.querySelectorAll(selector)].filter((node) => {{
+              if (!(node instanceof HTMLInputElement) || node.type !== 'file' || node.disabled) return false;
+              const accept = (node.accept || '').toLowerCase();
+              return (accept.includes('image') || accept.includes('.jpg') || accept.includes('.jpeg') || accept.includes('.png')) && visibleControl(node);
+            }});
+            if (matches.length > 1) throw new Error(`ambiguous file input: ${{selector}} (${{matches.length}})`);
+            if (matches.length === 1) return matches[0];
+          }}
+          return null;
         }})()
         """
 
@@ -387,41 +765,55 @@ class ChromeCDPBrowserGateway:
         expression = f"""
         (() => {{
           const selectors = {json.dumps(list(selectors))};
+          const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          let rejected = 0;
           for (const selector of selectors) {{
-            const node = document.querySelector(selector);
-            if (!node) continue;
-            const prototype = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-            const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-            setter ? setter.call(node, {json.dumps(value, ensure_ascii=False)}) : (node.value = {json.dumps(value, ensure_ascii=False)});
+            const all = [...document.querySelectorAll(selector)];
+            const matches = all.filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true' && (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node.isContentEditable));
+            rejected += all.length - matches.length;
+            if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length, selector}};
+            if (matches.length !== 1) continue;
+            const node = matches[0];
+            if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {{
+              const prototype = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+              setter ? setter.call(node, {json.dumps(value, ensure_ascii=False)}) : (node.value = {json.dumps(value, ensure_ascii=False)});
+            }} else {{
+              node.textContent = {json.dumps(value, ensure_ascii=False)};
+            }}
             node.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: {json.dumps(value, ensure_ascii=False)}}}));
             node.dispatchEvent(new Event('change', {{bubbles: true}}));
             return {{ok: true, selector}};
           }}
-          return {{ok: false}};
+          return {{ok: false, reason: rejected ? 'hidden_or_disabled' : 'not_found'}};
         }})()
         """
         result = self.evaluate(session, expression)
-        if required and (not isinstance(result, dict) or not result.get("ok")):
-            raise WeChatPublishingError(f"微信编辑器未找到{label}控件，已尝试选择器：{', '.join(selectors)}")
+        self._require_dom_result(result, label, selectors, required)
 
     def _set_editor_html(self, session: BrowserSession, content_html: str) -> None:
         expression = f"""
         (() => {{
           const selectors = {json.dumps(list(EDITOR_SELECTORS))};
+          const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          let rejected = 0;
           for (const selector of selectors) {{
-            const node = document.querySelector(selector);
-            if (!node) continue;
+            const all = [...document.querySelectorAll(selector)];
+            const matches = all.filter((node) => visible(node) && node.isContentEditable && node.getAttribute('aria-disabled') !== 'true');
+            rejected += all.length - matches.length;
+            if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length, selector}};
+            if (matches.length !== 1) continue;
+            const node = matches[0];
             node.focus();
             node.innerHTML = {json.dumps(content_html, ensure_ascii=False)};
             node.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
             return {{ok: true, selector}};
           }}
-          return {{ok: false}};
+          return {{ok: false, reason: rejected ? 'hidden_or_disabled' : 'not_found'}};
         }})()
         """
         result = self.evaluate(session, expression)
-        if not isinstance(result, dict) or not result.get("ok"):
-            raise WeChatPublishingError(f"微信编辑器未找到正文控件，已尝试选择器：{', '.join(EDITOR_SELECTORS)}")
+        self._require_dom_result(result, "正文", EDITOR_SELECTORS, True)
 
     def _click_first(
         self,
@@ -433,34 +825,46 @@ class ChromeCDPBrowserGateway:
         expression = f"""
         (() => {{
           const selectors = {json.dumps(list(selectors))};
+          const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          let rejected = 0;
           for (const selector of selectors) {{
-            const node = document.querySelector(selector);
-            if (!node || node.disabled || node.getAttribute('aria-disabled') === 'true') continue;
+            const all = [...document.querySelectorAll(selector)];
+            const matches = all.filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
+            rejected += all.length - matches.length;
+            if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length, selector}};
+            if (matches.length !== 1) continue;
+            const node = matches[0];
             node.scrollIntoView({{block: 'center'}});
             node.click();
             return {{ok: true, selector, text: (node.innerText || node.textContent || '').trim()}};
           }}
-          return {{ok: false}};
+          return {{ok: false, reason: rejected ? 'hidden_or_disabled' : 'not_found'}};
         }})()
         """
         result = self.evaluate(session, expression)
         found = isinstance(result, dict) and bool(result.get("ok"))
-        if required and not found:
-            raise WeChatPublishingError(f"微信页面未找到{label}，已尝试选择器：{', '.join(selectors)}")
+        self._require_dom_result(result, label, selectors, required)
         return found
 
     @staticmethod
-    def _candidate_expression(selectors: Sequence[str], result_name: str) -> str:
-        return f"""
-        (() => {{
-          const selectors = {json.dumps(list(selectors))};
-          for (const selector of selectors) {{
-            const {result_name} = document.querySelector(selector);
-            if ({result_name}) {{ {result_name}.selector = selector; return {result_name}; }}
-          }}
-          return null;
-        }})()
-        """
+    def _require_dom_result(
+        result: Any,
+        label: str,
+        selectors: Sequence[str],
+        required: bool,
+    ) -> None:
+        if isinstance(result, Mapping) and result.get("ok"):
+            return
+        reason = str(result.get("reason") or "") if isinstance(result, Mapping) else ""
+        if reason == "ambiguous":
+            raise WeChatPublishingError(
+                f"微信页面{label}控件不唯一，拒绝操作；选择器：{result.get('selector') or ', '.join(selectors)}"
+            )
+        if required:
+            detail = "不可见或不可用" if reason == "hidden_or_disabled" else "未找到"
+            raise WeChatPublishingError(
+                f"微信页面{label}控件{detail}，已尝试选择器：{', '.join(selectors)}"
+            )
 
     def _wait_for_target(self, port: int, process: subprocess.Popen[Any]) -> dict[str, Any]:
         deadline = time.time() + self.startup_timeout
@@ -495,6 +899,12 @@ class ChromeCDPBrowserGateway:
         session.url = str(value or session.url)
         return session.url
 
+    def _require_session_host(self, session: BrowserSession) -> None:
+        current_url = self._current_url(session)
+        parsed = urllib.parse.urlparse(current_url)
+        if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+            raise WeChatPublishingError("扫码确认会话页面不是 mp.weixin.qq.com")
+
     def _refresh_target(self, session: BrowserSession) -> None:
         target = self._target(session.port, session.target_id)
         if not target:
@@ -516,15 +926,27 @@ class ChromeCDPBrowserGateway:
         return next((item for item in self._targets(port) if str(item.get("id")) == target_id), None)
 
     @staticmethod
-    def _wechat_url(value: str) -> str:
-        parsed = urllib.parse.urlparse(value)
-        return value if parsed.scheme == "https" and parsed.hostname == "mp.weixin.qq.com" else ""
-
-    @staticmethod
     def _free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[Any], graceful: bool) -> None:
+        if process.poll() is not None:
+            return
+        if graceful:
+            try:
+                process.wait(timeout=3)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
 
     @staticmethod
     def _cdp_call(session: BrowserSession, method: str, params: Mapping[str, Any] | None = None) -> dict[str, Any]:

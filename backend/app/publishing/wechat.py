@@ -1,4 +1,3 @@
-import json
 import urllib.parse
 from pathlib import Path
 from typing import Any, Mapping
@@ -50,18 +49,24 @@ class WeChatBrowserPublisher:
         self._validate_payload(payload)
         session = None
         preserve_session = False
+        account_key = self._account_key(account)
         try:
             session = self.gateway.open_profile(profile_path, WECHAT_HOME_URL)
             self.gateway.require_authenticated(session)
             self.gateway.open_article_editor(session)
             self.gateway.fill_article(session, payload)
+            baseline = self.gateway.capture_baseline(session, payload["title"], action)
             if action == "draft":
                 self.gateway.click_save_draft(session)
-                outcome = self.gateway.verify_draft(session, payload["title"])
+                outcome = self.gateway.verify_draft(session, payload["title"], baseline)
             else:
                 self.gateway.click_publish(session)
-                outcome = self.gateway.verify_publish_or_confirmation(session, payload["title"])
-            result = self._result(outcome, action, session, payload["title"])
+                outcome = self.gateway.verify_publish_or_confirmation(
+                    session, payload["title"], baseline
+                )
+            result = self._result(
+                outcome, action, session, payload["title"], baseline, account_key
+            )
             preserve_session = result.requires_confirmation
             return result
         except WeChatPublishingError:
@@ -74,16 +79,19 @@ class WeChatBrowserPublisher:
 
     def resume(self, account: Mapping[str, Any], job_context: Mapping[str, Any]) -> PublishingResult:
         profile_path = self._profile_path(account)
-        title = str(job_context.get("title") or "").strip()
-        if not title:
-            raise WeChatPublishingError("恢复扫码确认缺少文章标题")
+        resume_handle = self._resume_handle(job_context)
+        account_key = self._account_key(account)
         session = None
         preserve_session = False
         try:
-            session = self.gateway.resume_profile(profile_path, job_context)
+            session, title, baseline = self.gateway.resume_profile(
+                profile_path, resume_handle, account_key
+            )
             self.gateway.require_authenticated(session)
-            outcome = self.gateway.verify_publish_or_confirmation(session, title)
-            result = self._result(outcome, "publish", session, title)
+            outcome = self.gateway.verify_publish_or_confirmation(session, title, baseline)
+            result = self._result(
+                outcome, "publish", session, title, baseline, account_key
+            )
             preserve_session = result.requires_confirmation
             return result
         except WeChatPublishingError:
@@ -94,54 +102,74 @@ class WeChatBrowserPublisher:
             if session is not None and not preserve_session:
                 self.gateway.close(session)
 
+    def cancel(self, account: Mapping[str, Any], job_context: Mapping[str, Any]) -> None:
+        self._profile_path(account)
+        self.gateway.cancel_pending(
+            self._resume_handle(job_context), self._account_key(account)
+        )
+
     def _result(
         self,
         outcome: Mapping[str, Any],
         action: PublishAction,
         session: Any,
         title: str,
+        baseline: Mapping[str, Any],
+        account_key: str,
     ) -> PublishingResult:
         if not isinstance(outcome, Mapping):
             raise WeChatPublishingError("微信页面未返回结构化平台结果")
         status = str(outcome.get("status") or "").strip()
-        platform_url = str(outcome.get("platform_url") or "").strip()
-        self._require_wechat_url(platform_url)
-        raw_response = outcome.get("response")
-        if not isinstance(raw_response, Mapping) or not raw_response:
-            raise WeChatPublishingError("微信页面未返回非空页面证据")
-        response = dict(raw_response)
+        platform_url = self._public_wechat_url(str(outcome.get("platform_url") or "").strip())
+        self._require_matching_baseline(outcome, baseline)
 
         if action == "draft":
             if status != "platform_draft":
                 raise WeChatPublishingError(f"微信草稿流程返回了无效状态：{status or '空'}")
             draft_id = str(outcome.get("draft_id") or "").strip()
-            self._require_evidenced_id(draft_id, response, "草稿 ID")
+            corroboration = self._require_bound_receipt(
+                outcome, baseline, title, draft_id, "草稿 ID"
+            )
             return PublishingResult(
                 status=status,
                 platform_draft_id=draft_id,
                 platform_url=platform_url,
-                response=response,
+                response=self._public_success_response(
+                    "draft_created", draft_id, title, corroboration
+                ),
             )
 
         if status == "awaiting_confirmation":
-            context = dict(self.gateway.session_context(session))
-            context["title"] = title
-            response["job_context"] = context
+            confirmation = outcome.get("confirmation")
+            if not isinstance(confirmation, Mapping) or confirmation.get("kind") != "operator_qr":
+                raise WeChatPublishingError("微信页面未返回可验证的运营者扫码确认信号")
+            resume_handle = self.gateway.retain_confirmation(
+                session, account_key, title, baseline
+            )
             return PublishingResult(
                 status=status,
                 platform_url=platform_url,
-                response=response,
+                response={
+                    "source": "wechat_platform",
+                    "event": "operator_confirmation_required",
+                    "confirmation": "operator_qr",
+                    "job_context": {"resume_handle": resume_handle},
+                },
                 requires_confirmation=True,
             )
         if status != "published":
             raise WeChatPublishingError(f"微信直发流程返回了无效状态：{status or '空'}")
         publish_id = str(outcome.get("publish_id") or "").strip()
-        self._require_evidenced_id(publish_id, response, "发布 ID")
+        corroboration = self._require_bound_receipt(
+            outcome, baseline, title, publish_id, "发布 ID"
+        )
         return PublishingResult(
             status=status,
             platform_publish_id=publish_id,
             platform_url=platform_url,
-            response=response,
+            response=self._public_success_response(
+                "article_published", publish_id, title, corroboration
+            ),
         )
 
     @staticmethod
@@ -160,6 +188,22 @@ class WeChatBrowserPublisher:
         if not raw_path or not path.is_dir():
             raise WeChatPublishingError(f"账号浏览器 Profile 不存在：{raw_path or '未配置'}")
         return path
+
+    @staticmethod
+    def _account_key(account: Mapping[str, Any]) -> str:
+        account_id = str(account.get("id") or "").strip()
+        if not account_id:
+            raise WeChatPublishingError("微信公众号账号缺少稳定账号 ID")
+        return account_id
+
+    @staticmethod
+    def _resume_handle(job_context: Mapping[str, Any]) -> str:
+        if not isinstance(job_context, Mapping):
+            raise WeChatPublishingError("扫码确认恢复参数格式不正确")
+        handle = str(job_context.get("resume_handle") or "").strip()
+        if not handle:
+            raise WeChatPublishingError("扫码确认恢复参数缺少 resume_handle")
+        return handle
 
     @staticmethod
     def _validate_payload(payload: Mapping[str, Any]) -> None:
@@ -181,17 +225,59 @@ class WeChatBrowserPublisher:
             raise WeChatPublishingError(f"{label}文件不存在：{path}")
 
     @staticmethod
-    def _require_wechat_url(value: str) -> None:
+    def _public_wechat_url(value: str) -> str:
         parsed = urllib.parse.urlparse(value)
         if parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
             raise WeChatPublishingError("平台结果缺少可验证的微信页面 URL")
+        return urllib.parse.urlunsplit(("https", "mp.weixin.qq.com", parsed.path or "/", "", ""))
 
     @staticmethod
-    def _require_evidenced_id(platform_id: str, response: Mapping[str, Any], label: str) -> None:
+    def _require_matching_baseline(
+        outcome: Mapping[str, Any], baseline: Mapping[str, Any]
+    ) -> None:
+        baseline_id = str(baseline.get("baseline_id") or "")
+        if not baseline_id or str(outcome.get("baseline_id") or "") != baseline_id:
+            raise WeChatPublishingError("微信平台结果与本次操作基线不匹配")
+
+    @staticmethod
+    def _require_bound_receipt(
+        outcome: Mapping[str, Any],
+        baseline: Mapping[str, Any],
+        title: str,
+        platform_id: str,
+        label: str,
+    ) -> str:
         if not platform_id:
             raise WeChatPublishingError(f"微信页面未返回真实{label}")
-        if platform_id not in json.dumps(response, ensure_ascii=False, sort_keys=True):
-            raise WeChatPublishingError(f"微信页面证据不包含{label}")
+        receipt = outcome.get("receipt")
+        if not isinstance(receipt, Mapping) or str(receipt.get("id") or "") != platform_id:
+            raise WeChatPublishingError(f"微信平台回执与{label}不一致")
+        if str(receipt.get("title") or "").strip() != title.strip():
+            raise WeChatPublishingError("微信平台回执未绑定本次文章标题")
+        if receipt.get("source") not in {"dom", "api"}:
+            raise WeChatPublishingError("微信平台回执不是来自平台 DOM 或 API")
+        old_ids = {str(value) for value in baseline.get("receipt_ids") or []}
+        if platform_id in old_ids:
+            raise WeChatPublishingError(f"微信{label}不是本次操作新产生的回执")
+        signal = outcome.get("post_action_signal")
+        if not isinstance(signal, Mapping) or not signal.get("observed_after_action"):
+            raise WeChatPublishingError("微信平台结果缺少本次操作后的后置信号")
+        signal_kind = str(signal.get("kind") or "")
+        if signal_kind not in {"success_message", "navigation", "api_response"}:
+            raise WeChatPublishingError("微信平台结果缺少可验证的后置信号")
+        return signal_kind
+
+    @staticmethod
+    def _public_success_response(
+        event: str, platform_id: str, title: str, corroboration: str
+    ) -> dict[str, Any]:
+        return {
+            "source": "wechat_platform",
+            "event": event,
+            "receipt_id": platform_id,
+            "title": title,
+            "corroboration": corroboration,
+        }
 
 
 # Transitional import compatibility while callers move to WeChatBrowserPublisher.
