@@ -256,21 +256,32 @@ class Database:
 
             conn.executescript(
                 """
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_insert
+                DROP TRIGGER IF EXISTS publish_jobs_platform_insert;
+                DROP TRIGGER IF EXISTS publish_jobs_platform_update;
+                DROP TRIGGER IF EXISTS publish_jobs_platform_refs_insert;
+                DROP TRIGGER IF EXISTS publish_jobs_platform_refs_update;
+                DROP TRIGGER IF EXISTS publish_jobs_account_platform_update;
+                DROP TRIGGER IF EXISTS publish_jobs_project_platform_update;
+                DROP TRIGGER IF EXISTS publish_jobs_account_insert;
+                DROP TRIGGER IF EXISTS publish_jobs_account_update;
+                DROP TRIGGER IF EXISTS publish_jobs_result_insert;
+                DROP TRIGGER IF EXISTS publish_jobs_result_update;
+
+                CREATE TRIGGER publish_jobs_platform_insert
                 BEFORE INSERT ON publish_jobs
                 WHEN COALESCE(NEW.platform, '') <> '微信公众号'
                 BEGIN
                   SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_update
+                CREATE TRIGGER publish_jobs_platform_update
                 BEFORE UPDATE OF platform ON publish_jobs
                 WHEN COALESCE(NEW.platform, '') <> '微信公众号'
                 BEGIN
                   SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_refs_insert
+                CREATE TRIGGER publish_jobs_platform_refs_insert
                 BEFORE INSERT ON publish_jobs
                 WHEN NOT EXISTS (
                   SELECT 1
@@ -285,7 +296,7 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_platform_refs_update
+                CREATE TRIGGER publish_jobs_platform_refs_update
                 BEFORE UPDATE OF project_id, account_id ON publish_jobs
                 WHEN NOT EXISTS (
                   SELECT 1
@@ -300,7 +311,7 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_account_platform_update
+                CREATE TRIGGER publish_jobs_account_platform_update
                 BEFORE UPDATE OF platform ON platform_accounts
                 WHEN COALESCE(NEW.platform, '') <> '微信公众号'
                   AND EXISTS (
@@ -312,7 +323,7 @@ class Database:
                   SELECT RAISE(ABORT, 'referenced platform account must remain 微信公众号');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_project_platform_update
+                CREATE TRIGGER publish_jobs_project_platform_update
                 BEFORE UPDATE OF platform ON content_projects
                 WHEN COALESCE(NEW.platform, '') <> '微信公众号'
                   AND EXISTS (
@@ -324,7 +335,7 @@ class Database:
                   SELECT RAISE(ABORT, 'referenced content project must remain 微信公众号');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_account_insert
+                CREATE TRIGGER publish_jobs_account_insert
                 BEFORE INSERT ON publish_jobs
                 WHEN EXISTS (
                   SELECT 1
@@ -335,7 +346,7 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs project_id must use one account_id');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_account_update
+                CREATE TRIGGER publish_jobs_account_update
                 BEFORE UPDATE OF project_id, account_id ON publish_jobs
                 WHEN EXISTS (
                   SELECT 1
@@ -346,7 +357,7 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs project_id must use one account_id');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_result_insert
+                CREATE TRIGGER publish_jobs_result_insert
                 BEFORE INSERT ON publish_jobs
                 WHEN (
                   (NEW.status = 'platform_draft' AND NOT (
@@ -369,7 +380,7 @@ class Database:
                   SELECT RAISE(ABORT, 'publish_jobs status requires platform evidence');
                 END;
 
-                CREATE TRIGGER IF NOT EXISTS publish_jobs_result_update
+                CREATE TRIGGER publish_jobs_result_update
                 BEFORE UPDATE OF status, platform_draft_id, platform_publish_id, platform_url, response_json, requires_confirmation ON publish_jobs
                 WHEN (
                   (NEW.status = 'platform_draft' AND NOT (

@@ -338,3 +338,72 @@ def test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration(
 
     with pytest.raises(sqlite3.IntegrityError):
         db.execute("UPDATE scheduled_tasks SET publish_action = ? WHERE id = ?", ("invalid", task_id))
+
+
+def test_existing_publish_jobs_rebuilds_same_named_relaxed_result_triggers(tmp_path):
+    database_path = tmp_path / "legacy-publish-jobs.db"
+    with sqlite3.connect(database_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE content_projects (
+              id INTEGER PRIMARY KEY,
+              title TEXT NOT NULL,
+              platform TEXT NOT NULL
+            );
+            CREATE TABLE platform_accounts (
+              id INTEGER PRIMARY KEY,
+              platform TEXT NOT NULL,
+              name TEXT NOT NULL
+            );
+            CREATE TABLE publish_jobs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL,
+              account_id INTEGER NOT NULL,
+              platform TEXT NOT NULL,
+              action TEXT NOT NULL,
+              status TEXT NOT NULL,
+              platform_draft_id TEXT NOT NULL DEFAULT '',
+              platform_publish_id TEXT NOT NULL DEFAULT '',
+              platform_url TEXT NOT NULL DEFAULT '',
+              response_json TEXT NOT NULL DEFAULT '{}',
+              requires_confirmation INTEGER NOT NULL DEFAULT 0,
+              failure_stage TEXT NOT NULL DEFAULT '',
+              failure_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO content_projects (id, title, platform) VALUES (1, '旧项目', '微信公众号');
+            INSERT INTO platform_accounts (id, platform, name) VALUES (1, '微信公众号', '旧账号');
+            CREATE TRIGGER publish_jobs_result_insert
+            BEFORE INSERT ON publish_jobs
+            BEGIN
+              SELECT NULL;
+            END;
+            CREATE TRIGGER publish_jobs_result_update
+            BEFORE UPDATE OF status, platform_url, response_json ON publish_jobs
+            BEGIN
+              SELECT NULL;
+            END;
+            """
+        )
+
+    db = Database(database_path)
+    db.init_schema()
+
+    trigger_sql = db.fetch_all(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name IN (?, ?)",
+        ("publish_jobs_result_insert", "publish_jobs_result_update"),
+    )
+    assert len(trigger_sql) == 2
+    assert all("mp.weixin.qq.com" in row["sql"] for row in trigger_sql)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """
+            INSERT INTO publish_jobs (
+              project_id, account_id, platform, action, status,
+              platform_publish_id, platform_url, response_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, 1, "微信公众号", "publish", "published", "publish-1", "https://example.com/article", "{}"),
+        )
