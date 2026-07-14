@@ -94,3 +94,50 @@ git diff --check -- backend/app/publishing/coordinator.py backend/app/services.p
 ```
 
 唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。
+
+## 第二轮 Review 修复
+
+### 实现
+
+- 每次 create/retry/resume claim 都使用 `secrets.token_urlsafe(32)` 生成新的私有 `_attempt_token`，写入 `response_json`；成功、待确认和失败持久化均保留当前尝试 token。
+- retry 将最初观察到的私有 `response_json` 传到条件 UPDATE，并同时比较 `id`、`status` 和该旧代上下文。即使赢家快速失败后状态再次变为 `failed`，旧代延迟请求也无法 claim；之后发起的新 retry 可基于新 token 正常执行。
+- `_attempt_token` 仅用于内部并发控制，公开 job 资源递归删除该 key 和 token 值。
+- 失败原因持久化前不区分大小写地清理 session/session_id、Cookie 多值 header、Authorization/Bearer、password、token/code/state、Profile、CDP/debug/WebSocket URL 和端口，并移除 HTTP URL 的凭据、显式端口、query 与 fragment。
+- 整个公开 job 资源递归清理字符串值，不再只过滤敏感 key；普通 `message`、嵌套 `detail`、列表值及顶层 `platform_url` 均执行相同脱敏。
+
+### 第二轮 TDD 证据
+
+RED 命令与结果：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py -k stale_retry_cannot_claim_a_later_failed_generation -q
+# 1 failed, 21 deselected；旧实现 publisher.calls 为 2
+
+PYTHONPATH=backend pytest backend/tests/test_api.py -k 'does_not_expose_browser_profile_path or recursively_redacts_sensitive_string_values' -q
+# 2 failed, 26 deselected；失败原因和普通 key 的嵌套字符串泄密
+
+PYTHONPATH=backend pytest backend/tests/test_api.py -k recursively_redacts_sensitive_string_values -q
+# 1 failed, 27 deselected；顶层 platform_url 泄露 query/fragment
+
+PYTHONPATH=backend pytest backend/tests/test_api.py -k 'does_not_expose_browser_profile_path or recursively_redacts_sensitive_string_values' -q
+# 2 failed, 26 deselected；多值 Cookie header 的第二个值泄密
+```
+
+最终 GREEN：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py -k 'stale_retry_cannot_claim_a_later_failed_generation or claim_allows_only_one' -q
+# 3 passed, 19 deselected
+
+PYTHONPATH=backend pytest backend/tests/test_api.py -k 'does_not_expose_browser_profile_path or recursively_redacts_sensitive_string_values or damaged_resume' -q
+# 3 passed, 25 deselected, 1 warning
+
+PYTHONPATH=backend pytest backend/tests -q
+# 117 passed, 1 warning
+
+python -m compileall -q backend/app backend/tests
+git diff --check -- backend/app/publishing/coordinator.py backend/app/services.py backend/app/main.py backend/tests/test_content_flow.py backend/tests/test_api.py .superpowers/sdd/task-3-report.md
+# exit code 0
+```
+
+唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。

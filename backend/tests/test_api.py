@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -76,7 +77,10 @@ class PublisherWithSensitiveFailure(FakePlatformPublisher):
             "webSocketDebuggerUrl=ws://127.0.0.1:9222/devtools/browser/socket-secret "
             "CDP_URL=http://127.0.0.1:9222/json?token=cdp-secret "
             "resumeHandle=resume-secret CODE=code-secret state=state-secret "
-            "--remote-debugging-port=9222"
+            "SeSsIoN=session-secret SESSION_ID=session-id-secret "
+            "Authorization: Bearer authorization-secret PaSsWoRd=password-secret "
+            "--remote-debugging-port=9222 "
+            "Cookies=first=cookie-secret; second=cookie-secondary-secret"
         )
 
 
@@ -112,6 +116,41 @@ class MutableEvidencePublisher(FakePlatformPublisher):
             platform_publish_id="evidence-publish",
             platform_url="https://mp.weixin.qq.com/s/evidence-publish",
             response=response,
+        )
+
+
+class PublisherWithSensitivePublicResponse(FakePlatformPublisher):
+    def publish(self, payload, account, action):
+        return PublishResult(
+            status="awaiting_confirmation",
+            platform_url=(
+                "https://mp.weixin.qq.com/cgi-bin/home?token=top-level-query-secret"
+                "#top-level-fragment-secret"
+            ),
+            response={
+                "source": "wechat_platform",
+                "event": "operator_confirmation_required",
+                "message": (
+                    "SeSsIoN=session-value-secret SESSION_ID=session-id-value-secret "
+                    "Authorization: Bearer authorization-value-secret "
+                    "PASSWORD=password-value-secret "
+                    "Cookies=first=cookie-value-secret; second=cookie-secondary-value-secret"
+                ),
+                "detail": {
+                    "summary": (
+                        "ToKeN=token-value-secret CODE=code-value-secret "
+                        "StAtE=state-value-secret PROFILE_PATH=/tmp/value-profile-secret"
+                    ),
+                    "trace": [
+                        "CDP_URL=http://127.0.0.1:9333/json?token=cdp-value-secret",
+                        "Debugger_URL=http://localhost:9333/devtools/debug-value-secret",
+                        "webSocketDebuggerUrl=ws://127.0.0.1:9333/devtools/websocket-value-secret",
+                        "https://example.com/path?token=query-value-secret#fragment-value-secret PORT=9333",
+                    ],
+                },
+                "job_context": {"resume_handle": "public-response-resume-secret"},
+            },
+            requires_confirmation=True,
         )
 
 
@@ -298,6 +337,12 @@ def test_failed_publish_job_does_not_expose_browser_profile_path(tmp_path: Path)
         "resume-secret",
         "code-secret",
         "state-secret",
+        "session-secret",
+        "session-id-secret",
+        "cookie-secret",
+        "cookie-secondary-secret",
+        "authorization-secret",
+        "password-secret",
         "9222",
     ]
     persisted = client.app.state.content_service.db.fetch_one(
@@ -311,6 +356,48 @@ def test_failed_publish_job_does_not_expose_browser_profile_path(tmp_path: Path)
     assert "https://mp.weixin.qq.com/cgi-bin/home" in persisted["failure_reason"]
     assert "?" not in persisted["failure_reason"]
     assert "#" not in persisted["failure_reason"]
+
+
+def test_public_publish_response_recursively_redacts_sensitive_string_values(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(
+        tmp_path, PublisherWithSensitivePublicResponse()
+    )
+
+    created = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "publish"},
+    )
+    fetched = client.get(f"/api/publish-jobs/{created.json()['id']}")
+
+    assert created.status_code == fetched.status_code == 200
+    assert created.json()["status"] == "awaiting_confirmation"
+    forbidden = [
+        "session-value-secret",
+        "session-id-value-secret",
+        "cookie-value-secret",
+        "cookie-secondary-value-secret",
+        "authorization-value-secret",
+        "password-value-secret",
+        "token-value-secret",
+        "code-value-secret",
+        "state-value-secret",
+        "/tmp/value-profile-secret",
+        "cdp-value-secret",
+        "debug-value-secret",
+        "websocket-value-secret",
+        "query-value-secret",
+        "fragment-value-secret",
+        "top-level-query-secret",
+        "top-level-fragment-secret",
+        "public-response-resume-secret",
+        "9333",
+        "_attempt_token",
+    ]
+    for secret in forbidden:
+        assert secret not in created.text
+        assert secret not in fetched.text
+    assert "message" in created.json()["response"]
+    assert "detail" in created.json()["response"]
 
 
 def test_publish_job_get_retry_resume_and_redacts_browser_context(tmp_path: Path):
@@ -359,7 +446,10 @@ def test_damaged_resume_context_becomes_failed_resource(tmp_path: Path):
     persisted = client.app.state.content_service.db.fetch_one(
         "SELECT status, response_json FROM publish_jobs WHERE id = ?", (job["id"],)
     )
-    assert persisted == {"status": "failed", "response_json": "{}"}
+    assert persisted["status"] == "failed"
+    private_response = json.loads(persisted["response_json"])
+    assert len(private_response["_attempt_token"]) >= 32
+    assert private_response["_attempt_token"] not in response.text
 
 
 def test_failed_publish_job_can_retry_as_same_resource(tmp_path: Path):

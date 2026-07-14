@@ -1,5 +1,7 @@
+import json
 import sqlite3
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -217,6 +219,94 @@ def test_retry_publish_job_claim_allows_only_one_publisher_call(tmp_path):
     assert publisher.calls == 1
     assert {result["id"] for result in results} == {failed["id"]}
     assert service.get_publish_job(failed["id"])["status"] == "platform_draft"
+
+
+def test_stale_retry_cannot_claim_a_later_failed_generation(tmp_path):
+    class MissingEvidencePublisher(FakePlatformPublisher):
+        def publish(self, payload, account, action):
+            return PublishResult(status="platform_draft")
+
+    class FailThenSucceedPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+            self.first_call_finished = threading.Event()
+
+        def publish(self, payload, account, action):
+            with self.lock:
+                self.calls += 1
+                call_number = self.calls
+            if call_number == 1:
+                self.first_call_finished.set()
+                raise RuntimeError("first retry failed quickly")
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "retry ABA 测试")
+    service.publish_coordinator.publisher = MissingEvidencePublisher()
+    failed = service.create_publish_job(project["id"], account_id, "draft")
+    assert failed["status"] == "failed"
+    initial_private = service.db.fetch_one(
+        "SELECT response_json FROM publish_jobs WHERE id = ?", (failed["id"],)
+    )
+    initial_token = json.loads(initial_private["response_json"])["_attempt_token"]
+    assert len(initial_token) >= 32
+    assert initial_token not in str(failed)
+
+    publisher = FailThenSucceedPublisher()
+    original_builder = service.publish_coordinator.payload_builder
+    builder_barrier = threading.Barrier(2)
+    builder_calls = 0
+    builder_lock = threading.Lock()
+
+    def delay_old_generation_contender(project_row, account_name):
+        nonlocal builder_calls
+        payload = original_builder(project_row, account_name)
+        with builder_lock:
+            builder_calls += 1
+            call_number = builder_calls
+        builder_barrier.wait(timeout=5)
+        if call_number == 2:
+            assert publisher.first_call_finished.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                current = service.db.fetch_one(
+                    "SELECT status FROM publish_jobs WHERE id = ?", (failed["id"],)
+                )
+                if current and current["status"] == "failed":
+                    break
+                time.sleep(0.01)
+            else:
+                raise AssertionError("winning retry did not persist failure")
+        return payload
+
+    service.publish_coordinator.payload_builder = delay_old_generation_contender
+    service.publish_coordinator.publisher = publisher
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        stale_results = list(
+            executor.map(lambda _: service.retry_publish_job(failed["id"]), range(2))
+        )
+
+    assert publisher.calls == 1
+    assert {result["status"] for result in stale_results} == {"failed"}
+    failed_again_private = service.db.fetch_one(
+        "SELECT response_json FROM publish_jobs WHERE id = ?", (failed["id"],)
+    )
+    failed_again_token = json.loads(failed_again_private["response_json"])["_attempt_token"]
+    assert failed_again_token != initial_token
+    assert failed_again_token not in str(stale_results)
+
+    service.publish_coordinator.payload_builder = original_builder
+    fresh_retry = service.retry_publish_job(failed["id"])
+
+    assert publisher.calls == 2
+    assert fresh_retry["status"] == "platform_draft"
+    fresh_private = service.db.fetch_one(
+        "SELECT response_json FROM publish_jobs WHERE id = ?", (failed["id"],)
+    )
+    fresh_token = json.loads(fresh_private["response_json"])["_attempt_token"]
+    assert fresh_token not in {initial_token, failed_again_token}
+    assert fresh_token not in str(fresh_retry)
 
 
 def test_resume_publish_job_claim_allows_only_one_publisher_call(tmp_path):
