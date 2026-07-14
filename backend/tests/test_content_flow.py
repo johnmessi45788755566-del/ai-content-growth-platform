@@ -688,6 +688,111 @@ def test_existing_publish_package_backfills_publish_job_id_from_payload(tmp_path
     assert package["publish_job_id"] == job_id
 
 
+def test_legacy_task_links_backfill_through_package_and_retry_reuses_job(tmp_path):
+    class UnexpectedPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    db = Database(tmp_path / "legacy-task-links.db")
+    db.init_schema()
+    publisher = UnexpectedPublisher()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=publisher,
+    )
+    account_id = db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '旧任务账号', '已授权')"
+    )
+    project_id = db.execute(
+        "INSERT INTO content_projects (title, platform) VALUES ('旧任务项目', '微信公众号')"
+    )
+    job_id = db.execute(
+        """
+        INSERT INTO publish_jobs (
+          project_id, account_id, platform, action, status,
+          platform_publish_id, platform_url, response_json
+        ) VALUES (?, ?, '微信公众号', 'publish', 'published', ?, ?, ?)
+        """,
+        (
+            project_id,
+            account_id,
+            "legacy-publish-id",
+            "https://mp.weixin.qq.com/s/legacy-publish-id",
+            json.dumps(
+                {
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "legacy-publish-id",
+                    "corroboration": "publish_success",
+                }
+            ),
+        ),
+    )
+    package_id = db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status, publish_job_id
+        ) VALUES (?, ?, '微信公众号', '旧任务账号', ?, 'pending_publish', NULL)
+        """,
+        (project_id, account_id, json.dumps({"publish_job_id": job_id})),
+    )
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "旧任务账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "旧失败任务恢复",
+        }
+    )
+    db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET status = '失败', content_project_id = ?, publish_package_id = ?, publish_job_id = NULL
+        WHERE id = ?
+        """,
+        (project_id, package_id, task["id"]),
+    )
+    run_id = db.execute(
+        """
+        INSERT INTO task_runs (
+          task_id, status, started_at, finished_at, content_project_id,
+          publish_package_id, publish_job_id
+        ) VALUES (?, '失败', '2026-07-14 09:30', '2026-07-14 09:31', ?, ?, NULL)
+        """,
+        (task["id"], project_id, package_id),
+    )
+
+    db.init_schema()
+    db.init_schema()
+
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM publish_packages WHERE id = ?", (package_id,)
+    )["publish_job_id"] == job_id
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM scheduled_tasks WHERE id = ?", (task["id"],)
+    )["publish_job_id"] == job_id
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM task_runs WHERE id = ?", (run_id,)
+    )["publish_job_id"] == job_id
+
+    retried = service.retry_failed_tasks([task["id"]])
+    recovered = service.get_task(task["id"])
+
+    assert retried["updated"] == 1
+    assert recovered["status"] == "已发布"
+    assert recovered["publish_job_id"] == job_id
+    assert db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert publisher.calls == 0
+
+
 def test_concurrent_task_execution_claims_generation_once(tmp_path):
     class CountingPublisher(FakePlatformPublisher):
         def __init__(self):

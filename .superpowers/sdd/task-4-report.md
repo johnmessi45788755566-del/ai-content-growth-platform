@@ -213,3 +213,54 @@ git diff --check
 结果：无输出，退出码 `0`。
 
 唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。
+
+## 第二轮后端审查修复
+
+### 修复内容
+
+- 公开 `publish_job` 继续递归过滤规范化敏感键，新增覆盖 `resume_context`/`resumeContext`、`credentials`/`credential`、`api_key`/`apiKey`、`access_token`/`accessToken`、`refresh_token`、cookie、token、secret、profile path 和 debug port；普通平台回执字段保持可见。
+- 迁移先从 `publish_packages.payload_json.publish_job_id` 回填 package，再沿 `publish_package_id` 回填 `scheduled_tasks.publish_job_id` 和 `task_runs.publish_job_id`；所有更新仅处理空值，可重复执行。
+- 首次任务执行先创建 pending job 与 `pending_publish` package，并在平台调用前原子关联 task/run/package/job；平台终态后，task、run、package 只在同一事务中最终化。进程中断或本地同步失败可读取同一 job 恢复，不再次调用平台。
+- task 关联失败 job 的 retry API 在平台返回 published、awaiting confirmation 或 failed 后，使用 job ID、task/run 旧状态和 run ID CAS 原子同步 task、run、package；重复任务仅在最终成功后计算下一次执行时间。终态 job 遇到本地事务失败时，后续 retry 只重做本地同步。
+- `/api/accounts`、账号详情、授权完成、更新及同步响应统一使用显式公开白名单；浏览器授权、检测和同步内部仍按 account ID 读取完整账号记录，不向网络响应返回 profile/login/QR、sync error 或浏览器会话字段。
+
+### RED: 实际故障注入
+
+- 嵌套发布响应实际注入全部敏感键后，列表、详情和协调器资源测试共 `2 failed`，确认 `resume_context` 等规范化键会进入网络响应。
+- 旧数据仅在 package payload 中保存 job ID 时，迁移测试失败，确认 task/run 未沿 package 关联回填。
+- 平台调用窗口、最终化事务回滚和进程中断恢复测试共 `3 failed`，分别确认平台调用前缺少 package 关联、分裂终态写入和中断后无法恢复。
+- task 关联 job 的 retry API 三种终态及陈旧代次测试共 `4 failed`，确认 job 已变化而 task/run/package 仍停留旧状态或可被旧 job 覆盖。
+- 账号表实际写入 profile path、带 token/cookie/debug port 的 login URL、credentials 和 sync error 后，公开接口白名单测试失败，确认私有列原样出现在响应中。
+
+### GREEN: 聚焦回归
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py backend/tests/test_content_flow.py -q
+```
+
+结果：退出码 `0`，`78 passed, 1 warning in 4.45s`。覆盖秘密实际注入与普通回执保留、迁移幂等和旧失败任务复用、首次执行窗口/回滚/中断恢复、retry 三终态/本地同步重试/陈旧代次 CAS、resume CAS、待确认重复排期和账号公开白名单。
+
+### 最终验证
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+结果：退出码 `0`，`145 passed, 1 warning in 4.59s`。
+
+```bash
+python3 -m compileall -q backend/app
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。
+
+### 第二轮 Concern
+
+- 平台 job 终态仍先于本地 task/run/package 事务提交，这是外部系统与 SQLite 无法组成分布式事务的固有限制；当前通过预建 pending 本地记录、终态 package 不提前暴露、同 job 幂等恢复和 CAS 防陈旧覆盖控制风险。
+- 本轮所有发布路径测试使用 fake publisher 或故障注入，未执行任何真实平台写入。

@@ -290,6 +290,42 @@ class Database:
                       AND json_extract(payload_json, '$.publish_job_id') IS NOT NULL
                     """
                 )
+            for backfill_sql in [
+                """
+                UPDATE scheduled_tasks
+                SET publish_job_id = (
+                  SELECT publish_job_id
+                  FROM publish_packages
+                  WHERE publish_packages.id = scheduled_tasks.publish_package_id
+                )
+                WHERE publish_job_id IS NULL
+                  AND publish_package_id IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM publish_packages
+                    WHERE publish_packages.id = scheduled_tasks.publish_package_id
+                      AND publish_packages.publish_job_id IS NOT NULL
+                  )
+                """,
+                """
+                UPDATE task_runs
+                SET publish_job_id = (
+                  SELECT publish_job_id
+                  FROM publish_packages
+                  WHERE publish_packages.id = task_runs.publish_package_id
+                )
+                WHERE publish_job_id IS NULL
+                  AND publish_package_id IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM publish_packages
+                    WHERE publish_packages.id = task_runs.publish_package_id
+                      AND publish_packages.publish_job_id IS NOT NULL
+                  )
+                """,
+            ]:
+                with suppress(sqlite3.OperationalError):
+                    conn.execute(backfill_sql)
 
             conn.executescript(
                 """

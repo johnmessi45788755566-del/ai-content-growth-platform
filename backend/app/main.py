@@ -335,7 +335,7 @@ def create_app(
     @app.get("/api/accounts/{account_id}")
     def get_account(account_id: int) -> dict[str, Any]:
         try:
-            return service.get_account(account_id)
+            return service.get_public_account(account_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

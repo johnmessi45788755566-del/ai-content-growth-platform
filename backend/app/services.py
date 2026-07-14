@@ -31,6 +31,26 @@ PLATFORM_ALIASES = {
     "小红书": "小红书",
     "抖音": "抖音",
 }
+PUBLIC_ACCOUNT_FIELDS = (
+    "id",
+    "platform",
+    "name",
+    "external_id",
+    "owner",
+    "tag",
+    "auth_status",
+    "monitor_status",
+    "sync_status",
+    "role",
+    "audience",
+    "style",
+    "taboo",
+    "preference",
+    "auth_method",
+    "last_sync_at",
+    "created_at",
+    "updated_at",
+)
 
 
 class NotFoundError(RuntimeError):
@@ -432,7 +452,7 @@ class ContentService:
                 "UPDATE platform_accounts SET sync_status = '同步失败', sync_error = ? WHERE id = ?",
                 (sync_error, account_id),
             )
-        return self.get_account(account_id)
+        return self.get_public_account(account_id)
 
     def list_accounts(self, platform: str = "", auth_status: str = "", q: str = "") -> list[dict[str, Any]]:
         clauses = []
@@ -448,7 +468,7 @@ class ContentService:
             keyword = f"%{q}%"
             params.extend([keyword, keyword, keyword])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return self.db.fetch_all(
+        accounts = self.db.fetch_all(
             f"""
             SELECT id, platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status, sync_error,
                    role, audience, style, taboo, preference, auth_method, qr_url, profile_path, login_url,
@@ -459,6 +479,7 @@ class ContentService:
             """,
             tuple(params),
         )
+        return [self._public_account(account) for account in accounts]
 
     def get_account(self, account_id: int) -> dict[str, Any]:
         account = self.db.fetch_one(
@@ -474,6 +495,13 @@ class ContentService:
         if not account:
             raise NotFoundError("账号不存在")
         return account
+
+    def get_public_account(self, account_id: int) -> dict[str, Any]:
+        return self._public_account(self.get_account(account_id))
+
+    @staticmethod
+    def _public_account(account: dict[str, Any]) -> dict[str, Any]:
+        return {field: account[field] for field in PUBLIC_ACCOUNT_FIELDS if field in account}
 
     def sync_account(self, account_id: int) -> dict[str, Any]:
         account = self.get_account(account_id)
@@ -499,7 +527,11 @@ class ContentService:
                 (error, account_id),
             )
             raise RuntimeError(f"真实数据同步失败：{error}") from exc
-        return {"synced": True, "source": data.get("source", "browser"), "account": self.get_account(account_id)}
+        return {
+            "synced": True,
+            "source": data.get("source", "browser"),
+            "account": self.get_public_account(account_id),
+        }
 
     def sync_due_accounts(self, now: datetime | None = None) -> dict[str, Any]:
         today = (now or datetime.now()).date().isoformat()
@@ -545,7 +577,7 @@ class ContentService:
                 account_id,
             ),
         )
-        return self.get_account(account_id)
+        return self.get_public_account(account_id)
 
     def delete_account(self, account_id: int) -> dict[str, Any]:
         self.get_account(account_id)
@@ -769,6 +801,18 @@ class ContentService:
     def execute_due_tasks(self, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now()
         due_at = _format_task_time(current)
+        recoverable_tasks = self.db.fetch_all(
+            """
+            SELECT scheduled_tasks.id
+            FROM scheduled_tasks
+            JOIN publish_jobs ON publish_jobs.id = scheduled_tasks.publish_job_id
+            WHERE scheduled_tasks.status = '执行中'
+              AND publish_jobs.status IN ('platform_draft', 'awaiting_confirmation', 'published', 'failed')
+            ORDER BY scheduled_tasks.id ASC
+            """
+        )
+        for task in recoverable_tasks:
+            self._recover_task_from_publish_job(int(task["id"]), current)
         due_tasks = self.db.fetch_all(
             """
             SELECT id
@@ -787,8 +831,43 @@ class ContentService:
 
     def execute_task(self, task_id: int, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now()
+        if self._recover_task_from_publish_job(task_id, current):
+            return self.get_task(task_id)
         detail, _ = self._execute_task(task_id, current)
         return detail
+
+    def _recover_task_from_publish_job(self, task_id: int, current: datetime) -> bool:
+        task = self.db.fetch_one(
+            "SELECT * FROM scheduled_tasks WHERE id = ? AND status = '执行中'",
+            (task_id,),
+        )
+        if not task or not task.get("publish_job_id"):
+            return False
+        job = self.get_publish_job(int(task["publish_job_id"]))
+        if job["status"] not in {"platform_draft", "awaiting_confirmation", "published", "failed"}:
+            return False
+        run = self.db.fetch_one(
+            """
+            SELECT * FROM task_runs
+            WHERE task_id = ? AND publish_job_id = ? AND status = '执行中'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, job["id"]),
+        )
+        if not run:
+            return False
+        package = self.db.fetch_one(
+            "SELECT id FROM publish_packages WHERE publish_job_id = ? ORDER BY id DESC LIMIT 1",
+            (job["id"],),
+        )
+        return self._finish_task_from_publish_job(
+            task,
+            int(run["id"]),
+            int(task.get("content_project_id") or job["project_id"]),
+            int(package["id"]) if package else None,
+            job,
+            current,
+        )
 
     def _execute_task(self, task_id: int, current: datetime) -> tuple[dict[str, Any], bool]:
         started_at = _format_task_time(current)
@@ -803,15 +882,19 @@ class ContentService:
         try:
             if task.get("publish_job_id"):
                 failed_job_id = int(task["publish_job_id"])
-                self._link_task_publish_job(task_id, run_id, failed_job_id)
                 job = self.get_publish_job(failed_job_id)
-                if job["status"] == "failed":
-                    job = self.retry_publish_job(failed_job_id)
                 package = self.db.fetch_one(
                     "SELECT id FROM publish_packages WHERE publish_job_id = ? ORDER BY id DESC LIMIT 1",
                     (failed_job_id,),
                 )
                 failed_package_id = int(package["id"]) if package else None
+                self._link_task_publish_job(
+                    task_id, run_id, failed_job_id, failed_package_id
+                )
+                if job["status"] == "failed":
+                    job = self.retry_publish_job(failed_job_id)
+                elif job["status"] == "pending":
+                    job = self.execute_publish_job(failed_job_id)
                 project_id = int(task.get("content_project_id") or job["project_id"])
                 self._finish_task_from_publish_job(
                     task,
@@ -872,11 +955,17 @@ class ContentService:
             stage = "文章排版"
             self.save_layout(project["id"], layout_blocks)
             stage = "提交平台草稿" if task["publish_action"] == "draft" else "发布文章"
-            job = self.create_publish_job(project["id"], int(account["id"]), task["publish_action"])
+            job = self.prepare_publish_job(
+                project["id"], int(account["id"]), task["publish_action"]
+            )
             failed_job_id = int(job["id"])
-            self._link_task_publish_job(task_id, run_id, failed_job_id)
-            package = self._persist_publish_package(project, account, job)
+            package = self._persist_publish_package(project, account, job, pending=True)
             failed_package_id = int(package["id"])
+            self._link_task_publish_job(
+                task_id, run_id, failed_job_id, failed_package_id
+            )
+            job = self.execute_publish_job(failed_job_id)
+            self._postprocess_publish_package(project, account, job)
             self._finish_task_from_publish_job(task, run_id, project["id"], package["id"], job, current)
         except Exception as exc:
             if failed_job_id is not None:
@@ -887,14 +976,36 @@ class ContentService:
                         (failed_job_id,),
                     )
                     failed_package_id = int(package["id"]) if package else None
-                self._finish_task_from_publish_job(
-                    task,
-                    run_id,
-                    int(project_id or job["project_id"]),
-                    failed_package_id,
-                    job,
-                    current,
-                )
+                if job["status"] in {"platform_draft", "awaiting_confirmation", "published", "failed"}:
+                    try:
+                        self._finish_task_from_publish_job(
+                            task,
+                            run_id,
+                            int(project_id or job["project_id"]),
+                            failed_package_id,
+                            job,
+                            current,
+                        )
+                    except Exception as sync_exc:
+                        self._finish_task_failure(
+                            task_id,
+                            run_id,
+                            "同步发布结果",
+                            str(sync_exc),
+                            current,
+                            failed_package_id,
+                            failed_job_id,
+                        )
+                else:
+                    self._finish_task_failure(
+                        task_id,
+                        run_id,
+                        stage,
+                        str(exc),
+                        current,
+                        failed_package_id,
+                        failed_job_id,
+                    )
             else:
                 failure_stage = "任务类型未开放" if task["task_type"] == TASK_TYPE_XIAOHONGSHU_RESERVED else stage
                 self._finish_task_failure(task_id, run_id, failure_stage, str(exc), current)
@@ -924,24 +1035,34 @@ class ContentService:
             conn.commit()
             return int(run_id)
 
-    def _link_task_publish_job(self, task_id: int, run_id: int, publish_job_id: int) -> None:
+    def _link_task_publish_job(
+        self,
+        task_id: int,
+        run_id: int,
+        publish_job_id: int,
+        publish_package_id: int | None = None,
+    ) -> None:
         with self.db.transaction() as conn:
             task_cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks
-                SET publish_job_id = ?, updated_at = CURRENT_TIMESTAMP
+                SET publish_job_id = ?,
+                    publish_package_id = COALESCE(?, publish_package_id),
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND status = '执行中'
                   AND (publish_job_id IS NULL OR publish_job_id = ?)
                 """,
-                (publish_job_id, task_id, publish_job_id),
+                (publish_job_id, publish_package_id, task_id, publish_job_id),
             )
             run_cursor = conn.execute(
                 """
                 UPDATE task_runs
-                SET publish_job_id = ?
-                WHERE id = ? AND task_id = ? AND status = '执行中' AND publish_job_id IS NULL
+                SET publish_job_id = ?,
+                    publish_package_id = COALESCE(?, publish_package_id)
+                WHERE id = ? AND task_id = ? AND status = '执行中'
+                  AND (publish_job_id IS NULL OR publish_job_id = ?)
                 """,
-                (publish_job_id, run_id, task_id),
+                (publish_job_id, publish_package_id, run_id, task_id, publish_job_id),
             )
             if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
                 raise RuntimeError("发布作业关联的任务代次已变化")
@@ -1205,10 +1326,12 @@ class ContentService:
         project: dict[str, Any],
         account: dict[str, Any],
         job: dict[str, Any],
+        pending: bool = False,
     ) -> dict[str, Any]:
         account_id = int(account["id"])
         platform = str(account["platform"])
         account_name = str(account["name"])
+        package_status = "pending_publish" if pending else str(job["status"])
         payload = {
             "project": project,
             "article_blocks": project["article_blocks"],
@@ -1230,28 +1353,46 @@ class ContentService:
                 platform,
                 account_name,
                 json.dumps({**payload, "publish_job_id": job["id"]}, ensure_ascii=False),
-                job["status"],
-                job["platform_draft_id"],
-                job["platform_url"],
-                json.dumps(job["response"], ensure_ascii=False),
-                job["failure_stage"],
-                job["failure_reason"],
+                package_status,
+                "" if pending else job["platform_draft_id"],
+                "" if pending else job["platform_url"],
+                "{}" if pending else json.dumps(job["response"], ensure_ascii=False),
+                "" if pending else job["failure_stage"],
+                "" if pending else job["failure_reason"],
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if job["status"] in {"platform_draft", "published"}
+                if not pending and job["status"] in {"platform_draft", "published"}
                 else "",
             ),
         )
+        if not pending:
+            self._postprocess_publish_package(project, account, job)
+        package = self.db.fetch_one("SELECT * FROM publish_packages WHERE id = ?", (package_id,))
+        return package or {}
+
+    def _postprocess_publish_package(
+        self,
+        project: dict[str, Any],
+        account: dict[str, Any],
+        job: dict[str, Any],
+    ) -> None:
+        account_id = int(account["id"])
+        platform = str(account["platform"])
+        account_name = str(account["name"])
         if job["status"] == "platform_draft":
             self._create_work_from_project(account_id, platform, account_name, project, status="平台草稿")
         elif job["status"] == "published":
             self._create_work_from_project(account_id, platform, account_name, project, status="已发布")
         self._set_stage(int(project["id"]), "publish")
         self.autosave(int(project["id"]), stage="publish", restore_stage="layout")
-        package = self.db.fetch_one("SELECT * FROM publish_packages WHERE id = ?", (package_id,))
-        return package or {}
 
     def create_publish_job(self, project_id: int, account_id: int, action: str) -> dict[str, Any]:
         return self.publish_coordinator.create_publish_job(project_id, account_id, action)
+
+    def prepare_publish_job(self, project_id: int, account_id: int, action: str) -> dict[str, Any]:
+        return self.publish_coordinator.prepare_publish_job(project_id, account_id, action)
+
+    def execute_publish_job(self, job_id: int) -> dict[str, Any]:
+        return self.publish_coordinator.execute_publish_job(job_id)
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
@@ -1261,7 +1402,22 @@ class ContentService:
 
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
-            return self.publish_coordinator.retry_publish_job(job_id)
+            try:
+                job = self.publish_coordinator.retry_publish_job(job_id)
+            except PublishJobValidationError:
+                job = self.get_publish_job(job_id)
+                linked_failed_task = self.db.fetch_one(
+                    "SELECT id FROM scheduled_tasks WHERE publish_job_id = ? AND status = '失败' LIMIT 1",
+                    (job_id,),
+                )
+                if job["status"] not in {
+                    "published",
+                    "platform_draft",
+                    "awaiting_confirmation",
+                } or not linked_failed_task:
+                    raise
+            self._synchronize_linked_tasks(job, "失败", "失败")
+            return job
         except LookupError as exc:
             raise NotFoundError(str(exc)) from exc
 
@@ -1283,33 +1439,50 @@ class ContentService:
             raise NotFoundError(str(exc)) from exc
 
     def _synchronize_linked_waiting_tasks(self, job: dict[str, Any]) -> None:
-        if job["status"] not in {"published", "platform_draft", "failed"}:
+        self._synchronize_linked_tasks(job, "待人工确认", "待人工确认")
+
+    def _synchronize_linked_tasks(
+        self,
+        job: dict[str, Any],
+        expected_task_status: str,
+        expected_run_status: str,
+    ) -> None:
+        if job["status"] not in {
+            "published",
+            "platform_draft",
+            "awaiting_confirmation",
+            "failed",
+        }:
             return
         tasks = self.db.fetch_all(
-            "SELECT * FROM scheduled_tasks WHERE publish_job_id = ? AND status = '待人工确认'",
-            (job["id"],),
+            "SELECT * FROM scheduled_tasks WHERE publish_job_id = ? AND status = ?",
+            (job["id"], expected_task_status),
         )
         for task in tasks:
             run = self.db.fetch_one(
                 """
                 SELECT * FROM task_runs
-                WHERE task_id = ? AND publish_job_id = ? AND status = '待人工确认'
+                WHERE task_id = ? AND publish_job_id = ? AND status = ?
                 ORDER BY id DESC LIMIT 1
                 """,
-                (task["id"], job["id"]),
+                (task["id"], job["id"], expected_run_status),
             )
             if not run:
                 continue
-            package_id = int(task["publish_package_id"]) if task.get("publish_package_id") else None
+            package = self.db.fetch_one(
+                "SELECT id FROM publish_packages WHERE publish_job_id = ? ORDER BY id DESC LIMIT 1",
+                (job["id"],),
+            )
+            package_id = int(package["id"]) if package else None
             self._finish_task_from_publish_job(
                 task,
                 int(run["id"]),
-                int(task["content_project_id"]),
+                int(task.get("content_project_id") or job["project_id"]),
                 package_id,
                 job,
                 datetime.now(),
-                expected_task_status="待人工确认",
-                expected_run_status="待人工确认",
+                expected_task_status=expected_task_status,
+                expected_run_status=expected_run_status,
             )
 
     def _validate_task_publish_target(self, task: dict[str, Any]) -> dict[str, Any]:

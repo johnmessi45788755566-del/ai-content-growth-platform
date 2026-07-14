@@ -55,7 +55,13 @@ class PublishCoordinator:
     def create_publish_job(
         self, project_id: int, account_id: int, action: PublishAction
     ) -> dict[str, Any]:
-        project, account, payload = self._load_inputs(project_id, account_id, action)
+        job = self.prepare_publish_job(project_id, account_id, action)
+        return self.execute_publish_job(int(job["id"]))
+
+    def prepare_publish_job(
+        self, project_id: int, account_id: int, action: PublishAction
+    ) -> dict[str, Any]:
+        project, account, _ = self._load_inputs(project_id, account_id, action)
         self._require_project_account(project_id, account_id)
         try:
             job_id = self.db.execute(
@@ -69,7 +75,20 @@ class PublishCoordinator:
             if "one account_id" in str(exc):
                 raise PublishJobValidationError("内容项目已绑定其他平台账号") from exc
             raise
-        return self._execute(job_id, account, payload, expected_status="pending")
+        return self.get_publish_job(job_id)
+
+    def execute_publish_job(self, job_id: int) -> dict[str, Any]:
+        job = self._get_row(job_id)
+        _, account, payload = self._load_inputs(
+            int(job["project_id"]), int(job["account_id"]), str(job["action"])
+        )
+        return self._execute(
+            job_id,
+            account,
+            payload,
+            expected_status="pending",
+            observed_job=job,
+        )
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         return self._public_job(self._get_row(job_id))
@@ -342,6 +361,8 @@ class PublishCoordinator:
     def _redact_browser_context(self, job: Mapping[str, Any], value: Any) -> Any:
         sensitive_keys = {
             "authorization",
+            "accesstoken",
+            "apikey",
             "browsercontext",
             "attempttoken",
             "bearer",
@@ -349,6 +370,9 @@ class PublishCoordinator:
             "cookies",
             "cdp",
             "cdpurl",
+            "credential",
+            "credentials",
+            "debugport",
             "debuggerurl",
             "jobcontext",
             "password",
@@ -357,7 +381,10 @@ class PublishCoordinator:
             "profile",
             "profilepath",
             "resume",
+            "resumecontext",
             "resumehandle",
+            "refreshtoken",
+            "secret",
             "session",
             "sessionid",
             "state",
