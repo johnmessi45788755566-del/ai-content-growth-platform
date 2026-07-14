@@ -60,6 +60,10 @@ class WeChatBrowserPublisher:
             self.gateway.open_article_editor(session)
             self.gateway.fill_article(session, payload)
             baseline = self.gateway.capture_baseline(session, payload["title"], action)
+            if not isinstance(baseline, Mapping) or baseline.get("baseline_complete") is not True:
+                raise WeChatPublishingError(
+                    "微信操作前基线采集不完整，已中止发布，请刷新页面后重试"
+                )
             if action == "draft":
                 self.gateway.click_save_draft(session)
                 outcome = self.gateway.verify_draft(session, payload["title"], baseline)

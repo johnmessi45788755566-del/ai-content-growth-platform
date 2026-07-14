@@ -52,6 +52,8 @@ PUBLISH_CONFIRM_SELECTORS = (
     ".weui-desktop-dialog button[type='submit']",
     ".js_confirm_send",
 )
+STATE_TRAVERSAL_MAX_DEPTH = 7
+STATE_TRAVERSAL_MAX_ENTRIES = 500
 
 
 class WeChatPublishingError(RuntimeError):
@@ -447,6 +449,8 @@ class ChromeCDPBrowserGateway:
         if not isinstance(observation, Mapping):
             raise WeChatPublishingError("微信页面未返回操作前基线")
         self._require_wechat_observation_url(str(observation.get("url") or ""))
+        if observation.get("baseline_complete") is not True:
+            raise WeChatPublishingError("微信操作前基线采集不完整，已中止发布，请刷新页面后重试")
         receipts = []
         seen_ids = set()
         for receipt in observation.get("receipts") or []:
@@ -465,6 +469,7 @@ class ChromeCDPBrowserGateway:
             )
         return {
             "baseline_id": baseline_id,
+            "baseline_complete": True,
             "receipt_ids": [str(receipt["id"]) for receipt in receipts],
             "receipts": receipts,
             "signal_kinds": [
@@ -674,26 +679,71 @@ class ChromeCDPBrowserGateway:
               if (platformId) receipts.push({{id: platformId, title: receiptTitle, source: 'dom', observed_after_baseline: changed(node) || changed(container) || changed(link), visible: visible(node)}});
             }}
           }}
-          const collectStateRecords = (value, depth = 0, seen = new WeakSet()) => {{
-            if (!includeHidden || !value || typeof value !== 'object' || depth > 7 || seen.has(value)) return;
-            seen.add(value);
+          let baselineComplete = true;
+          const baselineIncompleteReasons = [];
+          const markBaselineIncomplete = (root, kind, details = {{}}) => {{
+            baselineComplete = false;
+            baselineIncompleteReasons.push({{root, kind, ...details}});
+          }};
+          const collectStateRecords = (value, rootName) => {{
+            const seen = new WeakSet();
+            let entries = 0;
             const idKeys = ['draft_id', 'draftId', 'media_id', 'mediaId', 'appmsgid', 'appMsgId', 'publish_id', 'publishId', 'msgid', 'msgId'];
             const titleKeys = ['title', 'appmsg_title', 'appMsgTitle', 'name'];
-            const idKey = idKeys.find((key) => typeof value[key] === 'string' || typeof value[key] === 'number');
-            if (idKey) {{
-              const titleKey = titleKeys.find((key) => typeof value[key] === 'string');
-              receipts.push({{
-                id: String(value[idKey]).trim(),
-                title: normalizeTitle(titleKey ? value[titleKey] : ''),
-                source: 'platform_state',
-                observed_after_baseline: false,
-                visible: false
-              }});
-            }}
-            for (const child of Object.values(value).slice(0, 500)) collectStateRecords(child, depth + 1, seen);
+            const visit = (current, depth) => {{
+              if (!includeHidden || !current || typeof current !== 'object' || seen.has(current)) return;
+              if (depth > {STATE_TRAVERSAL_MAX_DEPTH}) {{
+                markBaselineIncomplete(rootName, 'depth_budget_exceeded', {{depth}});
+                return;
+              }}
+              seen.add(current);
+              const values = new Map();
+              const read = (key) => {{
+                if (values.has(key)) return values.get(key);
+                try {{
+                  const result = current[key];
+                  values.set(key, result);
+                  return result;
+                }} catch (_error) {{
+                  markBaselineIncomplete(rootName, 'state_access_failed');
+                  return undefined;
+                }}
+              }};
+              const idKey = idKeys.find((key) => ['string', 'number'].includes(typeof read(key)));
+              if (idKey) {{
+                const titleKey = titleKeys.find((key) => typeof read(key) === 'string');
+                receipts.push({{
+                  id: String(read(idKey)).trim(),
+                  title: normalizeTitle(titleKey ? read(titleKey) : ''),
+                  source: 'platform_state',
+                  observed_after_baseline: false,
+                  visible: false
+                }});
+              }}
+              try {{
+                for (const key in current) {{
+                  if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
+                  if (entries >= {STATE_TRAVERSAL_MAX_ENTRIES}) {{
+                    markBaselineIncomplete(rootName, 'entry_budget_exceeded', {{entries: entries + 1}});
+                    return;
+                  }}
+                  entries += 1;
+                  visit(read(key), depth + 1);
+                }}
+              }} catch (_error) {{
+                markBaselineIncomplete(rootName, 'state_access_failed');
+              }}
+            }};
+            visit(value, 0);
           }};
-          const stateRoots = [window.wx?.cgiData, window.cgiData, window.__INITIAL_STATE__, window.__INITIAL_DATA__, window.__NEXT_DATA__];
-          for (const root of stateRoots) collectStateRecords(root);
+          const stateRoots = [
+            ['wx.cgiData', window.wx?.cgiData],
+            ['cgiData', window.cgiData],
+            ['__INITIAL_STATE__', window.__INITIAL_STATE__],
+            ['__INITIAL_DATA__', window.__INITIAL_DATA__],
+            ['__NEXT_DATA__', window.__NEXT_DATA__]
+          ];
+          for (const [rootName, root] of stateRoots) collectStateRecords(root, rootName);
           const successSelectors = ['.weui-desktop-toast', '.weui-desktop-tips', '[role=alert]', '.js_success', '.publish_success'];
           const successWords = {json.dumps(success_words, ensure_ascii=False)};
           const successMessage = successSelectors.some((selector) => [...document.querySelectorAll(selector)].some((node) => visible(node) && changed(node) && successWords.some((word) => (node.innerText || '').includes(word))));
@@ -708,6 +758,8 @@ class ChromeCDPBrowserGateway:
             baseline_id: operation?.id || '',
             confirmation,
             confirmation_after_baseline: confirmationAfterBaseline,
+            baseline_complete: includeHidden ? baselineComplete : true,
+            baseline_incomplete_reasons: includeHidden ? baselineIncompleteReasons : [],
             receipts: [...receiptMap.values()],
             signals: successMessage ? [{{kind: {json.dumps(signal_kind)}, observed_after_baseline: true}}] : []
           }};
