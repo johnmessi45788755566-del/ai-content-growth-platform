@@ -114,6 +114,13 @@ function clickButton(text: string) {
   fireEvent.click(buttons[0]);
 }
 
+function expectButtonReady(text: string) {
+  const buttons = buttonsWithText(text);
+  expect(buttons).toHaveLength(1);
+  expect(buttons[0].disabled).toBe(false);
+  expect(buttons[0].classList.contains('ant-btn-loading')).toBe(false);
+}
+
 function clickStep(text: string) {
   const step = screen.getByText(text, { exact: true }).closest('[role="button"]');
   expect(step).not.toBeNull();
@@ -234,6 +241,38 @@ describe('Creator publishing', () => {
     expect(screen.queryByText('项目一迟到失败')).toBeNull();
     expect(document.body.textContent).toContain('平台发布 ID：publish-82');
   });
+
+  it('releases refresh loading when a newer retry fails before the old refresh finishes', async () => {
+    const firstProject = project(1, '竞态项目');
+    const staleRefresh = deferred<PublishJob>();
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(firstProject);
+    api.saveLayout.mockResolvedValue({ project: firstProject, layout_blocks: [] });
+    api.createPublishJob.mockResolvedValue(publishJob({ status: 'failed', failure_reason: '初次发布失败' }));
+    api.retryPublishJob
+      .mockRejectedValueOnce(new Error('首次重试失败'))
+      .mockRejectedValueOnce(new Error('新代次重试失败'));
+    api.getPublishJob.mockImplementation(() => staleRefresh.promise);
+
+    render(<Creator />);
+
+    await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
+    clickButton('发布');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalled());
+    clickButton('一键发布');
+    await waitFor(() => expect(document.body.textContent).toContain('初次发布失败'));
+    clickButton('重试');
+    await waitFor(() => expect(screen.queryByText('首次重试失败')).not.toBeNull());
+
+    clickButton('刷新发布状态');
+    await waitFor(() => expect(api.getPublishJob).toHaveBeenCalledWith(81));
+    clickButton('重试');
+    await waitFor(() => expect(screen.queryByText('新代次重试失败')).not.toBeNull());
+    staleRefresh.resolve(publishJob({ status: 'published', platform_draft_id: '', platform_publish_id: 'stale-result' }));
+
+    await waitFor(() => expectButtonReady('刷新发布状态'));
+    expect(screen.queryByText('平台发布 ID：stale-result')).toBeNull();
+  });
 });
 
 describe('Draft publishing', () => {
@@ -335,6 +374,39 @@ describe('Draft publishing', () => {
     clickButton('继续确认发布');
     await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-83'));
   }, 8_000);
+
+  it('releases refresh loading when a newer resume fails before the old refresh finishes', async () => {
+    const staleRefresh = deferred<PublishJob>();
+    api.drafts.mockResolvedValue({
+      drafts: [
+        { id: 2, project_id: 2, title: '确认竞态草稿', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+      ],
+    });
+    api.createPublishJob.mockResolvedValue(publishJob({ id: 84, project_id: 2, action: 'publish', status: 'awaiting_confirmation', platform_draft_id: '', requires_confirmation: true }));
+    api.resumePublishJob
+      .mockRejectedValueOnce(new Error('首次继续失败'))
+      .mockRejectedValueOnce(new Error('新代次继续失败'));
+    api.getPublishJob.mockImplementation(() => staleRefresh.promise);
+
+    render(<Drafts />);
+
+    await waitFor(() => expect(screen.queryByText('确认竞态草稿')).not.toBeNull());
+    clickButton('发布');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalled());
+    clickButton('一键发布');
+    await waitFor(() => expect(screen.queryByText('继续确认发布')).not.toBeNull());
+    clickButton('继续确认发布');
+    await waitFor(() => expect(screen.queryByText('首次继续失败')).not.toBeNull());
+
+    clickButton('刷新发布状态');
+    await waitFor(() => expect(api.getPublishJob).toHaveBeenCalledWith(84));
+    clickButton('继续确认发布');
+    await waitFor(() => expect(screen.queryByText('新代次继续失败')).not.toBeNull());
+    staleRefresh.resolve(publishJob({ id: 84, project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'stale-result' }));
+
+    await waitFor(() => expectButtonReady('刷新发布状态'));
+    expect(screen.queryByText('平台发布 ID：stale-result')).toBeNull();
+  });
 });
 
 describe('Task publishing results', () => {
@@ -376,14 +448,15 @@ describe('Task publishing results', () => {
       status: '失败',
       publish_job: publishJob({ id: 93, project_id: 3, action: 'publish', status: 'failed', platform_draft_id: '', failure_reason: '平台拒绝' }),
     });
-    const retried = scheduledTask(3, {
+    const retryResponse = publishJob({ id: 93, project_id: 3, action: 'publish', status: 'publishing', platform_draft_id: '', failure_reason: '不应采用 retry 返回值' });
+    const refreshed = scheduledTask(3, {
       topic: '发布失败任务',
-      status: '执行中',
-      publish_job: publishJob({ id: 93, project_id: 3, action: 'publish', status: 'publishing', platform_draft_id: '', failure_reason: '' }),
+      status: '已发布',
+      publish_job: publishJob({ id: 93, project_id: 3, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'publish-93', failure_reason: '' }),
     });
-    api.tasks.mockResolvedValueOnce({ tasks: [failed] }).mockResolvedValue({ tasks: [retried] });
-    api.task.mockResolvedValue(retried);
-    api.retryPublishJob.mockResolvedValue(retried.publish_job);
+    api.tasks.mockResolvedValueOnce({ tasks: [failed] }).mockResolvedValue({ tasks: [refreshed] });
+    api.task.mockResolvedValue(refreshed);
+    api.retryPublishJob.mockResolvedValue(retryResponse);
 
     render(<Tasks />);
 
@@ -394,6 +467,11 @@ describe('Task publishing results', () => {
     expect(api.retryTasks).not.toHaveBeenCalled();
     expect(api.task).toHaveBeenCalledWith(3);
     await waitFor(() => expect(api.tasks.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(api.task.mock.invocationCallOrder[0]).toBeGreaterThan(api.retryPublishJob.mock.invocationCallOrder[0]);
+    expect(api.tasks.mock.invocationCallOrder[1]).toBeGreaterThan(api.task.mock.invocationCallOrder[0]);
+    expect(screen.queryByText('平台拒绝')).toBeNull();
+    expect(screen.queryByText('不应采用 retry 返回值')).toBeNull();
+    expect(screen.queryByText('发布 ID：publish-93')).not.toBeNull();
   });
 
   it('keeps legacy non-WeChat tasks visible but blocks editing them in V1', async () => {

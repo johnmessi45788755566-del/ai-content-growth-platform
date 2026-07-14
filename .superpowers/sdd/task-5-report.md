@@ -170,3 +170,79 @@ event - Build index.html
 - Vitest 仍打印 Vite CJS API deprecated 警告及 HMR WebSocket `listen EPERM 0.0.0.0:24678`；不影响测试执行，最终退出码为 `0`。
 - Drafts 的乱序响应测试中 Ant Design 打印 `Warning: There may be circular references`；断言与测试退出码均正常，生产 build 无对应警告。
 - 本次仅修改 Task 5 前端页面、payload 工具、前端测试和本报告；未修改 backend、README、PRD、账号矩阵或数据分析文件。
+
+## 第三轮前端修复（2026-07-14）
+
+### 修复内容
+
+- Creator 与 Drafts 的 `beginPublishRequest` 在生成新请求代次时统一清空 `publishingAction` 和 `refreshingPublishJob`。refresh 未完成时启动 retry/resume，新操作失败后刷新按钮会恢复可点击；旧请求的响应和 `finally` 仍受项目/草稿与 generation 校验，不会覆盖新代次状态。
+- Tasks 的 failed job retry 行为测试不再采用 `retryPublishJob` 返回值模拟最终 UI。测试明确断言 retry 后依次调用任务详情与任务列表接口，并只按两次刷新返回的 task/job 渲染最终发布 ID、清除旧失败原因。
+- `PlatformAccount` 删除非公开 `login_url` 字段，并增加编译期字段白名单测试；发布页面使用的账号类型不声明 `profile_path`、`login_url`、token 或浏览器恢复上下文。网络响应裁剪由并行后端修复负责。
+
+### TDD 证据
+
+移除 loading 修复后运行：
+
+```bash
+npm --prefix frontend test -- --run tests/publishingUi.test.tsx -t "releases refresh loading" --reporter=verbose
+```
+
+退出码 `1`，精确结果为 `2 failed | 8 skipped`。Creator 的 refresh -> retry 与 Drafts 的 refresh -> resume 均因刷新按钮仍包含 `ant-btn-loading` 失败。
+
+公开字段白名单 RED：
+
+```bash
+npm --prefix frontend run typecheck
+```
+
+退出码 `2`，`tests/accountTypes.test.ts` 报错 `Type 'true' is not assignable to type 'false'`，命中 `PlatformAccount.login_url` 超出白名单。
+
+恢复最小修复后的竞态 GREEN：
+
+```bash
+npm --prefix frontend test -- --run tests/publishingUi.test.tsx -t "releases refresh loading" --reporter=verbose
+```
+
+退出码 `0`：
+
+```text
+Test Files  1 passed (1)
+Tests       2 passed | 8 skipped (10)
+```
+
+### 最终验证
+
+`npm --prefix frontend test` 退出码 `0`：
+
+```text
+Test Files  6 passed (6)
+Tests       18 passed (18)
+```
+
+`npm --prefix frontend run typecheck` 退出码 `0`：
+
+```text
+> tsc --noEmit
+```
+
+`npm --prefix frontend run build` 退出码 `0`，关键输出：
+
+```text
+✔ Webpack: Compiled successfully in 2.48s
+info  - Memory Usage: 362.25 MB (RSS: 896.72 MB)
+info  - [esbuildHelperChecker] No conflicts found.
+225.31 kB  dist/umi.js
+8.81 kB    dist/p__Creator.async.js
+8.18 kB    dist/p__Tasks.async.js
+6.23 kB    dist/p__Drafts.async.js
+event - Build index.html
+```
+
+`git diff --check` 退出码 `0`，无输出。
+
+### Concerns
+
+- Vitest 继续打印 Vite CJS API deprecated 与 HMR WebSocket `listen EPERM 0.0.0.0:24678`；完整测试仍全部执行并以退出码 `0` 结束。
+- Drafts 既有乱序响应测试继续打印 Ant Design `Warning: There may be circular references`；断言通过，生产 build 无对应警告。
+- 本轮未修改 Tasks 生产实现：现有实现已经在 retry 后读取任务详情并刷新任务列表，本轮只让测试严格验证调用顺序与刷新接口事实。
+- 本轮只修改 Task 5 的 Creator、Drafts、类型、前端测试与报告；未触碰 backend、README、PRD、Accounts、Analytics 或 `global.css`。

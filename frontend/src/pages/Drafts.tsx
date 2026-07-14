@@ -66,6 +66,8 @@ export default function Drafts() {
   function beginPublishRequest(targetProjectId: number) {
     const generation = publishRequestGenerationRef.current + 1;
     publishRequestGenerationRef.current = generation;
+    setPublishingAction('');
+    setRefreshingPublishJob(false);
     setPublishPollingError('');
     return { projectId: targetProjectId, generation };
   }

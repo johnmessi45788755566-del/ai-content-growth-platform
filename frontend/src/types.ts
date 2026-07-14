@@ -150,7 +150,6 @@ export interface PlatformAccount {
   preference: string;
   auth_method?: string;
   qr_url?: string;
-  login_url?: string;
   last_sync_at?: string;
   created_at?: string;
   updated_at?: string;
