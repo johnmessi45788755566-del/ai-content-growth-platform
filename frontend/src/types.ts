@@ -142,14 +142,12 @@ export interface PlatformAccount {
   auth_status: string;
   monitor_status: string;
   sync_status: string;
-  sync_error?: string;
   role: string;
   audience: string;
   style: string;
   taboo: string;
   preference: string;
   auth_method?: string;
-  qr_url?: string;
   last_sync_at?: string;
   created_at?: string;
   updated_at?: string;
