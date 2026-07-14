@@ -2,7 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -112,6 +112,7 @@ class TaskCreateRequest(BaseModel):
     selected_title: str = ""
     title_direction: str = ""
     status: str = "待执行"
+    publish_action: Literal["publish", "draft"] = "publish"
     execution_mode: str = "once"
     repeat_rule: str = ""
     weekly_day: int | None = None
@@ -129,6 +130,7 @@ class TaskUpdateRequest(BaseModel):
     article_requirements: str = ""
     selected_title: str = ""
     title_direction: str = ""
+    publish_action: Literal["publish", "draft"] = "publish"
     execution_mode: str = "once"
     repeat_rule: str = ""
     weekly_day: int | None = None
@@ -357,7 +359,10 @@ def create_app(
 
     @app.post("/api/tasks")
     def create_task(payload: TaskCreateRequest) -> dict[str, Any]:
-        return service.create_task(payload.model_dump())
+        try:
+            return service.create_task(payload.model_dump())
+        except (NotFoundError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/tasks/{task_id}")
     def get_task(task_id: int) -> dict[str, Any]:
@@ -365,6 +370,8 @@ def create_app(
             return service.get_task(task_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.patch("/api/tasks/{task_id}")
     def update_task(task_id: int, payload: TaskUpdateRequest) -> dict[str, Any]:
@@ -372,6 +379,8 @@ def create_app(
             return service.update_task(task_id, payload.model_dump())
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.delete("/api/tasks/{task_id}")
     def delete_task(task_id: int) -> dict[str, Any]:

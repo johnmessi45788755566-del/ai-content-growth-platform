@@ -212,6 +212,7 @@ class Database:
                   retry_count INTEGER NOT NULL DEFAULT 0,
                   content_project_id INTEGER REFERENCES content_projects(id) ON DELETE SET NULL,
                   publish_package_id INTEGER REFERENCES publish_packages(id) ON DELETE SET NULL,
+                  publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL,
                   last_run_at TEXT NOT NULL DEFAULT '',
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -227,6 +228,7 @@ class Database:
                   failure_reason TEXT NOT NULL DEFAULT '',
                   content_project_id INTEGER REFERENCES content_projects(id) ON DELETE SET NULL,
                   publish_package_id INTEGER REFERENCES publish_packages(id) ON DELETE SET NULL,
+                  publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL,
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 """
@@ -249,7 +251,9 @@ class Database:
                 "ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE scheduled_tasks ADD COLUMN content_project_id INTEGER REFERENCES content_projects(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_package_id INTEGER REFERENCES publish_packages(id) ON DELETE SET NULL",
+                "ALTER TABLE scheduled_tasks ADD COLUMN publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN last_run_at TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE task_runs ADD COLUMN publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL",
             ]:
                 with suppress(sqlite3.OperationalError):
                     conn.execute(column_sql)

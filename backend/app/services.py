@@ -568,17 +568,21 @@ class ContentService:
             keyword = f"%{q}%"
             params.extend([keyword, keyword])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return self.db.fetch_all(
+        tasks = self.db.fetch_all(
             f"""
             SELECT id, platform, account_id, account_name, execute_time, task_type, topic, article_requirements, selected_title, title_direction, status,
-                   publish_result, manual_takeover_url, execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason,
-                   retry_count, content_project_id, publish_package_id, last_run_at, created_at, updated_at
+                   publish_action, publish_result, manual_takeover_url, execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason,
+                   retry_count, content_project_id, publish_package_id, publish_job_id, last_run_at, created_at, updated_at
             FROM scheduled_tasks
             {where}
             ORDER BY COALESCE(NULLIF(next_run_at, ''), execute_time) ASC, id DESC
             """,
             tuple(params),
         )
+        for task in tasks:
+            if task.get("publish_job_id"):
+                task["publish_job"] = self.get_publish_job(int(task["publish_job_id"]))
+        return tasks
 
     def get_task(self, task_id: int) -> dict[str, Any]:
         task = self.db.fetch_one("SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,))
@@ -587,7 +591,7 @@ class ContentService:
         task["runs"] = self.db.fetch_all(
             """
             SELECT id, task_id, status, started_at, finished_at, failure_stage, failure_reason,
-                   content_project_id, publish_package_id, created_at
+                   content_project_id, publish_package_id, publish_job_id, created_at
             FROM task_runs
             WHERE task_id = ?
             ORDER BY id DESC
@@ -601,6 +605,8 @@ class ContentService:
                 "SELECT * FROM publish_packages WHERE id = ?",
                 (task["publish_package_id"],),
             )
+        if task.get("publish_job_id"):
+            task["publish_job"] = self.get_publish_job(int(task["publish_job_id"]))
         return task
 
     def create_task(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -609,9 +615,9 @@ class ContentService:
             """
             INSERT INTO scheduled_tasks (
               platform, account_id, account_name, execute_time, task_type, topic, article_requirements, selected_title, title_direction, status,
-              execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason
+              publish_action, execution_mode, repeat_rule, weekly_day, next_run_at, failure_stage, failure_reason
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 normalized["platform"],
@@ -624,6 +630,7 @@ class ContentService:
                 normalized["selected_title"],
                 normalized["title_direction"],
                 normalized["status"],
+                normalized["publish_action"],
                 normalized["execution_mode"],
                 normalized["repeat_rule"],
                 normalized["weekly_day"],
@@ -642,9 +649,9 @@ class ContentService:
             UPDATE scheduled_tasks
             SET platform = ?, account_id = ?, account_name = ?, execute_time = ?, task_type = ?, topic = ?, article_requirements = ?,
                 selected_title = ?, title_direction = ?, status = '待执行',
-                execution_mode = ?, repeat_rule = ?, weekly_day = ?,
+                publish_action = ?, execution_mode = ?, repeat_rule = ?, weekly_day = ?,
                 next_run_at = ?, failure_stage = '', failure_reason = '', publish_result = '', manual_takeover_url = '',
-                content_project_id = NULL, publish_package_id = NULL, updated_at = CURRENT_TIMESTAMP
+                content_project_id = NULL, publish_package_id = NULL, publish_job_id = NULL, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (
@@ -657,6 +664,7 @@ class ContentService:
                 normalized["article_requirements"],
                 normalized["selected_title"],
                 normalized["title_direction"],
+                normalized["publish_action"],
                 normalized["execution_mode"],
                 normalized["repeat_rule"],
                 normalized["weekly_day"],
@@ -679,18 +687,24 @@ class ContentService:
             where = f"{where} AND id IN ({placeholders})"
             params = tuple(task_ids)
         failed_tasks = self.db.fetch_all(f"SELECT id FROM scheduled_tasks WHERE {where}", params)
+        updated = 0
         for task in failed_tasks:
-            self.db.execute(
-                """
-                UPDATE scheduled_tasks
-                SET status = '已重试', retry_count = retry_count + 1, failure_stage = '',
-                    failure_reason = '', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                """,
-                (task["id"],),
-            )
+            with self.db.connect() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET status = '已重试', retry_count = retry_count + 1, failure_stage = '',
+                        failure_reason = '', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND status = '失败'
+                    """,
+                    (task["id"],),
+                )
+                conn.commit()
+            if cursor.rowcount != 1:
+                continue
+            updated += 1
             self.execute_task(int(task["id"]))
-        return {"updated": len(failed_tasks)}
+        return {"updated": updated}
 
     def execute_due_tasks(self, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now()
@@ -712,26 +726,16 @@ class ContentService:
     def execute_task(self, task_id: int, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now()
         started_at = _format_task_time(current)
+        run_id = self._claim_task_execution(task_id, started_at)
+        if run_id is None:
+            return self.get_task(task_id)
         task = self.get_task(task_id)
-        run_id = self.db.execute(
-            """
-            INSERT INTO task_runs (task_id, status, started_at)
-            VALUES (?, '执行中', ?)
-            """,
-            (task_id, started_at),
-        )
-        self.db.execute(
-            """
-            UPDATE scheduled_tasks
-            SET status = '执行中', last_run_at = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (started_at, task_id),
-        )
+        stage = "检查账号"
+        failed_package_id: int | None = None
+        failed_job_id: int | None = None
         try:
-            account = self.get_account(int(task["account_id"])) if task.get("account_id") else None
-            if account and account["auth_status"] != "已授权":
-                raise RuntimeError("账号未授权，无法执行定时任务")
+            account = self._validate_task_publish_target(task)
+            stage = "生成标题"
             title_choice = self._recommend_task_title(task)
             task_title = title_choice["title"]
             title_direction = title_choice["direction"]
@@ -748,7 +752,13 @@ class ContentService:
                 title_direction=title_direction,
                 platform=task["platform"],
             )
+            self.db.execute(
+                "UPDATE scheduled_tasks SET content_project_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (project["id"], task_id),
+            )
+            stage = "生成文章"
             article = self.generate_article(project["id"])
+            stage = "生成图片"
             images = self.generate_images(project["id"])
             cover = next((asset for asset in images["assets"] if asset["asset_type"] == "cover" and asset["selected"]), None)
             inline_assets = [asset for asset in images["assets"] if asset["asset_type"] == "inline" and asset["selected"]]
@@ -770,19 +780,51 @@ class ContentService:
                         "sort_order": index + 2,
                     }
                 )
+            stage = "文章排版"
             self.save_layout(project["id"], layout_blocks)
+            stage = "提交平台草稿" if task["publish_action"] == "draft" else "发布文章"
             package = self.create_publish_package(
                 project["id"],
                 platform=task["platform"],
                 account_name=task["account_name"],
-                account_id=task.get("account_id"),
-                status="platform_draft",
+                account_id=int(account["id"]),
+                action=task["publish_action"],
             )
-            self._finish_task_success(task, run_id, project["id"], package["id"], current)
+            failed_package_id = int(package["id"])
+            failed_job_id = int(package["publish_job_id"])
+            job = self.get_publish_job(failed_job_id)
+            self._finish_task_from_publish_job(task, run_id, project["id"], package["id"], job, current)
         except Exception as exc:
-            stage = "任务类型未开放" if task["task_type"] == TASK_TYPE_XIAOHONGSHU_RESERVED else "执行失败"
-            self._finish_task_failure(task_id, run_id, stage, str(exc), current)
+            failure_stage = "任务类型未开放" if task["task_type"] == TASK_TYPE_XIAOHONGSHU_RESERVED else stage
+            self._finish_task_failure(
+                task_id,
+                run_id,
+                failure_stage,
+                str(exc),
+                current,
+                publish_package_id=failed_package_id,
+                publish_job_id=failed_job_id,
+            )
         return self.get_task(task_id)
+
+    def _claim_task_execution(self, task_id: int, started_at: str) -> int | None:
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = '执行中', last_run_at = ?, next_run_at = '', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status IN ('待执行', '已重试')
+                """,
+                (started_at, task_id),
+            )
+            if cursor.rowcount != 1:
+                return None
+            run_id = conn.execute(
+                "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, '执行中', ?)",
+                (task_id, started_at),
+            ).lastrowid
+            conn.commit()
+            return int(run_id)
 
     def _recommend_task_title(self, task: dict[str, Any]) -> dict[str, str]:
         prompt = (
@@ -799,37 +841,58 @@ class ContentService:
                     return {"title": title, "direction": recommendation.direction}
         raise RuntimeError("AI 未返回可用标题")
 
-    def _finish_task_success(
+    def _finish_task_from_publish_job(
         self,
         task: dict[str, Any],
         run_id: int,
         project_id: int,
         package_id: int,
+        job: dict[str, Any],
         now: datetime,
     ) -> None:
-        finished_at = _format_task_time(now)
+        result_by_status = {
+            "published": "已发布",
+            "platform_draft": "已生成平台草稿",
+            "awaiting_confirmation": "待人工确认",
+        }
+        if job["status"] == "failed":
+            self._finish_task_failure(
+                int(task["id"]),
+                run_id,
+                str(job["failure_stage"]),
+                str(job["failure_reason"]),
+                now,
+                publish_package_id=package_id,
+                publish_job_id=int(job["id"]),
+            )
+            return
+        publish_result = result_by_status.get(str(job["status"]))
+        if not publish_result:
+            raise RuntimeError(f"发布任务返回了不可结束的状态：{job['status']}")
+        waiting = job["status"] == "awaiting_confirmation"
+        finished_at = "" if waiting else _format_task_time(now)
         next_run_at = ""
-        status = "已生成平台草稿"
-        publish_result = "已生成平台草稿"
-        if task["execution_mode"] == "repeat":
+        status = publish_result
+        if task["execution_mode"] == "repeat" and not waiting:
             status = "待执行"
             next_run_at = self._next_repeat_time(task, now)
         self.db.execute(
             """
             UPDATE scheduled_tasks
             SET status = ?, next_run_at = ?, failure_stage = '', failure_reason = '',
-                publish_result = ?, manual_takeover_url = '', content_project_id = ?, publish_package_id = ?, updated_at = CURRENT_TIMESTAMP
+                publish_result = ?, manual_takeover_url = '', content_project_id = ?, publish_package_id = ?,
+                publish_job_id = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (status, next_run_at, publish_result, project_id, package_id, task["id"]),
+            (status, next_run_at, publish_result, project_id, package_id, job["id"], task["id"]),
         )
         self.db.execute(
             """
             UPDATE task_runs
-            SET status = ?, finished_at = ?, content_project_id = ?, publish_package_id = ?
+            SET status = ?, finished_at = ?, content_project_id = ?, publish_package_id = ?, publish_job_id = ?
             WHERE id = ?
             """,
-            (publish_result, finished_at, project_id, package_id, run_id),
+            (publish_result, finished_at, project_id, package_id, job["id"], run_id),
         )
 
     def _finish_task_failure(
@@ -839,24 +902,30 @@ class ContentService:
         stage: str,
         reason: str,
         now: datetime,
+        publish_package_id: int | None = None,
+        publish_job_id: int | None = None,
     ) -> None:
         finished_at = _format_task_time(now)
         self.db.execute(
             """
             UPDATE scheduled_tasks
             SET status = '失败', failure_stage = ?, failure_reason = ?,
-                manual_takeover_url = 'manual-takeover://task/' || ?, updated_at = CURRENT_TIMESTAMP
+                manual_takeover_url = 'manual-takeover://task/' || ?,
+                publish_package_id = COALESCE(?, publish_package_id),
+                publish_job_id = COALESCE(?, publish_job_id), updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
-            (stage, reason, task_id, task_id),
+            (stage, reason, task_id, publish_package_id, publish_job_id, task_id),
         )
         self.db.execute(
             """
             UPDATE task_runs
-            SET status = '失败', finished_at = ?, failure_stage = ?, failure_reason = ?
+            SET status = '失败', finished_at = ?, failure_stage = ?, failure_reason = ?,
+                publish_package_id = COALESCE(?, publish_package_id),
+                publish_job_id = COALESCE(?, publish_job_id)
             WHERE id = ?
             """,
-            (finished_at, stage, reason, run_id),
+            (finished_at, stage, reason, publish_package_id, publish_job_id, run_id),
         )
 
     def _normalize_task_payload(self, payload: dict[str, Any], force_pending: bool = False) -> dict[str, Any]:
@@ -870,6 +939,27 @@ class ContentService:
             account = self.get_account(int(account_id))
             platform = account["platform"]
             account_name = account["name"]
+        else:
+            account = self.db.fetch_one(
+                """
+                SELECT * FROM platform_accounts
+                WHERE platform = ? AND name = ? AND auth_status = '已授权'
+                ORDER BY updated_at DESC, id DESC LIMIT 1
+                """,
+                (platform, account_name),
+            )
+            if account:
+                account_id = int(account["id"])
+        if platform != "微信公众号" or task_type != TASK_TYPE_WECHAT:
+            raise RuntimeError("V1 定时任务真实发布仅支持微信公众号")
+        if account_id in {None, ""}:
+            raise RuntimeError("请选择一个已授权的微信公众号账号")
+        account = self.get_account(int(account_id))
+        if account["platform"] != "微信公众号" or account["auth_status"] != "已授权":
+            raise RuntimeError("请选择一个已授权的微信公众号账号")
+        publish_action = str(payload.get("publish_action", "publish")).strip() or "publish"
+        if publish_action not in {"publish", "draft"}:
+            raise RuntimeError("发布动作必须是 publish 或 draft")
         execution_mode = str(payload.get("execution_mode", "once")).strip() or "once"
         repeat_rule = str(payload.get("repeat_rule", "")).strip()
         if execution_mode != "repeat":
@@ -898,6 +988,7 @@ class ContentService:
             "selected_title": str(payload.get("selected_title", "")),
             "title_direction": str(payload.get("title_direction", "")),
             "status": status,
+            "publish_action": publish_action,
             "execution_mode": execution_mode,
             "repeat_rule": repeat_rule,
             "weekly_day": weekly_day,
@@ -923,6 +1014,7 @@ class ContentService:
         platform: str,
         account_name: str,
         account_id: int | None = None,
+        action: str = "draft",
     ) -> dict[str, Any]:
         project = self.get_project(project_id)
         if _normalize_platform(platform) != "微信公众号":
@@ -937,7 +1029,7 @@ class ContentService:
             "media_assets": project["media_assets"],
             "layout_blocks": project["layout_blocks"],
         }
-        job = self.create_publish_job(project_id, account_id, "draft")
+        job = self.create_publish_job(project_id, account_id, action)
         package_id = self.db.execute(
             """
             INSERT INTO publish_packages (
@@ -959,12 +1051,14 @@ class ContentService:
                 job["failure_stage"],
                 job["failure_reason"],
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if job["status"] == "platform_draft"
+                if job["status"] in {"platform_draft", "published"}
                 else "",
             ),
         )
         if job["status"] == "platform_draft":
             self._create_work_from_project(account_id, platform, account_name, project, status="平台草稿")
+        elif job["status"] == "published":
+            self._create_work_from_project(account_id, platform, account_name, project, status="已发布")
         self._set_stage(project_id, "publish")
         self.autosave(project_id, stage="publish", restore_stage="layout")
         package = self.db.fetch_one("SELECT * FROM publish_packages WHERE id = ?", (package_id,))
@@ -989,9 +1083,69 @@ class ContentService:
 
     def resume_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
-            return self.publish_coordinator.resume_publish_job(job_id)
+            job = self.publish_coordinator.resume_publish_job(job_id)
+            self._synchronize_linked_waiting_tasks(job)
+            return job
         except LookupError as exc:
             raise NotFoundError(str(exc)) from exc
+
+    def _synchronize_linked_waiting_tasks(self, job: dict[str, Any]) -> None:
+        if job["status"] not in {"published", "platform_draft", "failed"}:
+            return
+        tasks = self.db.fetch_all(
+            "SELECT * FROM scheduled_tasks WHERE publish_job_id = ? AND status = '待人工确认'",
+            (job["id"],),
+        )
+        for task in tasks:
+            run = self.db.fetch_one(
+                """
+                SELECT * FROM task_runs
+                WHERE task_id = ? AND publish_job_id = ? AND status = '待人工确认'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (task["id"], job["id"]),
+            )
+            if not run:
+                continue
+            package_id = int(task["publish_package_id"])
+            self.db.execute(
+                """
+                UPDATE publish_packages
+                SET status = ?, platform_draft_id = ?, platform_draft_url = ?,
+                    platform_response_json = ?, failure_stage = ?, failure_reason = ?,
+                    published_at = CASE WHEN ? IN ('published', 'platform_draft') THEN CURRENT_TIMESTAMP ELSE '' END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    job["status"],
+                    job["platform_draft_id"],
+                    job["platform_url"],
+                    json.dumps(job.get("response", {}), ensure_ascii=False),
+                    job["failure_stage"],
+                    job["failure_reason"],
+                    job["status"],
+                    package_id,
+                ),
+            )
+            self._finish_task_from_publish_job(
+                task,
+                int(run["id"]),
+                int(task["content_project_id"]),
+                package_id,
+                job,
+                datetime.now(),
+            )
+
+    def _validate_task_publish_target(self, task: dict[str, Any]) -> dict[str, Any]:
+        if task["platform"] != "微信公众号" or task["task_type"] != TASK_TYPE_WECHAT:
+            raise RuntimeError("V1 定时任务真实发布仅支持微信公众号")
+        if not task.get("account_id"):
+            raise RuntimeError("请选择一个已授权的微信公众号账号")
+        account = self.get_account(int(task["account_id"]))
+        if account["platform"] != "微信公众号" or account["auth_status"] != "已授权":
+            raise RuntimeError("请选择一个已授权的微信公众号账号")
+        return account
 
     def _resolve_publish_account(
         self, platform: str, account_name: str, account_id: int | None

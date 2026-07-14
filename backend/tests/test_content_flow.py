@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -639,17 +640,122 @@ def test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration(
     database_path = tmp_path / "legacy.db"
     with sqlite3.connect(database_path) as conn:
         conn.execute("CREATE TABLE scheduled_tasks (id INTEGER PRIMARY KEY)")
+        conn.execute("CREATE TABLE task_runs (id INTEGER PRIMARY KEY)")
 
     db = Database(database_path)
     db.init_schema()
 
     task_id = db.execute("INSERT INTO scheduled_tasks (publish_action) VALUES (?)", ("draft",))
+    task_columns = {row["name"] for row in db.fetch_all("PRAGMA table_info(scheduled_tasks)")}
+    run_columns = {row["name"] for row in db.fetch_all("PRAGMA table_info(task_runs)")}
+
+    assert "publish_job_id" in task_columns
+    assert "publish_job_id" in run_columns
 
     with pytest.raises(sqlite3.IntegrityError):
         db.execute("INSERT INTO scheduled_tasks (publish_action) VALUES (?)", ("invalid",))
 
     with pytest.raises(sqlite3.IntegrityError):
         db.execute("UPDATE scheduled_tasks SET publish_action = ? WHERE id = ?", ("invalid", task_id))
+
+
+def test_concurrent_task_execution_claims_generation_once(tmp_path):
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def publish(self, payload, account, action):
+            with self.lock:
+                self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
+        ("微信公众号", "并发任务账号", "已授权"),
+    )
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "并发任务账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "并发只生成一次",
+            "publish_action": "draft",
+        }
+    )
+    barrier = threading.Barrier(2)
+
+    def execute():
+        barrier.wait(timeout=5)
+        return service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: execute(), range(2)))
+
+    assert {result["id"] for result in results} == {task["id"]}
+    assert publisher.calls == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM task_runs")["count"] == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM content_projects")["count"] == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
+def test_concurrent_failed_task_retries_claim_once(tmp_path):
+    class FailingPublisher(FakePlatformPublisher):
+        def publish(self, payload, account, action):
+            raise RuntimeError("first generation failed")
+
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def publish(self, payload, account, action):
+            with self.lock:
+                self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
+        ("微信公众号", "重试并发账号", "已授权"),
+    )
+    service.publish_coordinator.publisher = FailingPublisher()
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "重试并发账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "失败后并发重试",
+            "publish_action": "draft",
+        }
+    )
+    assert service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))["status"] == "失败"
+
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+    fetch_barrier = threading.Barrier(2)
+    original_fetch_all = service.db.fetch_all
+
+    def synchronized_fetch_all(sql, params=()):
+        rows = original_fetch_all(sql, params)
+        if "SELECT id FROM scheduled_tasks WHERE status = '失败'" in sql:
+            fetch_barrier.wait(timeout=5)
+        return rows
+
+    service.db.fetch_all = synchronized_fetch_all
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: service.retry_failed_tasks([task["id"]]), range(2)))
+
+    assert sum(result["updated"] for result in results) == 1
+    assert publisher.calls == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM task_runs")["count"] == 2
 
 
 def test_existing_publish_jobs_rebuilds_same_named_relaxed_result_triggers(tmp_path):
