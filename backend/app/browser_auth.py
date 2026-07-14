@@ -606,13 +606,40 @@ class BrowserAuthManager:
         BrowserAuthManager._wait_for_browser_exit(process)
 
     @staticmethod
+    def _public_account(account: Any) -> dict[str, Any] | None:
+        if not isinstance(account, dict):
+            return None
+        fields = (
+            "id",
+            "platform",
+            "name",
+            "account_name",
+            "auth_status",
+            "monitor_status",
+            "sync_status",
+            "last_sync_at",
+            "last_synced_at",
+        )
+        return {field: account[field] for field in fields if field in account}
+
+    @staticmethod
+    def _public_login_url(login_url: Any) -> str:
+        try:
+            parsed = urllib.parse.urlsplit(str(login_url or ""))
+        except ValueError:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return ""
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.hostname, parsed.path, "", ""))
+
+    @staticmethod
     def _public_session(session: dict[str, Any]) -> dict[str, Any]:
         return {
             "session_id": session["session_id"],
             "platform": session["platform"],
             "status": session["status"],
             "message": session["message"],
-            "login_url": session["login_url"],
-            "account": session.get("account"),
+            "login_url": BrowserAuthManager._public_login_url(session.get("login_url")),
+            "account": BrowserAuthManager._public_account(session.get("account")),
             "error": session.get("error", ""),
         }

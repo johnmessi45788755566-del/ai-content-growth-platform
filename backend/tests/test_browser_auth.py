@@ -159,3 +159,121 @@ def test_close_browser_terminates_and_kills_when_process_does_not_exit():
     assert process.terminated is True
     assert process.killed is True
     assert process.wait_timeouts == [3, 3]
+
+
+def test_public_session_redacts_sensitive_account_fields_and_sanitizes_login_url():
+    public_session = BrowserAuthManager._public_session(
+        {
+            "session_id": "session-1",
+            "platform": "微信公众号",
+            "status": "success",
+            "message": "登录成功",
+            "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=secret#fragment",
+            "account": {
+                "id": 7,
+                "platform": "微信公众号",
+                "name": "测试账号",
+                "account_name": "测试账号",
+                "auth_status": "已授权",
+                "monitor_status": "监测中",
+                "sync_status": "已同步",
+                "last_sync_at": "2026-07-14 09:00:00",
+                "profile_path": "/private/profile",
+                "external_id": "external-credential",
+                "cookies": [{"name": "session", "value": "secret"}],
+                "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=secret",
+            },
+            "error": "",
+        }
+    )
+
+    assert public_session == {
+        "session_id": "session-1",
+        "platform": "微信公众号",
+        "status": "success",
+        "message": "登录成功",
+        "login_url": "https://mp.weixin.qq.com/cgi-bin/home",
+        "account": {
+            "id": 7,
+            "platform": "微信公众号",
+            "name": "测试账号",
+            "account_name": "测试账号",
+            "auth_status": "已授权",
+            "monitor_status": "监测中",
+            "sync_status": "已同步",
+            "last_sync_at": "2026-07-14 09:00:00",
+        },
+        "error": "",
+    }
+
+
+def test_enable_session_restore_cleans_up_temporary_file_when_replace_fails(tmp_path, monkeypatch):
+    profile_path = tmp_path / "profile"
+    preferences_path = profile_path / "Default" / "Preferences"
+    preferences_path.parent.mkdir(parents=True)
+    preferences_path.write_text('{"browser":{"show_home_button":true}}', encoding="utf-8")
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(browser_auth.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        BrowserAuthManager._enable_session_restore(profile_path)
+
+    assert preferences_path.read_text(encoding="utf-8") == '{"browser":{"show_home_button":true}}'
+    assert list(preferences_path.parent.glob(".Preferences-*")) == []
+
+
+def test_close_browser_waits_for_normal_browser_close(monkeypatch):
+    class Response:
+        def read(self):
+            return b'{"webSocketDebuggerUrl":"ws://browser"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class Connection:
+        def __init__(self):
+            self.messages = []
+            self.closed = False
+
+        def send(self, message):
+            self.messages.append(json.loads(message))
+
+        def close(self):
+            self.closed = True
+
+    class Process:
+        def __init__(self):
+            self.wait_timeouts = []
+            self.terminated = False
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout):
+            self.wait_timeouts.append(timeout)
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.killed = True
+
+    connection = Connection()
+    process = Process()
+    monkeypatch.setattr(browser_auth.urllib.request, "urlopen", lambda request, timeout: Response())
+    monkeypatch.setattr(browser_auth.websocket, "create_connection", lambda url, timeout: connection)
+
+    BrowserAuthManager._close_browser(process, 9222)
+
+    assert connection.messages == [{"id": 1, "method": "Browser.close"}]
+    assert connection.closed is True
+    assert process.wait_timeouts == [3]
+    assert process.terminated is False
+    assert process.killed is False
