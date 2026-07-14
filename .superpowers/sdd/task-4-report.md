@@ -308,3 +308,62 @@ git diff --check
 ```
 
 结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有平台发布测试均使用 fake publisher，未执行真实平台写入。
+
+## Task 4 后端复审完整 findings 收口
+
+### 修复内容
+
+- PATCH 在 `BEGIN IMMEDIATE` 事务内同时检查 task、最新 run、package 和关联 job。活动、失败可重试、待确认以及平台已终态但本地记录未同步的 job 均返回 `409`；只有 task/run/package 已完整同步的成功终态允许重新编辑。
+- `scheduled_tasks.generation` 作为调度代次 CAS。due 扫描和失败重试都携带读取时 generation，PATCH 与领取都会递增；失败重试的状态标记和领取合并为一次原子 UPDATE，旧扫描不能执行被延期或改代的任务。
+- 公开 publish job 顶层改为显式字段白名单；嵌套响应按 snake/camel/紧凑键 token 边界过滤，覆盖 storage state、verification code、private key、client secret、API token、cookie jar、profile dir、debug info 及 resume/auth/session/port 族，同时保留 `report_id`、`author_name`、平台 ID、URL 和普通 receipt。可疑裸字符串直接替换为隐藏占位符。
+- 旧 package payload 仅在 `publish_job_id` 的 JSON 类型为 integer 且目标 `publish_jobs` 行存在时回填。账号级联删除 job 后再次初始化数据库不会恢复悬空引用。
+- 平台 job 已终态后的本地 task/run/package 最终化恢复路径保持不变：扫描或 resume 只重试本地事务，不再次调用 publisher。
+
+### RED: 完整 findings 复现
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_public_publish_job_drops_nested_normalized_secret_keys backend/tests/test_api.py::test_due_scan_cannot_claim_task_after_patch_moves_it_to_future backend/tests/test_api.py::test_retry_scan_cannot_claim_task_after_patch_changes_generation backend/tests/test_api.py::test_patch_task_rejects_unsynchronized_terminal_publish_job backend/tests/test_content_flow.py::test_publish_package_backfill_ignores_deleted_or_non_integer_job_ids -q
+```
+
+结果：退出码 `1`，`6 failed, 1 warning in 0.83s`。分别复现 token 子串误删 `report_id`、due/retry 陈旧快照继续领取、published/platform draft 关联被 PATCH 清空，以及级联删除 job 后迁移触发外键错误。
+
+紧凑无分隔敏感键追加 RED：`test_public_publish_job_drops_nested_normalized_secret_keys` 失败，`storagestate`、`verificationcode`、`privatekey` 字段仍出现在公开响应；并发 linked retry 对照测试通过。
+
+### GREEN: 聚焦回归
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_public_publish_job_drops_nested_normalized_secret_keys backend/tests/test_api.py::test_due_scan_cannot_claim_task_after_patch_moves_it_to_future backend/tests/test_api.py::test_retry_scan_cannot_claim_task_after_patch_changes_generation backend/tests/test_api.py::test_linked_job_retry_and_patch_keep_same_generation_and_job backend/tests/test_api.py::test_patch_task_rejects_unsynchronized_terminal_publish_job backend/tests/test_api.py::test_initial_task_finalization_rollback_stays_active_until_local_recovery backend/tests/test_api.py::test_repeated_local_finalization_failures_remain_pending_without_republishing backend/tests/test_api.py::test_resume_retries_local_sync_without_republishing_after_platform_success backend/tests/test_content_flow.py::test_publish_package_backfill_ignores_deleted_or_non_integer_job_ids -q
+```
+
+结果：退出码 `0`，`10 passed, 1 warning in 0.76s`。linked retry 与 PATCH 交错严格保持 `409`、同一 job、publisher 总调用 `2`（首次失败加原位重试）和 job 总数 `1`；due/retry 陈旧代次均为 `0` 次发布、`0` 个 job。
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py backend/tests/test_content_flow.py -q
+```
+
+结果：退出码 `0`，`87 passed, 1 warning in 5.36s`。
+
+### 最终完整验证
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+结果：退出码 `0`，`154 passed, 1 warning in 4.74s`。
+
+```bash
+python3 -m compileall -q backend/app
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。
+
+### Concern
+
+- 平台终态与 SQLite 本地最终化仍无法组成单一分布式事务；当前以持久 job、同 job 恢复、generation CAS 和本地终态重放保证不重发。所有发布测试均使用 fake publisher，未执行真实平台写入。
+- generation 由服务层支持的 PATCH、due 与 retry 路径维护；绕过服务直接更新 `scheduled_tasks` 的外部 SQL 不在并发保证范围内。

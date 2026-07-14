@@ -688,6 +688,49 @@ def test_existing_publish_package_backfills_publish_job_id_from_payload(tmp_path
     assert package["publish_job_id"] == job_id
 
 
+def test_publish_package_backfill_ignores_deleted_or_non_integer_job_ids(tmp_path):
+    db = Database(tmp_path / "stale-legacy-package.db")
+    db.init_schema()
+    project_id = db.execute("INSERT INTO content_projects (title) VALUES ('stale legacy package')")
+    account_id = db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '已删除账号', '已授权')"
+    )
+    job_id = db.execute(
+        """
+        INSERT INTO publish_jobs (project_id, account_id, platform, action, status)
+        VALUES (?, ?, '微信公众号', 'publish', 'pending')
+        """,
+        (project_id, account_id),
+    )
+    stale_package_id = db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status, publish_job_id
+        ) VALUES (?, ?, '微信公众号', '已删除账号', ?, 'pending_publish', ?)
+        """,
+        (project_id, account_id, json.dumps({"publish_job_id": job_id}), job_id),
+    )
+    malformed_package_id = db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status, publish_job_id
+        ) VALUES (?, ?, '微信公众号', '已删除账号', ?, 'pending_publish', NULL)
+        """,
+        (project_id, account_id, json.dumps({"publish_job_id": str(job_id)})),
+    )
+    db.execute("DELETE FROM platform_accounts WHERE id = ?", (account_id,))
+
+    db.init_schema()
+
+    assert db.fetch_one("SELECT id FROM publish_jobs WHERE id = ?", (job_id,)) is None
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM publish_packages WHERE id = ?", (stale_package_id,)
+    )["publish_job_id"] is None
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM publish_packages WHERE id = ?", (malformed_package_id,)
+    )["publish_job_id"] is None
+
+
 def test_legacy_task_links_backfill_through_package_and_retry_reuses_job(tmp_path):
     class UnexpectedPublisher(FakePlatformPublisher):
         def __init__(self):

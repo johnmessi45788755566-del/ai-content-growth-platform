@@ -221,6 +221,7 @@ class Database:
                   failure_stage TEXT NOT NULL DEFAULT '',
                   failure_reason TEXT NOT NULL DEFAULT '',
                   retry_count INTEGER NOT NULL DEFAULT 0,
+                  generation INTEGER NOT NULL DEFAULT 0,
                   content_project_id INTEGER REFERENCES content_projects(id) ON DELETE SET NULL,
                   publish_package_id INTEGER REFERENCES publish_packages(id) ON DELETE SET NULL,
                   publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL,
@@ -271,6 +272,7 @@ class Database:
                 "ALTER TABLE scheduled_tasks ADD COLUMN failure_stage TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE scheduled_tasks ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE scheduled_tasks ADD COLUMN content_project_id INTEGER REFERENCES content_projects(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_package_id INTEGER REFERENCES publish_packages(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL",
@@ -284,10 +286,18 @@ class Database:
                 conn.execute(
                     """
                     UPDATE publish_packages
-                    SET publish_job_id = CAST(json_extract(payload_json, '$.publish_job_id') AS INTEGER)
+                    SET publish_job_id = json_extract(payload_json, '$.publish_job_id')
                     WHERE publish_job_id IS NULL
                       AND json_valid(payload_json)
-                      AND json_extract(payload_json, '$.publish_job_id') IS NOT NULL
+                      AND json_type(payload_json, '$.publish_job_id') = 'integer'
+                      AND EXISTS (
+                        SELECT 1
+                        FROM publish_jobs
+                        WHERE publish_jobs.id = json_extract(
+                          publish_packages.payload_json,
+                          '$.publish_job_id'
+                        )
+                      )
                     """
                 )
             for backfill_sql in [

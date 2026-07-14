@@ -741,6 +741,70 @@ class ContentService:
         self.get_task(task_id)
         normalized = self._normalize_task_payload(payload, force_pending=True)
         with self.db.transaction() as conn:
+            current_row = conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if current_row is None:
+                raise NotFoundError("任务不存在")
+            current = dict(current_row)
+            conflict = current["status"] in {"执行中", "待人工确认"}
+            if current.get("publish_job_id"):
+                job_row = conn.execute(
+                    "SELECT status FROM publish_jobs WHERE id = ?",
+                    (current["publish_job_id"],),
+                ).fetchone()
+                job_status = str(job_row["status"]) if job_row else ""
+                if job_status in {
+                    "pending",
+                    "checking_login",
+                    "uploading_assets",
+                    "filling_content",
+                    "publishing",
+                    "awaiting_confirmation",
+                    "failed",
+                }:
+                    conflict = True
+                elif job_status in {"published", "platform_draft"}:
+                    expected_status = (
+                        "已发布" if job_status == "published" else "已生成平台草稿"
+                    )
+                    task_synchronized = current["status"] == expected_status
+                    if current["execution_mode"] == "repeat":
+                        task_synchronized = (
+                            current["status"] == "待执行"
+                            and bool(current["next_run_at"])
+                        )
+                    run = conn.execute(
+                        """
+                        SELECT status
+                        FROM task_runs
+                        WHERE task_id = ? AND publish_job_id = ?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (task_id, current["publish_job_id"]),
+                    ).fetchone()
+                    package = conn.execute(
+                        """
+                        SELECT status
+                        FROM publish_packages
+                        WHERE id = ? AND publish_job_id = ?
+                        """,
+                        (current["publish_package_id"], current["publish_job_id"]),
+                    ).fetchone()
+                    if (
+                        not task_synchronized
+                        or run is None
+                        or run["status"] != expected_status
+                        or package is None
+                        or package["status"] != job_status
+                    ):
+                        conflict = True
+                else:
+                    conflict = True
+            if conflict:
+                raise TaskConflictError(
+                    "任务正在发布或等待确认，或存在可恢复/待同步发布结果，暂不可编辑"
+                )
             cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks
@@ -748,18 +812,9 @@ class ContentService:
                     selected_title = ?, title_direction = ?, status = '待执行',
                     publish_action = ?, execution_mode = ?, repeat_rule = ?, weekly_day = ?,
                     next_run_at = ?, failure_stage = '', failure_reason = '', publish_result = '', manual_takeover_url = '',
-                    content_project_id = NULL, publish_package_id = NULL, publish_job_id = NULL, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                  AND status NOT IN ('执行中', '待人工确认')
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM publish_jobs
-                    WHERE publish_jobs.id = scheduled_tasks.publish_job_id
-                      AND publish_jobs.status IN (
-                        'pending', 'checking_login', 'uploading_assets', 'filling_content',
-                        'publishing', 'awaiting_confirmation'
-                      )
-                  )
+                    content_project_id = NULL, publish_package_id = NULL, publish_job_id = NULL,
+                    generation = generation + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND generation = ?
                 """,
                 (
                     normalized["platform"],
@@ -777,10 +832,11 @@ class ContentService:
                     normalized["weekly_day"],
                     normalized["next_run_at"],
                     task_id,
+                    current["generation"],
                 ),
             )
             if cursor.rowcount != 1:
-                raise TaskConflictError("任务正在发布或等待确认，暂不可编辑")
+                raise TaskConflictError("任务代次已变化，请刷新后重试")
         return self.get_task(task_id)
 
     def delete_task(self, task_id: int) -> dict[str, Any]:
@@ -795,24 +851,19 @@ class ContentService:
             placeholders = ",".join("?" for _ in task_ids)
             where = f"{where} AND id IN ({placeholders})"
             params = tuple(task_ids)
-        failed_tasks = self.db.fetch_all(f"SELECT id FROM scheduled_tasks WHERE {where}", params)
+        failed_tasks = self.db.fetch_all(
+            f"SELECT id, generation FROM scheduled_tasks WHERE {where}", params
+        )
         updated = 0
         for task in failed_tasks:
-            with self.db.connect() as conn:
-                cursor = conn.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET status = '已重试', retry_count = retry_count + 1, failure_stage = '',
-                        failure_reason = '', updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND status = '失败'
-                    """,
-                    (task["id"],),
-                )
-                conn.commit()
-            if cursor.rowcount != 1:
-                continue
-            updated += 1
-            self.execute_task(int(task["id"]))
+            _, claimed = self._execute_task(
+                int(task["id"]),
+                datetime.now(),
+                expected_status="失败",
+                expected_generation=int(task["generation"]),
+                increment_retry=True,
+            )
+            updated += int(claimed)
         return {"updated": updated}
 
     def execute_due_tasks(self, now: datetime | None = None) -> dict[str, Any]:
@@ -836,7 +887,7 @@ class ContentService:
                 continue
         due_tasks = self.db.fetch_all(
             """
-            SELECT id
+            SELECT id, generation
             FROM scheduled_tasks
             WHERE status = '待执行'
               AND COALESCE(NULLIF(next_run_at, ''), execute_time) <= ?
@@ -846,7 +897,12 @@ class ContentService:
         )
         executed = 0
         for task in due_tasks:
-            _, claimed = self._execute_task(int(task["id"]), current)
+            _, claimed = self._execute_task(
+                int(task["id"]),
+                current,
+                expected_status="待执行",
+                expected_generation=int(task["generation"]),
+            )
             executed += int(claimed)
         return {"executed": executed}
 
@@ -890,9 +946,22 @@ class ContentService:
             current,
         )
 
-    def _execute_task(self, task_id: int, current: datetime) -> tuple[dict[str, Any], bool]:
+    def _execute_task(
+        self,
+        task_id: int,
+        current: datetime,
+        expected_status: str | None = None,
+        expected_generation: int | None = None,
+        increment_retry: bool = False,
+    ) -> tuple[dict[str, Any], bool]:
         started_at = _format_task_time(current)
-        run_id = self._claim_task_execution(task_id, started_at)
+        run_id = self._claim_task_execution(
+            task_id,
+            started_at,
+            expected_status=expected_status,
+            expected_generation=expected_generation,
+            increment_retry=increment_retry,
+        )
         if run_id is None:
             return self.get_task(task_id), False
         task = self.get_task(task_id)
@@ -1028,20 +1097,38 @@ class ContentService:
                 self._finish_task_failure(task_id, run_id, failure_stage, str(exc), current)
         return self.get_task(task_id), True
 
-    def _claim_task_execution(self, task_id: int, started_at: str) -> int | None:
+    def _claim_task_execution(
+        self,
+        task_id: int,
+        started_at: str,
+        expected_status: str | None = None,
+        expected_generation: int | None = None,
+        increment_retry: bool = False,
+    ) -> int | None:
+        status_clause = "status IN ('待执行', '已重试')"
+        params: list[Any] = [started_at, int(increment_retry), task_id]
+        if expected_status is not None:
+            status_clause = "status = ?"
+            params.append(expected_status)
+        generation_clause = ""
+        if expected_generation is not None:
+            generation_clause = " AND generation = ?"
+            params.append(expected_generation)
         with self.db.connect() as conn:
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE scheduled_tasks
                 SET status = '执行中', last_run_at = ?, next_run_at = '',
                     publish_result = CASE WHEN status = '待执行' THEN '' ELSE publish_result END,
                     content_project_id = CASE WHEN status = '待执行' THEN NULL ELSE content_project_id END,
                     publish_package_id = CASE WHEN status = '待执行' THEN NULL ELSE publish_package_id END,
                     publish_job_id = CASE WHEN status = '待执行' THEN NULL ELSE publish_job_id END,
+                    retry_count = retry_count + ?, generation = generation + 1,
+                    failure_stage = '', failure_reason = '',
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status IN ('待执行', '已重试')
+                WHERE id = ? AND {status_clause}{generation_clause}
                 """,
-                (started_at, task_id),
+                tuple(params),
             )
             if cursor.rowcount != 1:
                 return None

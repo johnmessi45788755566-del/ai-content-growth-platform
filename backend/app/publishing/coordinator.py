@@ -25,16 +25,94 @@ COOKIE_PATTERN = re.compile(r"(?im)\bcookies?\s*[:=]\s*.*$")
 SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
     r"(?ix)"
     r"(?<![\w])"
-    r"(?:token|code|state|password|passwd|session(?:_?id)?|cookies?|"
+    r"(?:token|code|state|password|passwd|session(?:_?(?:id|cache|state))?|cookies?|"
+    r"storage_?state|verification_?code|private_?key|client_?secret|api_?token|"
+    r"cookie_?jar|profile_?dir|debug_?info|auth(?:orization)?_?context|"
     r"resume(?:_?handle)?|cdp(?:_?url)?|"
     r"websocket(?:_?debugger_?url|_?url)?|debugger_?url|"
     r"profile(?:_?path)?|remote-debugging-port|port)"
     r"\s*(?::|=|\s)\s*"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
+SUSPICIOUS_RAW_VALUE_PATTERN = re.compile(
+    r"(?ix)(?<![a-z0-9])(?:"
+    r"storage[_ -]?state|verification[_ -]?code|private[_ -]?key|"
+    r"client[_ -]?secret|api[_ -]?token|cookie[_ -]?jar|"
+    r"profile[_ -]?(?:dir|path)|debug[_ -]?(?:info|port)|"
+    r"resume(?:[_ -]?(?:context|handle))?|"
+    r"auth(?:orization)?(?:[_ -]?(?:context|header))?|"
+    r"session(?:[_ -]?(?:id|cache|state))?|"
+    r"(?:remote[_ -]?debugging[_ -]?)?port(?:[_ -]?binding)?"
+    r")(?![a-z0-9])"
+)
 LOCAL_DEBUG_ADDRESS_PATTERN = re.compile(
     r"(?i)\b(?:localhost|127\.0\.0\.1|\[?::1\]?):\d{2,5}\b"
 )
+PUBLIC_JOB_FIELDS = (
+    "id",
+    "project_id",
+    "account_id",
+    "platform",
+    "action",
+    "status",
+    "platform_draft_id",
+    "platform_publish_id",
+    "platform_url",
+    "requires_confirmation",
+    "failure_stage",
+    "failure_reason",
+    "created_at",
+    "updated_at",
+)
+SENSITIVE_KEY_TOKENS = {
+    "auth",
+    "authorization",
+    "bearer",
+    "cdp",
+    "code",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "debug",
+    "key",
+    "passwd",
+    "password",
+    "port",
+    "profile",
+    "resume",
+    "secret",
+    "session",
+    "state",
+    "token",
+}
+SENSITIVE_COMPACT_KEYS = {
+    "accesstoken",
+    "apitoken",
+    "apikey",
+    "authcontext",
+    "browsercontext",
+    "clientsecret",
+    "cookiejar",
+    "cdpurl",
+    "debuginfo",
+    "debugport",
+    "debuggerurl",
+    "jobcontext",
+    "portbinding",
+    "privatekey",
+    "profiledir",
+    "profilepath",
+    "refreshtoken",
+    "resumecontext",
+    "resumehandle",
+    "sessioncache",
+    "sessionid",
+    "storagestate",
+    "verificationcode",
+    "websocketdebuggerurl",
+    "websocketurl",
+}
 
 
 class PublishCoordinator:
@@ -309,13 +387,20 @@ class PublishCoordinator:
             response = json.loads(str(job.get("response_json") or "{}"))
         except json.JSONDecodeError:
             response = {}
-        resource = {key: value for key, value in job.items() if key != "response_json"}
+        resource = {
+            key: job[key]
+            for key in PUBLIC_JOB_FIELDS
+            if key in job
+        }
         resource["requires_confirmation"] = bool(resource["requires_confirmation"])
         resource["failure_reason"] = self._redact_sensitive_text(
             job, str(resource["failure_reason"])
         )
-        resource["response"] = response
-        return self._redact_browser_context(job, resource)
+        resource["platform_url"] = self._redact_sensitive_text(
+            job, str(resource["platform_url"])
+        )
+        resource["response"] = self._redact_browser_context(job, response)
+        return resource
 
     def _redact_sensitive_text(self, job: Mapping[str, Any], value: str) -> str:
         account = self.db.fetch_one(
@@ -359,51 +444,30 @@ class PublishCoordinator:
         return [value] if isinstance(value, str) else []
 
     def _redact_browser_context(self, job: Mapping[str, Any], value: Any) -> Any:
-        exact_sensitive_keys = {
-            "apikey",
-            "authorization",
-            "browsercontext",
-            "bearer",
-            "cdp",
-            "cdpurl",
-            "debuggerurl",
-            "jobcontext",
-            "passwd",
-            "state",
-            "code",
-            "websocketdebuggerurl",
-            "websocketurl",
-        }
-        sensitive_fragments = (
-            "auth",
-            "cookie",
-            "credential",
-            "debug",
-            "password",
-            "port",
-            "profile",
-            "resume",
-            "secret",
-            "session",
-            "token",
-        )
         if isinstance(value, Mapping):
             return {
                 key: self._redact_browser_context(job, item)
                 for key, item in value.items()
-                if (
-                    (normalized_key := re.sub(r"[^a-z0-9]", "", str(key).lower()))
-                    not in exact_sensitive_keys
-                    and not any(
-                        fragment in normalized_key for fragment in sensitive_fragments
-                    )
-                )
+                if not self._is_sensitive_key(key)
             }
         if isinstance(value, list):
             return [self._redact_browser_context(job, item) for item in value]
         if isinstance(value, str):
+            if SUSPICIOUS_RAW_VALUE_PATTERN.search(value):
+                return REDACTED_BROWSER_CONTEXT
             return self._redact_sensitive_text(job, value)
         return value
+
+    @staticmethod
+    def _is_sensitive_key(key: Any) -> bool:
+        value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+        tokens = {
+            token
+            for token in re.split(r"[^a-z0-9]+", value.lower())
+            if token
+        }
+        compact = re.sub(r"[^a-z0-9]", "", value.lower())
+        return bool(tokens & SENSITIVE_KEY_TOKENS) or compact in SENSITIVE_COMPACT_KEYS
 
 
 __all__ = ["PublishCoordinator", "PublishJobValidationError"]
