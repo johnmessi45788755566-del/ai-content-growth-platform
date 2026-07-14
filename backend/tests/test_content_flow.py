@@ -646,11 +646,20 @@ def test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration(
     db.init_schema()
 
     task_id = db.execute("INSERT INTO scheduled_tasks (publish_action) VALUES (?)", ("draft",))
+    run_id = db.execute("INSERT INTO task_runs DEFAULT VALUES")
     task_columns = {row["name"] for row in db.fetch_all("PRAGMA table_info(scheduled_tasks)")}
     run_columns = {row["name"] for row in db.fetch_all("PRAGMA table_info(task_runs)")}
 
     assert "publish_job_id" in task_columns
     assert "publish_job_id" in run_columns
+    assert "generation" in task_columns
+    assert "generation" in run_columns
+    assert db.fetch_one("SELECT generation FROM scheduled_tasks WHERE id = ?", (task_id,)) == {
+        "generation": 0
+    }
+    assert db.fetch_one("SELECT generation FROM task_runs WHERE id = ?", (run_id,)) == {
+        "generation": 0
+    }
 
     with pytest.raises(sqlite3.IntegrityError):
         db.execute("INSERT INTO scheduled_tasks (publish_action) VALUES (?)", ("invalid",))

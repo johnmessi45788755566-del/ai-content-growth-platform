@@ -85,6 +85,17 @@ PUBLIC_RECEIPT_FIELDS = (
     "author_name",
 )
 PUBLIC_RECEIPT_CONTAINERS = ("platform_receipt", "receipt")
+UNCERTAIN_IN_PROGRESS_STATUSES = (
+    "checking_login",
+    "uploading_assets",
+    "filling_content",
+    "publishing",
+)
+INTERRUPTED_FAILURE_STAGE = "发布中断"
+INTERRUPTED_FAILURE_REASON = (
+    "发布流程长时间无进展，无法确认平台是否已完成操作；"
+    "请人工核对平台状态后再决定是否重试"
+)
 
 
 class PublishCoordinator:
@@ -158,6 +169,40 @@ class PublishCoordinator:
             clear_previous_result=True,
             observed_job=job,
         )
+
+    def fail_stale_in_progress_job(
+        self, job_id: int, stale_before: str
+    ) -> dict[str, Any]:
+        job = self._get_row(job_id)
+        if job["status"] not in UNCERTAIN_IN_PROGRESS_STATUSES:
+            return self._public_job(job)
+        response_json = json.dumps(
+            {ATTEMPT_TOKEN_KEY: self._attempt_token(job)}, ensure_ascii=False
+        )
+        with self.db.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE publish_jobs
+                SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
+                    platform_url = '', response_json = ?, requires_confirmation = 0,
+                    failure_stage = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+                  AND response_json = ?
+                  AND updated_at <= ?
+                """,
+                (
+                    response_json,
+                    INTERRUPTED_FAILURE_STAGE,
+                    INTERRUPTED_FAILURE_REASON,
+                    job_id,
+                    *UNCERTAIN_IN_PROGRESS_STATUSES,
+                    job["response_json"],
+                    stale_before,
+                ),
+            )
+            conn.commit()
+        return self.get_publish_job(job_id)
 
     def resume_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)

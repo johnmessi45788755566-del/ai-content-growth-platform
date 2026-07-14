@@ -233,6 +233,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS task_runs (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   task_id INTEGER NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+                  generation INTEGER NOT NULL DEFAULT 0,
                   status TEXT NOT NULL,
                   started_at TEXT NOT NULL,
                   finished_at TEXT NOT NULL DEFAULT '',
@@ -277,6 +278,7 @@ class Database:
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_package_id INTEGER REFERENCES publish_packages(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN last_run_at TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE task_runs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
                 "ALTER TABLE task_runs ADD COLUMN publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL",
             ]:
                 with suppress(sqlite3.OperationalError):
@@ -301,6 +303,26 @@ class Database:
                     """
                 )
             for backfill_sql in [
+                """
+                UPDATE task_runs
+                SET generation = (
+                  SELECT generation
+                  FROM scheduled_tasks
+                  WHERE scheduled_tasks.id = task_runs.task_id
+                )
+                WHERE generation = 0
+                  AND id = (
+                    SELECT MAX(latest_run.id)
+                    FROM task_runs AS latest_run
+                    WHERE latest_run.task_id = task_runs.task_id
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM scheduled_tasks
+                    WHERE scheduled_tasks.id = task_runs.task_id
+                      AND scheduled_tasks.generation <> 0
+                  )
+                """,
                 """
                 UPDATE scheduled_tasks
                 SET publish_job_id = (
@@ -329,8 +351,10 @@ class Database:
                   AND EXISTS (
                     SELECT 1
                     FROM publish_packages
+                    JOIN scheduled_tasks ON scheduled_tasks.id = task_runs.task_id
                     WHERE publish_packages.id = task_runs.publish_package_id
                       AND publish_packages.publish_job_id IS NOT NULL
+                      AND task_runs.generation = scheduled_tasks.generation
                   )
                 """,
                 """
@@ -339,6 +363,7 @@ class Database:
                   SELECT publish_job_id
                   FROM task_runs
                   WHERE task_runs.task_id = scheduled_tasks.id
+                    AND task_runs.generation = scheduled_tasks.generation
                   ORDER BY task_runs.id DESC
                   LIMIT 1
                 )
@@ -347,11 +372,13 @@ class Database:
                     SELECT 1
                     FROM task_runs
                     WHERE task_runs.task_id = scheduled_tasks.id
+                      AND task_runs.generation = scheduled_tasks.generation
                       AND task_runs.publish_job_id IS NOT NULL
                       AND task_runs.id = (
                         SELECT MAX(latest_run.id)
                         FROM task_runs AS latest_run
                         WHERE latest_run.task_id = scheduled_tasks.id
+                          AND latest_run.generation = scheduled_tasks.generation
                       )
                   )
                 """,

@@ -433,3 +433,72 @@ git diff --check
 ```
 
 结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有发布测试使用 fake publisher，未执行真实平台写入。
+
+## 最新两个 Important findings 修复：代次隔离与发布中断恢复
+
+### 修复内容
+
+- `task_runs` 新增 `generation INTEGER NOT NULL DEFAULT 0`，已有库通过幂等 `ALTER TABLE` 迁移；旧 task/run 均保持可解析的 `generation=0`，已有非零代次库将最新 legacy run 对齐到 task 当前代次。
+- claim 在 resolver 之前先核验状态与 generation，陈旧 due/retry 快照会直接退出，不提交任何历史 job 回填。成功 claim 将 `scheduled_tasks.generation + 1` 的确切值写入新 run。
+- resolver 只读取 task 当前 generation 的最新 run，以及 task/current run 指向的 package。once 成功后 PATCH 可清空旧代关联并执行新主题；repeat 下一次运行同样使用新 run generation 和新 publish job。
+- task/run/job/package 已关联且 job 为 `pending` 时，扫描和手动 execute 都通过 publish job CAS 执行同一个 job，不创建新 job。
+- `checking_login`、`uploading_assets`、`filling_content`、`publishing` 不自动重发。超过固定 15 分钟无更新时，原 job CAS 为 `failed`，`failure_stage=发布中断`，reason 明确要求人工核对平台后再决定重试，并沿终态本地恢复同步 task/run/package；近期活动 job 保持不变。
+- SQLite `CURRENT_TIMESTAMP` 使用 UTC，超时边界会把调度本地时间显式转换为 UTC，避免东八区将近期 job 误判为陈旧。
+- 既有严格 response allowlist、legacy link fail closed、generation CAS 和平台终态本地恢复路径保持通过。
+
+### TDD 证据
+
+generation 隔离 RED：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py::test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration backend/tests/test_api.py::test_once_task_patch_starts_new_generation_without_reusing_old_publish_job backend/tests/test_api.py::test_stale_generation_claim_does_not_backfill_old_publish_job -q
+```
+
+结果：退出码 `1`，`3 failed, 1 warning in 0.58s`。分别复现 run 无 generation、once PATCH 后复用旧 job、陈旧 claim 在 CAS 失败前回填旧 job。
+
+中断恢复 RED：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_interrupted_pending_publish_job_executes_same_job backend/tests/test_api.py::test_stale_checking_login_job_moves_to_manual_interruption_failure backend/tests/test_api.py::test_recent_checking_login_job_is_not_changed_by_recovery_scan -q
+```
+
+结果：退出码 `1`，`3 failed, 1 passed, 1 warning in 0.62s`。pending job 在手动/扫描恢复后仍停留执行中，旧 checking_login 也无法退出执行中；近期 checking_login 对照保持不变。
+
+UTC 边界补充 RED：近期 job 使用 SQLite UTC 时间后被错误标记失败，结果为 `1 failed, 1 passed, 1 warning in 0.48s`；转换超时边界为 UTC 后两项通过。
+
+### GREEN 与最终验证
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py::test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration backend/tests/test_api.py::test_once_task_patch_starts_new_generation_without_reusing_old_publish_job backend/tests/test_api.py::test_stale_generation_claim_does_not_backfill_old_publish_job backend/tests/test_api.py::test_repeat_task_starts_next_generation_with_a_new_publish_job backend/tests/test_api.py::test_interrupted_pending_publish_job_executes_same_job backend/tests/test_api.py::test_stale_checking_login_job_moves_to_manual_interruption_failure backend/tests/test_api.py::test_recent_checking_login_job_is_not_changed_by_recovery_scan -q
+```
+
+结果：退出码 `0`，`8 passed, 1 warning in 0.90s`。once 两次执行产生不同 job，job 总数与 publisher 调用均为 `2`，第二项目标题和 task 主题来自新代次；pending 手动/扫描恢复均为同一 job 且仅调用 publisher 一次；陈旧 checking_login 的 job/publisher 数不增加，近期项不变。
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py backend/tests/test_content_flow.py -q
+```
+
+结果：退出码 `0`，`102 passed, 1 warning in 7.32s`。
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+结果：退出码 `0`，`169 passed, 1 warning in 6.82s`。
+
+```bash
+python3 -m compileall -q backend/app backend/tests
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。
+
+### Concern
+
+- 不确定发布状态超时后不会自动判断平台真实结果；这是刻意的 fail-closed 路径，必须由操作人员先核对微信公众号后台，再决定是否通过显式 retry 重试原 job。
+- 平台终态与 SQLite 仍无法组成分布式事务；现有持久 job、同 job 恢复、generation CAS 与终态本地重放继续承担该边界。所有测试均使用 fake publisher，未执行真实平台写入。

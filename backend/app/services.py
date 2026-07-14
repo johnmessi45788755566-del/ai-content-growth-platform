@@ -1,11 +1,15 @@
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .ai import OpenAICompatibleClient, TopicRecommendation
 from .database import Database
-from .publishing.coordinator import PublishCoordinator, PublishJobValidationError
+from .publishing.coordinator import (
+    UNCERTAIN_IN_PROGRESS_STATUSES,
+    PublishCoordinator,
+    PublishJobValidationError,
+)
 from .publishing.wechat import WeChatDraftPublisher
 
 
@@ -22,6 +26,7 @@ TASK_TYPE_WECHAT = "微信公众号图文生成"
 TASK_TYPE_WECHAT_LEGACY = "公众号文章创作"
 TASK_TYPE_XIAOHONGSHU_RESERVED = "小红书图文生成（预留）"
 TASK_TIME_FORMAT = "%Y-%m-%d %H:%M"
+PUBLISH_INTERRUPTION_TIMEOUT = timedelta(minutes=15)
 PLATFORMS = ["微信公众号", "视频号", "小红书", "抖音"]
 PLATFORM_ALIASES = {
     "公众号": "微信公众号",
@@ -917,12 +922,40 @@ class ContentService:
             ):
                 return False
         job = self.get_publish_job(publish_job_id)
-        if job["status"] not in {"platform_draft", "awaiting_confirmation", "published", "failed"}:
-            return False
-        package = self.db.fetch_one(
-            "SELECT id FROM publish_packages WHERE publish_job_id = ? ORDER BY id DESC LIMIT 1",
-            (job["id"],),
-        )
+        if job["status"] == "pending":
+            job = self.execute_publish_job(publish_job_id)
+        elif job["status"] in UNCERTAIN_IN_PROGRESS_STATUSES:
+            stale_before_at = current - PUBLISH_INTERRUPTION_TIMEOUT
+            if stale_before_at.tzinfo is None:
+                stale_before_at = stale_before_at.astimezone()
+            stale_before = stale_before_at.astimezone(timezone.utc).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            job = self.publish_coordinator.fail_stale_in_progress_job(
+                publish_job_id, stale_before
+            )
+        if job["status"] in UNCERTAIN_IN_PROGRESS_STATUSES:
+            return True
+        if job["status"] not in {
+            "platform_draft",
+            "awaiting_confirmation",
+            "published",
+            "failed",
+        }:
+            return True
+        package = None
+        for package_id in {
+            task.get("publish_package_id"),
+            run.get("publish_package_id"),
+        }:
+            if package_id is None:
+                continue
+            package = self.db.fetch_one(
+                "SELECT id FROM publish_packages WHERE id = ? AND publish_job_id = ?",
+                (package_id, job["id"]),
+            )
+            if package:
+                break
         return self._finish_task_from_publish_job(
             task,
             int(run["id"]),
@@ -1101,6 +1134,23 @@ class ContentService:
             generation_clause = " AND generation = ?"
             where_params.append(expected_generation)
         with self.db.transaction() as conn:
+            observed_task_row = conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if observed_task_row is None:
+                raise NotFoundError("任务不存在")
+            observed_task = dict(observed_task_row)
+            status_matches = (
+                observed_task["status"] == expected_status
+                if expected_status is not None
+                else observed_task["status"] in {"待执行", "已重试"}
+            )
+            generation_matches = (
+                expected_generation is None
+                or int(observed_task["generation"]) == expected_generation
+            )
+            if not status_matches or not generation_matches:
+                return None
             task, latest_run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
             clear_previous_generation = publish_job_id is None
             if (
@@ -1169,9 +1219,13 @@ class ContentService:
             )
             if cursor.rowcount != 1:
                 return None
+            run_generation = int(task["generation"]) + 1
             run_id = conn.execute(
-                "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, '执行中', ?)",
-                (task_id, started_at),
+                """
+                INSERT INTO task_runs (task_id, generation, status, started_at)
+                VALUES (?, ?, '执行中', ?)
+                """,
+                (task_id, run_generation, started_at),
             ).lastrowid
             return int(run_id)
 
@@ -1185,8 +1239,13 @@ class ContentService:
             raise NotFoundError("任务不存在")
         task = dict(task_row)
         latest_run_row = conn.execute(
-            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
-            (task_id,),
+            """
+            SELECT *
+            FROM task_runs
+            WHERE task_id = ? AND generation = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, task["generation"]),
         ).fetchone()
         latest_run = dict(latest_run_row) if latest_run_row else None
         candidates = {
@@ -1247,6 +1306,13 @@ class ContentService:
         publish_package_id: int | None = None,
     ) -> None:
         with self.db.transaction() as conn:
+            run_row = conn.execute(
+                "SELECT generation FROM task_runs WHERE id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("发布作业关联的运行代次不存在")
+            generation = int(run_row["generation"])
             task_cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks
@@ -1254,9 +1320,16 @@ class ContentService:
                     publish_package_id = COALESCE(?, publish_package_id),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND status = '执行中'
+                  AND generation = ?
                   AND (publish_job_id IS NULL OR publish_job_id = ?)
                 """,
-                (publish_job_id, publish_package_id, task_id, publish_job_id),
+                (
+                    publish_job_id,
+                    publish_package_id,
+                    task_id,
+                    generation,
+                    publish_job_id,
+                ),
             )
             run_cursor = conn.execute(
                 """
@@ -1264,9 +1337,17 @@ class ContentService:
                 SET publish_job_id = ?,
                     publish_package_id = COALESCE(?, publish_package_id)
                 WHERE id = ? AND task_id = ? AND status = '执行中'
+                  AND generation = ?
                   AND (publish_job_id IS NULL OR publish_job_id = ?)
                 """,
-                (publish_job_id, publish_package_id, run_id, task_id, publish_job_id),
+                (
+                    publish_job_id,
+                    publish_package_id,
+                    run_id,
+                    task_id,
+                    generation,
+                    publish_job_id,
+                ),
             )
             if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
                 raise RuntimeError("发布作业关联的任务代次已变化")
@@ -1324,7 +1405,7 @@ class ContentService:
                 SET status = ?, next_run_at = ?, failure_stage = ?, failure_reason = ?,
                     publish_result = ?, manual_takeover_url = ?, content_project_id = ?,
                     publish_package_id = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status = ? AND publish_job_id = ?
+                WHERE id = ? AND status = ? AND publish_job_id = ? AND generation = ?
                 """,
                 (
                     status,
@@ -1338,6 +1419,7 @@ class ContentService:
                     task["id"],
                     expected_task_status,
                     job["id"],
+                    task["generation"],
                 ),
             )
             if task_cursor.rowcount != 1:
@@ -1348,6 +1430,7 @@ class ContentService:
                 SET status = ?, finished_at = ?, failure_stage = ?, failure_reason = ?,
                     content_project_id = ?, publish_package_id = ?
                 WHERE id = ? AND task_id = ? AND status = ? AND publish_job_id = ?
+                  AND generation = ?
                 """,
                 (
                     run_status,
@@ -1360,6 +1443,7 @@ class ContentService:
                     task["id"],
                     expected_run_status,
                     job["id"],
+                    task["generation"],
                 ),
             )
             if run_cursor.rowcount != 1:
@@ -1402,6 +1486,13 @@ class ContentService:
     ) -> None:
         finished_at = _format_task_time(now)
         with self.db.transaction() as conn:
+            run_row = conn.execute(
+                "SELECT generation FROM task_runs WHERE id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("任务失败状态写入的运行代次不存在")
+            generation = int(run_row["generation"])
             task_cursor = conn.execute(
                 """
                 UPDATE scheduled_tasks
@@ -1409,9 +1500,17 @@ class ContentService:
                     manual_takeover_url = 'manual-takeover://task/' || ?,
                     publish_package_id = COALESCE(?, publish_package_id),
                     publish_job_id = COALESCE(?, publish_job_id), updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status = '执行中'
+                WHERE id = ? AND status = '执行中' AND generation = ?
                 """,
-                (stage, reason, task_id, publish_package_id, publish_job_id, task_id),
+                (
+                    stage,
+                    reason,
+                    task_id,
+                    publish_package_id,
+                    publish_job_id,
+                    task_id,
+                    generation,
+                ),
             )
             run_cursor = conn.execute(
                 """
@@ -1419,9 +1518,18 @@ class ContentService:
                 SET status = '失败', finished_at = ?, failure_stage = ?, failure_reason = ?,
                     publish_package_id = COALESCE(?, publish_package_id),
                     publish_job_id = COALESCE(?, publish_job_id)
-                WHERE id = ? AND task_id = ? AND status = '执行中'
+                WHERE id = ? AND task_id = ? AND status = '执行中' AND generation = ?
                 """,
-                (finished_at, stage, reason, publish_package_id, publish_job_id, run_id, task_id),
+                (
+                    finished_at,
+                    stage,
+                    reason,
+                    publish_package_id,
+                    publish_job_id,
+                    run_id,
+                    task_id,
+                    generation,
+                ),
             )
             if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
                 raise RuntimeError("任务失败状态写入的运行代次已变化")

@@ -230,6 +230,52 @@ def prepare_task_with_historical_publish_link(
     return client, service, publisher, account_id, finished
 
 
+def prepare_task_interrupted_with_pending_job(tmp_path: Path, name: str):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / f"interrupted-pending-{name}.db",
+        upload_dir=tmp_path / f"uploads-{name}",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, f"中断恢复-{name}")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": f"中断恢复-{name}",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": f"中断恢复-{name}",
+        }
+    )
+    original_link = service._link_task_publish_job
+
+    def exit_after_link(*args, **kwargs):
+        original_link(*args, **kwargs)
+        raise SimulatedProcessExit
+
+    service._link_task_publish_job = exit_after_link
+    try:
+        with pytest.raises(SimulatedProcessExit):
+            service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    finally:
+        service._link_task_publish_job = original_link
+
+    interrupted = service.get_task(task["id"])
+    assert interrupted["status"] == "执行中"
+    assert interrupted["runs"][0]["status"] == "执行中"
+    assert interrupted["publish_job"]["status"] == "pending"
+    assert interrupted["publish_package"]["status"] == "pending_publish"
+    assert publisher.calls == []
+    return service, publisher, task, interrupted
+
+
 class PublisherWithoutReceipt(FakePlatformPublisher):
     def publish(self, payload, account, action):
         return PublishResult(status="platform_draft")
@@ -2149,6 +2195,90 @@ def test_scheduler_recovers_interrupted_initial_finalization_without_republishin
     assert len(publisher.calls) == 1
 
 
+@pytest.mark.parametrize("recovery", ["manual", "scan"])
+def test_interrupted_pending_publish_job_executes_same_job(
+    tmp_path: Path, recovery: str
+):
+    service, publisher, task, interrupted = prepare_task_interrupted_with_pending_job(
+        tmp_path, recovery
+    )
+    original_job_id = interrupted["publish_job_id"]
+
+    if recovery == "manual":
+        service.execute_task(task["id"], datetime(2026, 7, 14, 9, 31))
+    else:
+        scan = service.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
+        assert scan["executed"] == 0
+
+    recovered = service.get_task(task["id"])
+    assert recovered["status"] == "已发布"
+    assert recovered["runs"][0]["status"] == "已发布"
+    assert recovered["publish_package"]["status"] == "published"
+    assert recovered["publish_job_id"] == original_job_id
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert len(publisher.calls) == 1
+
+
+def test_stale_checking_login_job_moves_to_manual_interruption_failure(tmp_path: Path):
+    service, publisher, task, interrupted = prepare_task_interrupted_with_pending_job(
+        tmp_path, "stale-checking-login"
+    )
+    original_job_id = interrupted["publish_job_id"]
+    service.db.execute(
+        """
+        UPDATE publish_jobs
+        SET status = 'checking_login', updated_at = '2026-07-14 01:00:00'
+        WHERE id = ?
+        """,
+        (original_job_id,),
+    )
+
+    scan = service.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+    failed = service.get_task(task["id"])
+
+    assert scan["executed"] == 0
+    assert failed["status"] == "失败"
+    assert failed["runs"][0]["status"] == "失败"
+    assert failed["publish_package"]["status"] == "failed"
+    assert failed["publish_job"]["status"] == "failed"
+    assert failed["publish_job_id"] == original_job_id
+    assert failed["failure_stage"] == "发布中断"
+    assert failed["runs"][0]["failure_stage"] == "发布中断"
+    assert failed["publish_package"]["failure_stage"] == "发布中断"
+    assert "人工核对平台" in failed["failure_reason"]
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert publisher.calls == []
+
+
+def test_recent_checking_login_job_is_not_changed_by_recovery_scan(tmp_path: Path):
+    service, publisher, task, interrupted = prepare_task_interrupted_with_pending_job(
+        tmp_path, "recent-checking-login"
+    )
+    original_job_id = interrupted["publish_job_id"]
+    service.db.execute(
+        """
+        UPDATE publish_jobs
+        SET status = 'checking_login', updated_at = '2026-07-14 01:55:00'
+        WHERE id = ?
+        """,
+        (original_job_id,),
+    )
+
+    scan = service.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+    unchanged = service.get_task(task["id"])
+
+    assert scan["executed"] == 0
+    assert unchanged["status"] == "执行中"
+    assert unchanged["runs"][0]["status"] == "执行中"
+    assert unchanged["publish_package"]["status"] == "pending_publish"
+    assert unchanged["publish_job"]["status"] == "checking_login"
+    assert unchanged["publish_job_id"] == original_job_id
+    assert unchanged["failure_stage"] == ""
+    assert unchanged["failure_reason"] == ""
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert publisher.calls == []
+
+
 def test_platform_success_survives_local_postprocessing_failure_without_republish(tmp_path: Path):
     publisher = FakePlatformPublisher()
     app = create_app(
@@ -2740,6 +2870,128 @@ def test_repeat_task_starts_next_generation_with_a_new_publish_job(tmp_path: Pat
     assert second["publish_job_id"] != first["publish_job_id"]
     assert len(second["runs"]) == 2
     assert len(publisher.calls) == 2
+    assert service.db.fetch_all(
+        "SELECT generation FROM task_runs WHERE task_id = ? ORDER BY id",
+        (task["id"],),
+    ) == [{"generation": 1}, {"generation": 2}]
+
+
+def test_once_task_patch_starts_new_generation_without_reusing_old_publish_job(
+    tmp_path: Path,
+):
+    class GenerationAwareAIClient(FakeAIClient):
+        def recommend_topics(self, user_prompt: str):
+            self.topic_prompts.append(user_prompt)
+            title = "第二代标题" if "第二代主题" in user_prompt else "第一代标题"
+            return [
+                TopicRecommendation(
+                    direction="代次隔离",
+                    subtitle="代次隔离",
+                    titles=[title],
+                )
+            ]
+
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "once-new-generation.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=GenerationAwareAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "单次任务新代次账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "单次任务新代次账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "第一代主题",
+        }
+    )
+    first = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+
+    response = client.patch(
+        f"/api/tasks/{task['id']}",
+        json={
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "单次任务新代次账号",
+            "execute_time": "2026-07-15 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "第二代主题",
+        },
+    )
+    second = service.execute_task(task["id"], datetime(2026, 7, 15, 9, 30))
+
+    assert response.status_code == 200
+    assert second["publish_job_id"] != first["publish_job_id"]
+    assert second["topic"] == "第二代主题"
+    assert second["content_project"]["title"] == "第二代标题"
+    assert publisher.calls[1][0]["title"] == "第二代标题"
+    assert len(publisher.calls) == 2
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 2
+    run_generations = service.db.fetch_all(
+        "SELECT generation FROM task_runs WHERE task_id = ? ORDER BY id",
+        (task["id"],),
+    )
+    assert run_generations == [{"generation": 1}, {"generation": 3}]
+
+
+def test_stale_generation_claim_does_not_backfill_old_publish_job(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "stale-generation-backfill.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "陈旧扫描代次账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "陈旧扫描代次账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "第一代扫描主题",
+        }
+    )
+    first = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    patched = client.patch(
+        f"/api/tasks/{task['id']}",
+        json={
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "陈旧扫描代次账号",
+            "execute_time": "2026-07-15 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "第二代扫描主题",
+        },
+    ).json()
+
+    run_id = service._claim_task_execution(
+        task["id"],
+        "2026-07-15 09:30",
+        expected_status="待执行",
+        expected_generation=first["generation"],
+    )
+
+    unchanged = service.db.fetch_one(
+        "SELECT generation, publish_job_id FROM scheduled_tasks WHERE id = ?",
+        (task["id"],),
+    )
+    assert run_id is None
+    assert unchanged == {"generation": patched["generation"], "publish_job_id": None}
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM task_runs")["count"] == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert len(publisher.calls) == 1
 
 
 def test_task_image_failure_keeps_generated_draft_and_reports_exact_stage(tmp_path: Path):
