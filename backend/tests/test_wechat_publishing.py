@@ -120,7 +120,7 @@ def draft_outcome():
         "platform_url": "https://mp.weixin.qq.com/cgi-bin/appmsg?action=list&token=secret-token",
         "baseline_id": "baseline-1",
         "receipt": {"id": "draft-42", "title": "浏览器发布测试", "source": "dom"},
-        "post_action_signal": {"kind": "success_message", "observed_after_action": True},
+        "post_action_signal": {"kind": "draft_saved", "observed_after_action": True},
     }
 
 
@@ -131,7 +131,7 @@ def published_outcome():
         "platform_url": "https://mp.weixin.qq.com/cgi-bin/masssendpage?token=secret-token",
         "baseline_id": "baseline-1",
         "receipt": {"id": "publish-88", "title": "浏览器发布测试", "source": "dom"},
-        "post_action_signal": {"kind": "success_message", "observed_after_action": True},
+        "post_action_signal": {"kind": "publish_success", "observed_after_action": True},
     }
 
 
@@ -150,7 +150,7 @@ def test_wechat_browser_publisher_creates_verified_platform_draft(tmp_path: Path
         "event": "draft_created",
         "receipt_id": "draft-42",
         "title": "浏览器发布测试",
-        "corroboration": "success_message",
+        "corroboration": "draft_saved",
     }
     assert gateway.actions.index("capture_baseline") < gateway.actions.index("click_save_draft")
     assert gateway.actions[-1] == "verify_draft"
@@ -251,7 +251,7 @@ def test_wechat_browser_publisher_resumes_preserved_confirmation_session(tmp_pat
                 "platform_url": "https://mp.weixin.qq.com/",
                 "baseline_id": "baseline-1",
                 "receipt": {"id": "", "title": "浏览器发布测试", "source": "dom"},
-                "post_action_signal": {"kind": "success_message", "observed_after_action": True},
+                "post_action_signal": {"kind": "draft_saved", "observed_after_action": True},
             },
             "草稿 ID",
         ),
@@ -262,7 +262,7 @@ def test_wechat_browser_publisher_resumes_preserved_confirmation_session(tmp_pat
                 "platform_url": "https://example.com/receipt",
                 "baseline_id": "baseline-1",
                 "receipt": {"id": "publish-88", "title": "浏览器发布测试", "source": "dom"},
-                "post_action_signal": {"kind": "success_message", "observed_after_action": True},
+                "post_action_signal": {"kind": "publish_success", "observed_after_action": True},
             },
             "微信页面 URL",
         ),
@@ -531,7 +531,7 @@ def test_browser_gateway_accepts_only_new_title_bound_receipt_with_post_action_s
             },
         ],
         "signals": [
-            {"kind": "success_message", "observed_after_baseline": True}
+            {"kind": "draft_saved", "observed_after_baseline": True}
         ],
     }
     gateway = ObservationGateway([baseline_observation, post_observation])
@@ -564,7 +564,7 @@ def test_browser_gateway_rejects_empty_title_or_preexisting_receipts(tmp_path: P
             },
         ],
         "signals": [
-            {"kind": "success_message", "observed_after_baseline": True}
+            {"kind": "draft_saved", "observed_after_baseline": True}
         ],
     }
     gateway = ObservationGateway([baseline_observation, post_observation])
@@ -607,7 +607,7 @@ def test_browser_gateway_rejects_receipt_not_mutated_after_baseline(tmp_path: Pa
                     {"id": "old-list-id", "title": "浏览器发布测试", "source": "dom"}
                 ],
                 "signals": [
-                    {"kind": "success_message", "observed_after_baseline": True}
+                    {"kind": "draft_saved", "observed_after_baseline": True}
                 ],
             },
         ]
@@ -617,6 +617,158 @@ def test_browser_gateway_rejects_receipt_not_mutated_after_baseline(tmp_path: Pa
 
     with pytest.raises(WeChatPublishingError, match="未返回可验证的草稿结果"):
         gateway.verify_draft(session, "浏览器发布测试", baseline)
+
+
+def test_browser_gateway_baseline_keeps_all_receipt_ids_regardless_title_or_visibility(
+    tmp_path: Path,
+):
+    gateway = ObservationGateway(
+        [
+            {
+                "url": "https://mp.weixin.qq.com/cgi-bin/appmsg",
+                "receipts": [
+                    {"id": "same-title", "title": "浏览器发布测试", "source": "dom"},
+                    {"id": "other-title", "title": "其他文章", "source": "dom"},
+                    {"id": "hidden-no-title", "title": "", "source": "dom", "visible": False},
+                ],
+                "signals": [],
+            }
+        ]
+    )
+
+    baseline = gateway.capture_baseline(
+        browser_session(tmp_path), "浏览器发布测试", "draft"
+    )
+
+    assert set(baseline["receipt_ids"]) == {
+        "same-title",
+        "other-title",
+        "hidden-no-title",
+    }
+    assert {record["id"] for record in baseline["receipts"]} == set(
+        baseline["receipt_ids"]
+    )
+
+
+def test_browser_gateway_rejects_baseline_record_reinserted_with_matching_title(
+    tmp_path: Path,
+):
+    same_url = "https://mp.weixin.qq.com/cgi-bin/appmsg"
+    gateway = ObservationGateway(
+        [
+            {
+                "url": same_url,
+                "receipts": [
+                    {"id": "existing-id", "title": "", "source": "dom", "visible": False}
+                ],
+                "signals": [],
+            },
+            {
+                "url": same_url,
+                "receipts": [
+                    {
+                        "id": "existing-id",
+                        "title": "浏览器发布测试",
+                        "source": "dom",
+                        "observed_after_baseline": True,
+                    }
+                ],
+                "signals": [
+                    {"kind": "draft_saved", "observed_after_baseline": True}
+                ],
+            },
+        ]
+    )
+    session = browser_session(tmp_path)
+    baseline = gateway.capture_baseline(session, "浏览器发布测试", "draft")
+
+    with pytest.raises(WeChatPublishingError, match="未返回可验证的草稿结果"):
+        gateway.verify_draft(session, "浏览器发布测试", baseline)
+
+
+def test_receipt_title_uses_nfkc_whitespace_normalized_exact_equality():
+    observation = {
+        "receipts": [
+            {
+                "id": "new-id",
+                "title": "ＡＩ　 发布测试",
+                "source": "dom",
+                "observed_after_baseline": True,
+            }
+        ]
+    }
+    baseline = {"receipt_ids": []}
+
+    receipt = ChromeCDPBrowserGateway._new_receipt(
+        observation, baseline, "AI 发布测试"
+    )
+
+    assert receipt and receipt["id"] == "new-id"
+    observation["receipts"][0]["title"] = "AI 发布测试扩展"
+    assert (
+        ChromeCDPBrowserGateway._new_receipt(
+            observation, baseline, "AI 发布测试"
+        )
+        is None
+    )
+
+
+def test_receipt_dom_expression_never_uses_substring_or_synthesized_title():
+    expression = ChromeCDPBrowserGateway._observation_expression(
+        "浏览器发布测试", "draft", include_hidden=True
+    )
+
+    assert ".includes(expectedTitle)" not in expression
+    assert "title: expectedTitle" not in expression
+    assert "includeHidden || visible(node)" in expression
+
+
+def test_baseline_expression_collects_unrendered_platform_state_records():
+    expression = ChromeCDPBrowserGateway._observation_expression(
+        "浏览器发布测试", "draft", include_hidden=True
+    )
+
+    assert "window.__INITIAL_STATE__" in expression
+    assert "window.cgiData" in expression
+    assert "collectStateRecords" in expression
+
+
+@pytest.mark.parametrize(
+    ("action", "signal_kind"),
+    [("draft", "publish_success"), ("publish", "draft_saved")],
+)
+def test_action_specific_signal_rejects_other_action(action, signal_kind):
+    observation = {
+        "signals": [
+            {"kind": signal_kind, "observed_after_baseline": True}
+        ]
+    }
+
+    assert (
+        ChromeCDPBrowserGateway._post_action_signal(
+            observation, {"signal_kinds": []}, action
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome_factory", "action", "wrong_signal"),
+    [
+        (draft_outcome, "draft", "publish_success"),
+        (published_outcome, "publish", "draft_saved"),
+    ],
+)
+def test_publisher_rejects_other_action_success_signal(
+    tmp_path: Path, outcome_factory, action, wrong_signal
+):
+    outcome = outcome_factory()
+    outcome["post_action_signal"]["kind"] = wrong_signal
+
+    with pytest.raises(WeChatPublishingError, match="动作不匹配"):
+        WeChatBrowserPublisher(gateway=FakeWeChatGateway(outcome)).publish(
+            article_payload(tmp_path), browser_account(tmp_path), action=action
+        )
 
 
 def test_cover_and_inline_upload_selectors_are_disjoint_and_not_generic():
@@ -632,6 +784,35 @@ def test_file_upload_locator_requires_unique_visible_image_file_input():
     assert "node.type !== 'file'" in expression
     assert "visibleControl(node)" in expression
     assert "accept.includes('image')" in expression
+
+
+class ExpressionCaptureGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.expressions = []
+
+    def evaluate(self, session, expression):
+        self.expressions.append(expression)
+        return {"ok": False, "reason": "ambiguous", "count": 2}
+
+
+def test_all_control_resolvers_deduplicate_matches_across_every_selector(tmp_path: Path):
+    gateway = ExpressionCaptureGateway()
+    session = browser_session(tmp_path)
+
+    with pytest.raises(WeChatPublishingError, match="不唯一"):
+        gateway._click_first(session, (".primary", "button.primary"), "按钮")
+    with pytest.raises(WeChatPublishingError, match="不唯一"):
+        gateway._set_value(session, ("#title", "textarea#title"), "标题", "标题")
+    with pytest.raises(WeChatPublishingError, match="不唯一"):
+        gateway._set_editor_html(session, "<p>正文</p>")
+
+    expressions = gateway.expressions + [
+        ChromeCDPBrowserGateway._file_input_expression(
+            (".cover input", "input.cover")
+        )
+    ]
+    assert all("new Set(selectors.flatMap" in expression for expression in expressions)
 
 
 class UploadRecordingGateway(ChromeCDPBrowserGateway):

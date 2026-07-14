@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -55,6 +56,10 @@ PUBLISH_CONFIRM_SELECTORS = (
 
 class WeChatPublishingError(RuntimeError):
     pass
+
+
+def normalize_wechat_title(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
 
 
 @dataclass
@@ -433,22 +438,35 @@ class ChromeCDPBrowserGateway:
         self._install_operation_marker(session, baseline_id)
         observation = self.evaluate(
             session,
-            self._observation_expression(title, "draft" if action == "draft" else "publish"),
+            self._observation_expression(
+                title,
+                "draft" if action == "draft" else "publish",
+                include_hidden=True,
+            ),
         )
         if not isinstance(observation, Mapping):
             raise WeChatPublishingError("微信页面未返回操作前基线")
         self._require_wechat_observation_url(str(observation.get("url") or ""))
-        receipts = [
-            receipt
-            for receipt in observation.get("receipts") or []
-            if isinstance(receipt, Mapping)
-            and str(receipt.get("id") or "").strip()
-            and str(receipt.get("title") or "").strip() == title.strip()
-            and receipt.get("source") in {"dom", "api"}
-        ]
+        receipts = []
+        seen_ids = set()
+        for receipt in observation.get("receipts") or []:
+            if not isinstance(receipt, Mapping):
+                continue
+            receipt_id = str(receipt.get("id") or "").strip()
+            if not receipt_id or receipt_id in seen_ids:
+                continue
+            seen_ids.add(receipt_id)
+            receipts.append(
+                {
+                    "id": receipt_id,
+                    "title": normalize_wechat_title(receipt.get("title")),
+                    "source": str(receipt.get("source") or ""),
+                }
+            )
         return {
             "baseline_id": baseline_id,
             "receipt_ids": [str(receipt["id"]) for receipt in receipts],
+            "receipts": receipts,
             "signal_kinds": [
                 str(signal.get("kind") or "")
                 for signal in observation.get("signals") or []
@@ -487,7 +505,9 @@ class ChromeCDPBrowserGateway:
             raise WeChatPublishingError("微信操作基线与当前发布动作不匹配")
         deadline = time.time() + self.result_timeout
         while True:
-            observation = self.evaluate(session, self._observation_expression(title, kind))
+            observation = self.evaluate(
+                session, self._observation_expression(title, kind, include_hidden=False)
+            )
             if not isinstance(observation, dict):
                 observation = {}
             platform_url = self._require_wechat_observation_url(
@@ -514,7 +534,11 @@ class ChromeCDPBrowserGateway:
                     },
                 }
             receipt = self._new_receipt(observation, baseline, title) if same_baseline else None
-            signal = self._post_action_signal(observation, baseline) if same_baseline else None
+            signal = (
+                self._post_action_signal(observation, baseline, expected_action)
+                if same_baseline
+                else None
+            )
             if receipt and signal:
                 platform_id = str(receipt["id"])
                 return {
@@ -524,7 +548,7 @@ class ChromeCDPBrowserGateway:
                     "baseline_id": baseline.get("baseline_id"),
                     "receipt": {
                         "id": platform_id,
-                        "title": title,
+                        "title": receipt.get("title"),
                         "source": receipt.get("source"),
                     },
                     "post_action_signal": {
@@ -575,23 +599,47 @@ class ChromeCDPBrowserGateway:
             raise WeChatPublishingError("微信页面无法建立本次发布操作基线")
 
     @staticmethod
-    def _observation_expression(title: str, kind: str) -> str:
-        title_json = json.dumps(title, ensure_ascii=False)
-        id_attributes = ["data-draft-id", "data-media-id", "data-appmsgid", "data-id"] if kind == "draft" else ["data-publish-id", "data-msg-id", "data-id"]
-        query_names = ["draft_id", "media_id", "appmsgid"] if kind == "draft" else ["publish_id", "msgid"]
-        success_selectors = (
-            ["[data-draft-id]", "[data-media-id]", ".js_draft_item[data-id]", ".appmsg[data-appmsgid]"]
+    def _observation_expression(
+        title: str, kind: str, include_hidden: bool = False
+    ) -> str:
+        del title
+        draft_attributes = ["data-draft-id", "data-media-id", "data-appmsgid", "data-id"]
+        publish_attributes = ["data-publish-id", "data-msg-id", "data-id"]
+        draft_queries = ["draft_id", "media_id", "appmsgid"]
+        publish_queries = ["publish_id", "msgid"]
+        draft_selectors = ["[data-draft-id]", "[data-media-id]", ".js_draft_item[data-id]", ".appmsg[data-appmsgid]"]
+        publish_selectors = ["[data-publish-id]", "[data-msg-id]", ".publish_success[data-id]", ".js_publish_success[data-id]"]
+        if include_hidden:
+            id_attributes = list(dict.fromkeys(draft_attributes + publish_attributes))
+            query_names = list(dict.fromkeys(draft_queries + publish_queries))
+            success_selectors = list(dict.fromkeys(draft_selectors + publish_selectors))
+        elif kind == "draft":
+            id_attributes, query_names, success_selectors = (
+                draft_attributes,
+                draft_queries,
+                draft_selectors,
+            )
+        else:
+            id_attributes, query_names, success_selectors = (
+                publish_attributes,
+                publish_queries,
+                publish_selectors,
+            )
+        signal_kind = "draft_saved" if kind == "draft" else "publish_success"
+        success_words = (
+            ["保存成功", "草稿已保存", "已保存至草稿"]
             if kind == "draft"
-            else ["[data-publish-id]", "[data-msg-id]", ".publish_success[data-id]", ".js_publish_success[data-id]"]
+            else ["发表成功", "发送成功", "群发成功", "发布成功"]
         )
         return f"""
         (() => {{
-          const expectedTitle = {title_json};
           const selectors = {json.dumps(success_selectors)};
           const attributes = {json.dumps(id_attributes)};
           const queryNames = {json.dumps(query_names)};
+          const includeHidden = {json.dumps(include_hidden)};
           const confirmationSelectors = ['.js_qrcode', '.weui-desktop-qrcheck', '[class*=qrcode]', '[class*=qr_code]'];
           const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
+          const normalizeTitle = (value) => (value || '').normalize('NFKC').replace(/\\s+/gu, ' ').trim();
           const operation = window.__codexWechatOperation;
           const changed = (node) => !!operation?.changed?.has(node);
           const bodyText = document.body?.innerText || '';
@@ -604,10 +652,12 @@ class ChromeCDPBrowserGateway:
           const receipts = [];
           for (const selector of selectors) {{
             for (const node of document.querySelectorAll(selector)) {{
-              if (!visible(node)) continue;
+              if (!(includeHidden || visible(node))) continue;
               const container = node.closest('li, tr, article, .weui-desktop-panel, .appmsg, .publish_success') || node;
-              const text = (container.innerText || node.innerText || '').trim();
-              if (!text || !expectedTitle || !text.includes(expectedTitle)) continue;
+              const titleSelectors = ['[data-title]', '.appmsg_title', '.weui-desktop-mass-appmsg__title', '.js_title', '[class*=title]'];
+              const titleNode = titleSelectors.flatMap((candidate) => [...container.querySelectorAll(candidate)]).find((candidate) => includeHidden || visible(candidate));
+              const rawTitle = node.getAttribute('data-title') || container.getAttribute?.('data-title') || titleNode?.getAttribute('data-title') || titleNode?.textContent || '';
+              const receiptTitle = normalizeTitle(rawTitle);
               let platformId = '';
               for (const attribute of attributes) {{
                 const value = node.getAttribute(attribute) || container.getAttribute?.(attribute);
@@ -621,19 +671,45 @@ class ChromeCDPBrowserGateway:
                   if (value) {{ platformId = value; break; }}
                 }}
               }}
-              if (platformId) receipts.push({{id: platformId, title: expectedTitle, source: 'dom', observed_after_baseline: changed(node) || changed(container) || changed(link)}});
+              if (platformId) receipts.push({{id: platformId, title: receiptTitle, source: 'dom', observed_after_baseline: changed(node) || changed(container) || changed(link), visible: visible(node)}});
             }}
           }}
+          const collectStateRecords = (value, depth = 0, seen = new WeakSet()) => {{
+            if (!includeHidden || !value || typeof value !== 'object' || depth > 7 || seen.has(value)) return;
+            seen.add(value);
+            const idKeys = ['draft_id', 'draftId', 'media_id', 'mediaId', 'appmsgid', 'appMsgId', 'publish_id', 'publishId', 'msgid', 'msgId'];
+            const titleKeys = ['title', 'appmsg_title', 'appMsgTitle', 'name'];
+            const idKey = idKeys.find((key) => typeof value[key] === 'string' || typeof value[key] === 'number');
+            if (idKey) {{
+              const titleKey = titleKeys.find((key) => typeof value[key] === 'string');
+              receipts.push({{
+                id: String(value[idKey]).trim(),
+                title: normalizeTitle(titleKey ? value[titleKey] : ''),
+                source: 'platform_state',
+                observed_after_baseline: false,
+                visible: false
+              }});
+            }}
+            for (const child of Object.values(value).slice(0, 500)) collectStateRecords(child, depth + 1, seen);
+          }};
+          const stateRoots = [window.wx?.cgiData, window.cgiData, window.__INITIAL_STATE__, window.__INITIAL_DATA__, window.__NEXT_DATA__];
+          for (const root of stateRoots) collectStateRecords(root);
           const successSelectors = ['.weui-desktop-toast', '.weui-desktop-tips', '[role=alert]', '.js_success', '.publish_success'];
-          const successWords = ['保存成功', '已保存', '发表成功', '发送成功', '群发成功'];
+          const successWords = {json.dumps(success_words, ensure_ascii=False)};
           const successMessage = successSelectors.some((selector) => [...document.querySelectorAll(selector)].some((node) => visible(node) && changed(node) && successWords.some((word) => (node.innerText || '').includes(word))));
+          const receiptMap = new Map();
+          for (const receipt of receipts) {{
+            if (!receipt.id) continue;
+            const existing = receiptMap.get(receipt.id);
+            if (!existing || (!existing.title && receipt.title)) receiptMap.set(receipt.id, receipt);
+          }}
           return {{
             url: location.href,
             baseline_id: operation?.id || '',
             confirmation,
             confirmation_after_baseline: confirmationAfterBaseline,
-            receipts: [...new Map(receipts.map((item) => [item.id, item])).values()],
-            signals: successMessage ? [{{kind: 'success_message', observed_after_baseline: true}}] : []
+            receipts: [...receiptMap.values()],
+            signals: successMessage ? [{{kind: {json.dumps(signal_kind)}, observed_after_baseline: true}}] : []
           }};
         }})()
         """
@@ -647,11 +723,11 @@ class ChromeCDPBrowserGateway:
             if not isinstance(receipt, Mapping):
                 continue
             receipt_id = str(receipt.get("id") or "").strip()
-            receipt_title = str(receipt.get("title") or "").strip()
+            receipt_title = normalize_wechat_title(receipt.get("title"))
             if (
                 receipt_id
                 and receipt_id not in old_ids
-                and receipt_title == title.strip()
+                and receipt_title == normalize_wechat_title(title)
                 and receipt.get("source") in {"dom", "api"}
                 and receipt.get("observed_after_baseline") is True
             ):
@@ -660,15 +736,19 @@ class ChromeCDPBrowserGateway:
 
     @staticmethod
     def _post_action_signal(
-        observation: Mapping[str, Any], baseline: Mapping[str, Any]
+        observation: Mapping[str, Any], baseline: Mapping[str, Any], action: str
     ) -> Mapping[str, Any] | None:
         old_kinds = {str(value) for value in baseline.get("signal_kinds") or []}
+        expected_kinds = {
+            "draft": {"draft_saved", "draft_api_response"},
+            "publish": {"publish_success", "publish_api_response"},
+        }.get(action, set())
         for signal in observation.get("signals") or []:
             if not isinstance(signal, Mapping):
                 continue
             kind = str(signal.get("kind") or "")
             if (
-                kind in {"success_message", "api_response"}
+                kind in expected_kinds
                 and kind not in old_kinds
                 and signal.get("observed_after_baseline") is True
             ):
@@ -741,15 +821,14 @@ class ChromeCDPBrowserGateway:
           const selectors = {json.dumps(list(selectors))};
           const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
           const visibleControl = (node) => visible(node) || visible(node.closest('label, [role=button], .weui-desktop-upload, .upload-box, [class*=upload]'));
-          for (const selector of selectors) {{
-            const matches = [...document.querySelectorAll(selector)].filter((node) => {{
-              if (!(node instanceof HTMLInputElement) || node.type !== 'file' || node.disabled) return false;
-              const accept = (node.accept || '').toLowerCase();
-              return (accept.includes('image') || accept.includes('.jpg') || accept.includes('.jpeg') || accept.includes('.png')) && visibleControl(node);
-            }});
-            if (matches.length > 1) throw new Error(`ambiguous file input: ${{selector}} (${{matches.length}})`);
-            if (matches.length === 1) return matches[0];
-          }}
+          const candidates = [...new Set(selectors.flatMap((selector) => [...document.querySelectorAll(selector)]))];
+          const matches = candidates.filter((node) => {{
+            if (!(node instanceof HTMLInputElement) || node.type !== 'file' || node.disabled) return false;
+            const accept = (node.accept || '').toLowerCase();
+            return (accept.includes('image') || accept.includes('.jpg') || accept.includes('.jpeg') || accept.includes('.png')) && visibleControl(node);
+          }});
+          if (matches.length > 1) throw new Error(`ambiguous file input (${{matches.length}} unique nodes)`);
+          if (matches.length === 1) return matches[0];
           return null;
         }})()
         """
@@ -766,13 +845,10 @@ class ChromeCDPBrowserGateway:
         (() => {{
           const selectors = {json.dumps(list(selectors))};
           const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
-          let rejected = 0;
-          for (const selector of selectors) {{
-            const all = [...document.querySelectorAll(selector)];
-            const matches = all.filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true' && (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node.isContentEditable));
-            rejected += all.length - matches.length;
-            if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length, selector}};
-            if (matches.length !== 1) continue;
+          const candidates = [...new Set(selectors.flatMap((selector) => [...document.querySelectorAll(selector)]))];
+          const matches = candidates.filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true' && (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node.isContentEditable));
+          if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length}};
+          if (matches.length === 1) {{
             const node = matches[0];
             if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {{
               const prototype = node instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -783,9 +859,9 @@ class ChromeCDPBrowserGateway:
             }}
             node.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText', data: {json.dumps(value, ensure_ascii=False)}}}));
             node.dispatchEvent(new Event('change', {{bubbles: true}}));
-            return {{ok: true, selector}};
+            return {{ok: true}};
           }}
-          return {{ok: false, reason: rejected ? 'hidden_or_disabled' : 'not_found'}};
+          return {{ok: false, reason: candidates.length ? 'hidden_or_disabled' : 'not_found'}};
         }})()
         """
         result = self.evaluate(session, expression)
@@ -796,20 +872,17 @@ class ChromeCDPBrowserGateway:
         (() => {{
           const selectors = {json.dumps(list(EDITOR_SELECTORS))};
           const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
-          let rejected = 0;
-          for (const selector of selectors) {{
-            const all = [...document.querySelectorAll(selector)];
-            const matches = all.filter((node) => visible(node) && node.isContentEditable && node.getAttribute('aria-disabled') !== 'true');
-            rejected += all.length - matches.length;
-            if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length, selector}};
-            if (matches.length !== 1) continue;
+          const candidates = [...new Set(selectors.flatMap((selector) => [...document.querySelectorAll(selector)]))];
+          const matches = candidates.filter((node) => visible(node) && node.isContentEditable && node.getAttribute('aria-disabled') !== 'true');
+          if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length}};
+          if (matches.length === 1) {{
             const node = matches[0];
             node.focus();
             node.innerHTML = {json.dumps(content_html, ensure_ascii=False)};
             node.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
-            return {{ok: true, selector}};
+            return {{ok: true}};
           }}
-          return {{ok: false, reason: rejected ? 'hidden_or_disabled' : 'not_found'}};
+          return {{ok: false, reason: candidates.length ? 'hidden_or_disabled' : 'not_found'}};
         }})()
         """
         result = self.evaluate(session, expression)
@@ -826,19 +899,16 @@ class ChromeCDPBrowserGateway:
         (() => {{
           const selectors = {json.dumps(list(selectors))};
           const visible = (node) => !!node && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none' && node.getClientRects().length > 0;
-          let rejected = 0;
-          for (const selector of selectors) {{
-            const all = [...document.querySelectorAll(selector)];
-            const matches = all.filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
-            rejected += all.length - matches.length;
-            if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length, selector}};
-            if (matches.length !== 1) continue;
+          const candidates = [...new Set(selectors.flatMap((selector) => [...document.querySelectorAll(selector)]))];
+          const matches = candidates.filter((node) => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true');
+          if (matches.length > 1) return {{ok: false, reason: 'ambiguous', count: matches.length}};
+          if (matches.length === 1) {{
             const node = matches[0];
             node.scrollIntoView({{block: 'center'}});
             node.click();
-            return {{ok: true, selector, text: (node.innerText || node.textContent || '').trim()}};
+            return {{ok: true, text: (node.innerText || node.textContent || '').trim()}};
           }}
-          return {{ok: false, reason: rejected ? 'hidden_or_disabled' : 'not_found'}};
+          return {{ok: false, reason: candidates.length ? 'hidden_or_disabled' : 'not_found'}};
         }})()
         """
         result = self.evaluate(session, expression)

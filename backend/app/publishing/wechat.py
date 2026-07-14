@@ -2,7 +2,11 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Mapping
 
-from .browser_gateway import ChromeCDPBrowserGateway, WeChatPublishingError
+from .browser_gateway import (
+    ChromeCDPBrowserGateway,
+    WeChatPublishingError,
+    normalize_wechat_title,
+)
 from .models import PublishAction, PublishResult as PublishingResult
 
 
@@ -128,7 +132,7 @@ class WeChatBrowserPublisher:
                 raise WeChatPublishingError(f"微信草稿流程返回了无效状态：{status or '空'}")
             draft_id = str(outcome.get("draft_id") or "").strip()
             corroboration = self._require_bound_receipt(
-                outcome, baseline, title, draft_id, "草稿 ID"
+                outcome, baseline, title, draft_id, "草稿 ID", "draft"
             )
             return PublishingResult(
                 status=status,
@@ -161,7 +165,7 @@ class WeChatBrowserPublisher:
             raise WeChatPublishingError(f"微信直发流程返回了无效状态：{status or '空'}")
         publish_id = str(outcome.get("publish_id") or "").strip()
         corroboration = self._require_bound_receipt(
-            outcome, baseline, title, publish_id, "发布 ID"
+            outcome, baseline, title, publish_id, "发布 ID", "publish"
         )
         return PublishingResult(
             status=status,
@@ -246,13 +250,14 @@ class WeChatBrowserPublisher:
         title: str,
         platform_id: str,
         label: str,
+        action: PublishAction,
     ) -> str:
         if not platform_id:
             raise WeChatPublishingError(f"微信页面未返回真实{label}")
         receipt = outcome.get("receipt")
         if not isinstance(receipt, Mapping) or str(receipt.get("id") or "") != platform_id:
             raise WeChatPublishingError(f"微信平台回执与{label}不一致")
-        if str(receipt.get("title") or "").strip() != title.strip():
+        if normalize_wechat_title(receipt.get("title")) != normalize_wechat_title(title):
             raise WeChatPublishingError("微信平台回执未绑定本次文章标题")
         if receipt.get("source") not in {"dom", "api"}:
             raise WeChatPublishingError("微信平台回执不是来自平台 DOM 或 API")
@@ -263,8 +268,12 @@ class WeChatBrowserPublisher:
         if not isinstance(signal, Mapping) or not signal.get("observed_after_action"):
             raise WeChatPublishingError("微信平台结果缺少本次操作后的后置信号")
         signal_kind = str(signal.get("kind") or "")
-        if signal_kind not in {"success_message", "navigation", "api_response"}:
-            raise WeChatPublishingError("微信平台结果缺少可验证的后置信号")
+        expected_signal_kinds = {
+            "draft": {"draft_saved", "draft_api_response"},
+            "publish": {"publish_success", "publish_api_response"},
+        }[action]
+        if signal_kind not in expected_signal_kinds:
+            raise WeChatPublishingError("微信平台成功信号与发布动作不匹配")
         return signal_kind
 
     @staticmethod
