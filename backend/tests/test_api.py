@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.ai import GeneratedImage, TopicRecommendation
 from app.database import Database
 from app.main import create_app
+from app.publishing.wechat import PublishResult
 from app.services import ContentService
 
 
@@ -27,6 +28,259 @@ class FakeAIClient:
 
     def generate_image(self, prompt: str, image_type: str):
         return GeneratedImage(filename=f"{image_type}.svg", content=b"<svg></svg>", content_type="image/svg+xml")
+
+
+class FakePlatformPublisher:
+    def __init__(self):
+        self.calls = []
+
+    def publish(self, payload, account, action):
+        self.calls.append((payload, account, action))
+        return PublishResult(
+            status="platform_draft",
+            platform_draft_id="wechat-draft-media-id",
+            platform_url="https://mp.weixin.qq.com/draft/wechat-draft-media-id",
+            response={"source": "wechat_platform", "media_id": "wechat-draft-media-id"},
+        )
+
+    def resume(self, account, job_context):
+        raise AssertionError("draft jobs cannot be resumed")
+
+    def cancel(self, account, job_context):
+        return None
+
+
+def add_authorized_account(service, name: str, platform: str = "微信公众号") -> int:
+    return service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
+        (platform, name, "已授权"),
+    )
+
+
+class PublisherWithoutReceipt(FakePlatformPublisher):
+    def publish(self, payload, account, action):
+        return PublishResult(status="platform_draft")
+
+
+class PublisherWithSensitiveFailure(FakePlatformPublisher):
+    def publish(self, payload, account, action):
+        raise RuntimeError(f"浏览器启动失败：{account['profile_path']}")
+
+
+class ConfirmationPublisher(FakePlatformPublisher):
+    def __init__(self):
+        super().__init__()
+        self.resume_context = None
+
+    def publish(self, payload, account, action):
+        return PublishResult(
+            status="awaiting_confirmation",
+            response={
+                "source": "wechat_platform",
+                "event": "operator_confirmation_required",
+                "job_context": {"resume_handle": "sensitive-browser-handle"},
+            },
+            requires_confirmation=True,
+        )
+
+    def resume(self, account, job_context):
+        self.resume_context = job_context
+        return PublishResult(
+            status="published",
+            platform_publish_id="publish-42",
+            platform_url="https://mp.weixin.qq.com/s/publish-42",
+            response={"source": "wechat_platform", "publish_id": "publish-42"},
+        )
+
+
+def prepare_publish_job_api(tmp_path: Path, publisher, platform: str = "微信公众号"):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = service.db.execute(
+        """
+        INSERT INTO platform_accounts (platform, name, auth_status, profile_path)
+        VALUES (?, ?, ?, ?)
+        """,
+        (platform, f"{platform}测试账号", "已授权", "/tmp/sensitive-wechat-profile"),
+    )
+    project = client.post(
+        "/api/content-projects",
+        json={"title": "发布任务 API 测试", "platform": "微信公众号"},
+    ).json()
+    article = client.post(f"/api/content-projects/{project['id']}/generate-article").json()
+    assets = client.post(f"/api/content-projects/{project['id']}/generate-images").json()["assets"]
+    cover = next(asset for asset in assets if asset["asset_type"] == "cover")
+    client.patch(
+        f"/api/content-projects/{project['id']}/layout",
+        json={
+            "blocks": [
+                {
+                    "section_type": "title",
+                    "content": project["title"],
+                    "media_asset_id": cover["id"],
+                    "sort_order": 1,
+                },
+                {
+                    "section_type": "intro",
+                    "content": article["blocks"][0]["content"],
+                    "media_asset_id": None,
+                    "sort_order": 2,
+                },
+            ]
+        },
+    )
+    return client, project, account_id
+
+
+def test_create_publish_job_rejects_non_wechat_platform(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(
+        tmp_path, FakePlatformPublisher(), platform="小红书"
+    )
+
+    response = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "publish"},
+    )
+
+    assert response.status_code == 400
+    assert "暂未开放" in response.json()["detail"]
+
+
+def test_create_publish_job_rejects_switching_project_account(tmp_path: Path):
+    client, project, first_account_id = prepare_publish_job_api(
+        tmp_path, FakePlatformPublisher()
+    )
+    first = client.post(
+        "/api/publish-jobs",
+        json={
+            "project_id": project["id"],
+            "account_id": first_account_id,
+            "action": "draft",
+        },
+    )
+    second_account_id = add_authorized_account(
+        client.app.state.content_service, "另一个公众号账号"
+    )
+
+    response = client.post(
+        "/api/publish-jobs",
+        json={
+            "project_id": project["id"],
+            "account_id": second_account_id,
+            "action": "draft",
+        },
+    )
+
+    assert first.status_code == 200
+    assert response.status_code == 400
+    assert "已绑定" in response.json()["detail"]
+
+
+def test_publish_job_requires_platform_observed_success(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(tmp_path, PublisherWithoutReceipt())
+
+    response = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "draft"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["failure_stage"] == "提交平台草稿"
+    assert "平台" in response.json()["failure_reason"]
+
+
+def test_failed_publish_job_does_not_expose_browser_profile_path(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(
+        tmp_path, PublisherWithSensitiveFailure()
+    )
+
+    response = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "draft"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert "/tmp/sensitive-wechat-profile" not in response.text
+
+
+def test_publish_job_get_retry_resume_and_redacts_browser_context(tmp_path: Path):
+    publisher = ConfirmationPublisher()
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+    created = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "publish"},
+    )
+
+    assert created.status_code == 200
+    job = created.json()
+    assert job["status"] == "awaiting_confirmation"
+    assert job["requires_confirmation"] is True
+    assert "sensitive-browser-handle" not in created.text
+    fetched = client.get(f"/api/publish-jobs/{job['id']}")
+    assert fetched.status_code == 200
+    assert "sensitive-browser-handle" not in fetched.text
+
+    resumed = client.post(f"/api/publish-jobs/{job['id']}/resume")
+
+    assert resumed.status_code == 200
+    assert resumed.json()["status"] == "published"
+    assert resumed.json()["platform_publish_id"] == "publish-42"
+    assert publisher.resume_context == {"resume_handle": "sensitive-browser-handle"}
+
+
+def test_failed_publish_job_can_retry_as_same_resource(tmp_path: Path):
+    class RetryPublisher(PublisherWithoutReceipt):
+        def __init__(self):
+            self.attempts = 0
+
+        def publish(self, payload, account, action):
+            self.attempts += 1
+            if self.attempts == 1:
+                return super().publish(payload, account, action)
+            return FakePlatformPublisher().publish(payload, account, action)
+
+    publisher = RetryPublisher()
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+    failed = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "draft"},
+    ).json()
+
+    retried = client.post(f"/api/publish-jobs/{failed['id']}/retry")
+
+    assert retried.status_code == 200
+    assert retried.json()["id"] == failed["id"]
+    assert retried.json()["status"] == "platform_draft"
+
+
+def test_publish_package_compatibility_endpoint_uses_draft_job(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(tmp_path, FakePlatformPublisher())
+
+    response = client.post(
+        f"/api/content-projects/{project['id']}/publish-package",
+        json={
+            "platform": "微信公众号",
+            "account_name": "过期的前端账号名",
+            "account_id": account_id,
+        },
+    )
+
+    assert response.status_code == 200
+    package = response.json()
+    assert package["status"] == "platform_draft"
+    assert package["platform_draft_id"] == "wechat-draft-media-id"
+    job = client.app.state.content_service.get_publish_job(package["publish_job_id"])
+    assert job["action"] == "draft"
+    assert job["account_id"] == account_id
 
 
 def test_api_content_creation_flow(tmp_path: Path):

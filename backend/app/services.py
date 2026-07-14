@@ -5,6 +5,8 @@ from typing import Any
 
 from .ai import OpenAICompatibleClient, TopicRecommendation
 from .database import Database
+from .publishing.coordinator import PublishCoordinator
+from .publishing.wechat import WeChatDraftPublisher
 
 
 STAGE_LABELS = {
@@ -36,11 +38,25 @@ class NotFoundError(RuntimeError):
 
 
 class ContentService:
-    def __init__(self, db: Database, ai_client: Any | None = None, upload_dir: str | Path = "backend/uploads"):
+    def __init__(
+        self,
+        db: Database,
+        ai_client: Any | None = None,
+        upload_dir: str | Path = "backend/uploads",
+        platform_publisher: Any | None = None,
+    ):
         self.db = db
         self.ai_client = ai_client or OpenAICompatibleClient()
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self.platform_publisher = platform_publisher or WeChatDraftPublisher()
+        self.publish_coordinator = PublishCoordinator(
+            db=self.db,
+            publisher=self.platform_publisher,
+            project_loader=self.get_project,
+            account_loader=self.get_account,
+            payload_builder=self._build_wechat_publish_payload,
+        )
 
     def recommend_topics(self, user_prompt: str) -> list[TopicRecommendation]:
         return self.ai_client.recommend_topics(user_prompt)
@@ -384,7 +400,7 @@ class ContentService:
         account = self.db.fetch_one(
             """
             SELECT id, platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status,
-                   role, audience, style, taboo, preference, auth_method, qr_url, last_sync_at, created_at, updated_at
+                   role, audience, style, taboo, preference, auth_method, qr_url, profile_path, last_sync_at, created_at, updated_at
             FROM platform_accounts
             WHERE id = ?
             """,
@@ -907,28 +923,140 @@ class ContentService:
         platform: str,
         account_name: str,
         account_id: int | None = None,
-        status: str = "pending_publish",
     ) -> dict[str, Any]:
         project = self.get_project(project_id)
+        if _normalize_platform(platform) != "微信公众号":
+            raise RuntimeError(f"{platform}真实平台草稿发布适配器尚未接入")
+        account = self._resolve_publish_account(platform, account_name, account_id)
+        platform = account["platform"]
+        account_name = account["name"]
+        account_id = int(account["id"])
         payload = {
             "project": project,
             "article_blocks": project["article_blocks"],
             "media_assets": project["media_assets"],
             "layout_blocks": project["layout_blocks"],
         }
+        job = self.create_publish_job(project_id, account_id, "draft")
         package_id = self.db.execute(
             """
-            INSERT INTO publish_packages (project_id, account_id, platform, account_name, payload_json, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO publish_packages (
+              project_id, account_id, platform, account_name, payload_json, status,
+              platform_draft_id, platform_draft_url, platform_response_json,
+              failure_stage, failure_reason, published_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (project_id, account_id, platform, account_name, json.dumps(payload, ensure_ascii=False), status),
+            (
+                project_id,
+                account_id,
+                platform,
+                account_name,
+                json.dumps({**payload, "publish_job_id": job["id"]}, ensure_ascii=False),
+                job["status"],
+                job["platform_draft_id"],
+                job["platform_url"],
+                json.dumps(job["response"], ensure_ascii=False),
+                job["failure_stage"],
+                job["failure_reason"],
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if job["status"] == "platform_draft"
+                else "",
+            ),
         )
-        if account_id:
-            self._create_work_from_project(int(account_id), platform, account_name, project)
+        if job["status"] == "platform_draft":
+            self._create_work_from_project(account_id, platform, account_name, project, status="平台草稿")
         self._set_stage(project_id, "publish")
         self.autosave(project_id, stage="publish", restore_stage="layout")
         package = self.db.fetch_one("SELECT * FROM publish_packages WHERE id = ?", (package_id,))
+        if package:
+            package["publish_job_id"] = job["id"]
         return package or {}
+
+    def create_publish_job(self, project_id: int, account_id: int, action: str) -> dict[str, Any]:
+        return self.publish_coordinator.create_publish_job(project_id, account_id, action)
+
+    def get_publish_job(self, job_id: int) -> dict[str, Any]:
+        try:
+            return self.publish_coordinator.get_publish_job(job_id)
+        except LookupError as exc:
+            raise NotFoundError(str(exc)) from exc
+
+    def retry_publish_job(self, job_id: int) -> dict[str, Any]:
+        try:
+            return self.publish_coordinator.retry_publish_job(job_id)
+        except LookupError as exc:
+            raise NotFoundError(str(exc)) from exc
+
+    def resume_publish_job(self, job_id: int) -> dict[str, Any]:
+        try:
+            return self.publish_coordinator.resume_publish_job(job_id)
+        except LookupError as exc:
+            raise NotFoundError(str(exc)) from exc
+
+    def _resolve_publish_account(
+        self, platform: str, account_name: str, account_id: int | None
+    ) -> dict[str, Any]:
+        if account_id is not None:
+            return self.get_account(int(account_id))
+        normalized_platform = _normalize_platform(platform)
+        account = self.db.fetch_one(
+            """
+            SELECT * FROM platform_accounts
+            WHERE platform = ? AND auth_status = '已授权' AND name = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (normalized_platform, account_name),
+        )
+        if not account:
+            raise RuntimeError("请选择一个已授权的平台账号")
+        return self.get_account(int(account["id"]))
+
+    def _build_wechat_publish_payload(self, project: dict[str, Any], account_name: str) -> dict[str, Any]:
+        assets = {int(asset["id"]): asset for asset in project["media_assets"]}
+        cover = next(
+            (
+                asset
+                for asset in project["media_assets"]
+                if asset["asset_type"] == "cover" and int(asset["selected"]) == 1
+            ),
+            None,
+        )
+        if not cover:
+            raise RuntimeError("请先选择一张公众号封面图")
+        blocks = []
+        for block in project["layout_blocks"]:
+            if block["section_type"] == "title":
+                continue
+            asset = assets.get(int(block["media_asset_id"])) if block.get("media_asset_id") else None
+            blocks.append(
+                {
+                    "type": block["section_type"],
+                    "content": block["content"],
+                    "image_path": str(self._media_file_path(asset)) if asset else "",
+                }
+            )
+        if not blocks:
+            blocks = [
+                {"type": block["type"], "content": block["content"], "image_path": ""}
+                for block in project["article_blocks"]
+            ]
+        digest = next((block["content"] for block in project["article_blocks"] if block["type"] == "intro"), "")
+        return {
+            "title": project["title"],
+            "author": account_name,
+            "digest": digest[:120],
+            "cover_path": str(self._media_file_path(cover)),
+            "blocks": blocks,
+        }
+
+    def _media_file_path(self, asset: dict[str, Any]) -> Path:
+        path = Path(str(asset["local_path"]))
+        if path.is_absolute():
+            return path
+        if path.parts and path.parts[0] == "uploads":
+            return self.upload_dir / path.name
+        return self.upload_dir / path
 
     def get_article_blocks(self, project_id: int) -> list[dict[str, Any]]:
         return self.db.fetch_all(
@@ -1028,13 +1156,20 @@ class ContentService:
                 ),
             )
 
-    def _create_work_from_project(self, account_id: int, platform: str, account_name: str, project: dict[str, Any]) -> None:
+    def _create_work_from_project(
+        self,
+        account_id: int,
+        platform: str,
+        account_name: str,
+        project: dict[str, Any],
+        status: str = "已生成平台草稿",
+    ) -> None:
         work_id = self.db.execute(
             """
             INSERT INTO platform_works (account_id, platform, account_name, title, content_type, status, published_at)
-            VALUES (?, ?, ?, ?, '图文', '已生成平台草稿', ?)
+            VALUES (?, ?, ?, ?, '图文', ?, ?)
             """,
-            (account_id, platform, account_name, project["title"], _format_task_time(datetime.now())),
+            (account_id, platform, account_name, project["title"], status, _format_task_time(datetime.now())),
         )
         self.db.execute(
             """

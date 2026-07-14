@@ -16,6 +16,8 @@ except Exception:  # pragma: no cover
 
 from .ai import AIConfigurationError, AIResponseError, OpenAICompatibleClient
 from .database import Database
+from .publishing.coordinator import PublishJobValidationError
+from .publishing.wechat import WeChatDraftPublisher
 from .services import ContentService, NotFoundError
 
 
@@ -77,6 +79,12 @@ class PublishPackageRequest(BaseModel):
     account_id: int | None = None
 
 
+class PublishJobRequest(BaseModel):
+    project_id: int
+    account_id: int
+    action: str
+
+
 class AccountAuthRequest(BaseModel):
     platform: str = Field(min_length=1)
     account_name: str = ""
@@ -134,6 +142,7 @@ def create_app(
     database_path: str | Path | None = None,
     upload_dir: str | Path | None = None,
     ai_client: Any | None = None,
+    platform_publisher: Any | None = None,
     scheduler_enabled: bool = True,
 ) -> FastAPI:
     if load_dotenv:
@@ -142,7 +151,12 @@ def create_app(
     db = Database(database_path or BACKEND_ROOT / "data" / "content.db")
     db.init_schema()
     uploads = Path(upload_dir or BACKEND_ROOT / "uploads")
-    service = ContentService(db=db, ai_client=ai_client or OpenAICompatibleClient(), upload_dir=uploads)
+    service = ContentService(
+        db=db,
+        ai_client=ai_client or OpenAICompatibleClient(),
+        upload_dir=uploads,
+        platform_publisher=platform_publisher or WeChatDraftPublisher(),
+    )
 
     async def task_scheduler_loop() -> None:
         while True:
@@ -370,12 +384,50 @@ def create_app(
     def retry_tasks(payload: TaskRetryRequest | None = None) -> dict[str, Any]:
         return service.retry_failed_tasks(payload.task_ids if payload else None)
 
+    @app.post("/api/publish-jobs")
+    def create_publish_job(payload: PublishJobRequest) -> dict[str, Any]:
+        try:
+            return service.create_publish_job(payload.project_id, payload.account_id, payload.action)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PublishJobValidationError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/publish-jobs/{job_id}")
+    def get_publish_job(job_id: int) -> dict[str, Any]:
+        try:
+            return service.get_publish_job(job_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/publish-jobs/{job_id}/retry")
+    def retry_publish_job(job_id: int) -> dict[str, Any]:
+        try:
+            return service.retry_publish_job(job_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PublishJobValidationError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/publish-jobs/{job_id}/resume")
+    def resume_publish_job(job_id: int) -> dict[str, Any]:
+        try:
+            return service.resume_publish_job(job_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (PublishJobValidationError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/content-projects/{project_id}/publish-package")
     def publish_package(project_id: int, payload: PublishPackageRequest) -> dict[str, Any]:
         try:
-            return service.create_publish_package(project_id, payload.platform, payload.account_name, payload.account_id)
+            return service.create_publish_package(
+                project_id, payload.platform, payload.account_name, payload.account_id
+            )
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
 

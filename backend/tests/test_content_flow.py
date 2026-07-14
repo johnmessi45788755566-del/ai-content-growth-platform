@@ -5,6 +5,7 @@ import pytest
 
 from app.ai import GeneratedImage, TopicRecommendation
 from app.database import Database
+from app.publishing.wechat import PublishResult
 from app.services import ContentService
 
 
@@ -34,10 +35,31 @@ class FakeAIClient:
         )
 
 
+class FakePlatformPublisher:
+    def publish(self, payload, account, action):
+        return PublishResult(
+            status="platform_draft",
+            platform_draft_id="draft-media-id",
+            platform_url="https://mp.weixin.qq.com/draft/draft-media-id",
+            response={"source": "wechat_platform", "media_id": "draft-media-id"},
+        )
+
+    def resume(self, account, job_context):
+        raise AssertionError("draft jobs cannot be resumed")
+
+    def cancel(self, account, job_context):
+        return None
+
+
 def make_service(tmp_path: Path) -> ContentService:
     db = Database(tmp_path / "content.db")
     db.init_schema()
-    return ContentService(db=db, ai_client=FakeAIClient(), upload_dir=tmp_path / "uploads")
+    return ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
 
 
 def test_content_creation_flow_persists_article_images_draft_and_publish_package(tmp_path):
@@ -78,9 +100,75 @@ def test_content_creation_flow_persists_article_images_draft_and_publish_package
     assert drafts[0]["title"] == project["title"]
     assert drafts[0]["restore_stage"] == "layout"
 
-    package = service.create_publish_package(project["id"], platform="微信公众号", account_name="AI 记账工具公众号")
-    assert package["status"] == "pending_publish"
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
+        ("微信公众号", "AI 记账工具公众号", "已授权"),
+    )
+    package = service.create_publish_package(
+        project["id"],
+        platform="微信公众号",
+        account_name="AI 记账工具公众号",
+        account_id=account_id,
+    )
+    assert package["status"] == "platform_draft"
+    assert package["platform_draft_id"] == "draft-media-id"
     assert package["platform"] == "微信公众号"
+
+
+def test_publish_coordinator_persists_transition_before_external_publish(tmp_path):
+    class TransitionPublisher(FakePlatformPublisher):
+        def __init__(self, db):
+            self.db = db
+            self.status_during_publish = ""
+
+        def publish(self, payload, account, action):
+            row = self.db.fetch_one("SELECT status FROM publish_jobs ORDER BY id DESC LIMIT 1")
+            self.status_during_publish = row["status"] if row else ""
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    publisher = TransitionPublisher(service.db)
+    service.platform_publisher = publisher
+    service.publish_coordinator.publisher = publisher
+    project = service.create_project("协调器状态测试", platform="微信公众号")
+    service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": "intro",
+                "content": "协调器正文",
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
+        ("微信公众号", "协调器测试账号", "已授权"),
+    )
+
+    job = service.create_publish_job(project["id"], account_id, "draft")
+
+    assert publisher.status_during_publish == "checking_login"
+    assert job["status"] == "platform_draft"
+    persisted = service.db.fetch_one(
+        "SELECT status, platform_draft_id, failure_reason FROM publish_jobs WHERE id = ?",
+        (job["id"],),
+    )
+    assert persisted == {
+        "status": "platform_draft",
+        "platform_draft_id": "draft-media-id",
+        "failure_reason": "",
+    }
 
 
 def test_publish_jobs_schema_and_default_task_action(tmp_path):
