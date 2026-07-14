@@ -27,6 +27,11 @@ TASK_TYPE_WECHAT_LEGACY = "公众号文章创作"
 TASK_TYPE_XIAOHONGSHU_RESERVED = "小红书图文生成（预留）"
 TASK_TIME_FORMAT = "%Y-%m-%d %H:%M"
 PUBLISH_INTERRUPTION_TIMEOUT = timedelta(minutes=15)
+TERMINAL_PUBLISH_JOB_STATUSES = ("platform_draft", "published", "failed")
+WAITING_TASK_RECOVERY_JOB_STATUSES = (
+    *UNCERTAIN_IN_PROGRESS_STATUSES,
+    *TERMINAL_PUBLISH_JOB_STATUSES,
+)
 PLATFORMS = ["微信公众号", "视频号", "小红书", "抖音"]
 PLATFORM_ALIASES = {
     "公众号": "微信公众号",
@@ -880,12 +885,12 @@ class ContentService:
                         SELECT 1
                         FROM publish_jobs AS jobs
                         WHERE jobs.id = tasks.publish_job_id
-                          AND jobs.status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+                          AND jobs.status IN ({','.join('?' for _ in WAITING_TASK_RECOVERY_JOB_STATUSES)})
                     )
                )
             ORDER BY id ASC
             """,
-            UNCERTAIN_IN_PROGRESS_STATUSES,
+            WAITING_TASK_RECOVERY_JOB_STATUSES,
         )
         for task in recoverable_tasks:
             try:
@@ -946,7 +951,7 @@ class ContentService:
         job = self.get_publish_job(publish_job_id)
         if (
             expected_task_status == "待人工确认"
-            and job["status"] not in UNCERTAIN_IN_PROGRESS_STATUSES
+            and job["status"] not in WAITING_TASK_RECOVERY_JOB_STATUSES
         ):
             return False
         if job["status"] == "pending":

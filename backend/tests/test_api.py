@@ -545,7 +545,9 @@ class ConfirmationPublisher(FakePlatformPublisher):
         )
 
 
-def prepare_task_interrupted_during_resume(tmp_path: Path, name: str):
+def prepare_task_interrupted_during_resume(
+    tmp_path: Path, name: str, execution_mode: str = "once"
+):
     class SimulatedProcessExit(BaseException):
         pass
 
@@ -574,6 +576,8 @@ def prepare_task_interrupted_during_resume(tmp_path: Path, name: str):
             "execute_time": "2026-07-14 09:30",
             "task_type": "微信公众号图文生成",
             "topic": f"人工确认恢复中断-{name}",
+            "execution_mode": execution_mode,
+            "repeat_rule": "daily" if execution_mode == "repeat" else "",
         }
     )
     waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
@@ -2493,6 +2497,263 @@ def test_scheduler_recognizes_recent_claimed_resume_without_timing_it_out(tmp_pa
     assert unchanged["publish_job"]["status"] == "checking_login"
     assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
     assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "expected_status", "expected_next_run_at"),
+    [
+        ("once", "已发布", ""),
+        ("repeat", "待执行", "2026-07-15 09:30"),
+    ],
+)
+def test_task_scheduler_finalizes_resume_success_after_exit_before_local_sync(
+    tmp_path: Path,
+    execution_mode: str,
+    expected_status: str,
+    expected_next_run_at: str,
+):
+    class ProcessInterrupted(BaseException):
+        pass
+
+    database_path = tmp_path / f"resume-terminal-{execution_mode}.db"
+    upload_dir = tmp_path / f"resume-terminal-uploads-{execution_mode}"
+    publisher = ConfirmationPublisher()
+    app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, f"resume 终态-{execution_mode}")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": f"resume 终态-{execution_mode}",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": f"resume 成功本地收尾-{execution_mode}",
+            "execution_mode": execution_mode,
+            "repeat_rule": "daily" if execution_mode == "repeat" else "",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+
+    def exit_before_local_sync(job):
+        assert job["status"] == "published"
+        raise ProcessInterrupted("forced exit before resume local sync")
+
+    service._synchronize_linked_waiting_tasks = exit_before_local_sync
+    with pytest.raises(ProcessInterrupted, match="forced exit before resume local sync"):
+        service.resume_publish_job(waiting["publish_job_id"])
+
+    interrupted = service.get_task(task["id"])
+    assert interrupted["status"] == "待人工确认"
+    assert interrupted["runs"][0]["status"] == "待人工确认"
+    assert interrupted["publish_package"]["status"] == "awaiting_confirmation"
+    assert interrupted["publish_job"]["status"] == "published"
+    assert publisher.resume_calls == 1
+
+    recovery_publisher = FakePlatformPublisher()
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=recovery_publisher,
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+    first_scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+    recovered = restarted.get_task(task["id"])
+    second_scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 1))
+    repeated = restarted.get_task(task["id"])
+
+    assert first_scan["executed"] == second_scan["executed"] == 0
+    assert recovered["status"] == expected_status
+    assert recovered["publish_result"] == "已发布"
+    assert recovered["next_run_at"] == expected_next_run_at
+    assert recovered["runs"][0]["status"] == "已发布"
+    assert recovered["runs"][0]["finished_at"]
+    assert recovered["publish_package"]["status"] == "published"
+    assert recovered["publish_package"]["published_at"]
+    assert recovered["publish_job"]["status"] == "published"
+    assert recovered["publish_job"]["response"]["receipt_id"] == "publish-42"
+    assert repeated["status"] == recovered["status"]
+    assert repeated["next_run_at"] == recovered["next_run_at"]
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    package_evidence = restarted.db.fetch_one(
+        "SELECT platform_response_json FROM publish_packages WHERE id = ?",
+        (recovered["publish_package_id"],),
+    )
+    assert json.loads(package_evidence["platform_response_json"])["receipt_id"] == "publish-42"
+    assert recovery_publisher.calls == []
+
+
+@pytest.mark.parametrize(
+    ("execution_mode", "expected_status", "expected_next_run_at"),
+    [
+        ("once", "已生成平台草稿", ""),
+        ("repeat", "待执行", "2026-07-15 09:30"),
+    ],
+)
+def test_task_scheduler_locally_finalizes_linked_platform_draft_after_restart(
+    tmp_path: Path,
+    execution_mode: str,
+    expected_status: str,
+    expected_next_run_at: str,
+):
+    database_path = tmp_path / f"waiting-platform-draft-{execution_mode}.db"
+    upload_dir = tmp_path / f"waiting-platform-draft-uploads-{execution_mode}"
+    publisher = ConfirmationPublisher()
+    app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, f"平台草稿恢复-{execution_mode}")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": f"平台草稿恢复-{execution_mode}",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": f"平台草稿本地收尾-{execution_mode}",
+            "execution_mode": execution_mode,
+            "repeat_rule": "daily" if execution_mode == "repeat" else "",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    response = {
+        "source": "wechat_platform",
+        "event": "draft_created",
+        "receipt_id": "recovered-draft",
+        "corroboration": "draft_saved",
+    }
+    service.db.execute(
+        """
+        UPDATE publish_jobs
+        SET status = 'platform_draft', platform_draft_id = 'recovered-draft',
+            platform_publish_id = '', platform_url = ?, response_json = ?,
+            requires_confirmation = 0, failure_stage = '', failure_reason = ''
+        WHERE id = ?
+        """,
+        (
+            "https://mp.weixin.qq.com/draft/recovered-draft",
+            json.dumps(response, ensure_ascii=False),
+            waiting["publish_job_id"],
+        ),
+    )
+
+    recovery_publisher = FakePlatformPublisher()
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=recovery_publisher,
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+    first_scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+    recovered = restarted.get_task(task["id"])
+    second_scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 1))
+
+    assert first_scan["executed"] == second_scan["executed"] == 0
+    assert recovered["status"] == expected_status
+    assert recovered["publish_result"] == "已生成平台草稿"
+    assert recovered["next_run_at"] == expected_next_run_at
+    assert recovered["runs"][0]["status"] == "已生成平台草稿"
+    assert recovered["runs"][0]["finished_at"]
+    assert recovered["publish_package"]["status"] == "platform_draft"
+    assert recovered["publish_package"]["platform_draft_id"] == "recovered-draft"
+    assert recovered["publish_package"]["published_at"]
+    assert recovered["publish_job"]["status"] == "platform_draft"
+    assert recovered["publish_job"]["response"] == response
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    assert publisher.resume_calls == 0
+    assert publisher.calls == []
+    assert recovery_publisher.calls == []
+
+
+@pytest.mark.parametrize("execution_mode", ["once", "repeat"])
+def test_task_scheduler_finalizes_stale_failure_after_exit_before_local_sync(
+    tmp_path: Path, execution_mode: str
+):
+    class ProcessInterrupted(BaseException):
+        pass
+
+    database_path, upload_dir, task, interrupted = prepare_task_interrupted_during_resume(
+        tmp_path, f"stale-terminal-{execution_mode}", execution_mode
+    )
+    job_id = interrupted["publish_job_id"]
+    Database(database_path).execute(
+        "UPDATE publish_jobs SET updated_at = '2026-07-14 01:00:00' WHERE id = ?",
+        (job_id,),
+    )
+    recovery_publisher = FakePlatformPublisher()
+    interrupted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=recovery_publisher,
+        scheduler_enabled=False,
+    )
+    interrupted_service = interrupted_app.state.content_service
+
+    def exit_before_local_sync(*args, **kwargs):
+        assert args[4]["status"] == "failed"
+        raise ProcessInterrupted("forced exit before stale local sync")
+
+    interrupted_service._finish_task_from_publish_job = exit_before_local_sync
+    with pytest.raises(ProcessInterrupted, match="forced exit before stale local sync"):
+        interrupted_service.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+
+    terminal = interrupted_service.get_task(task["id"])
+    assert terminal["status"] == "待人工确认"
+    assert terminal["runs"][0]["status"] == "待人工确认"
+    assert terminal["publish_package"]["status"] == "awaiting_confirmation"
+    assert terminal["publish_job"]["status"] == "failed"
+    assert terminal["publish_job"]["failure_stage"] == "发布中断"
+
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=recovery_publisher,
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+    first_scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 1))
+    failed = restarted.get_task(task["id"])
+    second_scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 2))
+    repeated = restarted.get_task(task["id"])
+
+    assert first_scan["executed"] == second_scan["executed"] == 0
+    assert failed["status"] == "失败"
+    assert failed["publish_result"] == ""
+    assert failed["next_run_at"] == ""
+    assert failed["failure_stage"] == "发布中断"
+    assert "人工核对平台" in failed["failure_reason"]
+    assert failed["manual_takeover_url"] == f"manual-takeover://task/{task['id']}"
+    assert failed["runs"][0]["status"] == "失败"
+    assert failed["runs"][0]["finished_at"]
+    assert failed["runs"][0]["failure_stage"] == "发布中断"
+    assert failed["publish_package"]["status"] == "failed"
+    assert failed["publish_package"]["failure_stage"] == "发布中断"
+    assert failed["publish_package"]["published_at"] == ""
+    assert failed["publish_job"]["status"] == "failed"
+    assert repeated["status"] == "失败"
+    assert repeated["failure_reason"] == failed["failure_reason"]
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    assert recovery_publisher.calls == []
 
 
 def test_stale_checking_login_job_moves_to_manual_interruption_failure(tmp_path: Path):

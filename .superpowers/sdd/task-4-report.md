@@ -636,3 +636,64 @@ git diff --check
 
 - uncertain resume attempt 超时后仍无法自动确认微信公众号后台的真实结果，继续采用 fail-closed 并要求人工核对后显式 retry。
 - prepare/package 恢复只接回当前代唯一、未被 task/run 占用的 pending job；候选不唯一时保持原有 fail closed，不猜测归属。
+
+## 最新审查唯一 Important：terminal job 本地收尾恢复
+
+### 修复内容
+
+- 新增精确的待确认任务恢复状态集合：保留 `checking_login`、`uploading_assets`、`filling_content`、`publishing` 的 recent/stale 检查，并加入 `published`、`platform_draft`、`failed` 三种 terminal job；普通 `awaiting_confirmation` 不进入扫描。
+- “待人工确认/待人工确认 + linked terminal job”恢复只调用既有本地最终化事务，不再次调用 publisher。task/run/package 的结果、平台 evidence、失败字段和 `published_at` 同步沿用 generation CAS，重复扫描不产生额外写入或新 job/package。
+- once 成功保持最终结果且 `next_run_at=''`；repeat 成功回到“待执行”并计算下一执行时间；failed 对 once/repeat 均保持“失败”且不生成 `next_run_at`。
+- 新增 resume 成功提交 terminal job 后、task/run/package 收尾前 `BaseException` 退出，以及 stale timeout 提交 failed 后、收尾前 `BaseException` 退出的真实重启回归。另覆盖 persisted `platform_draft` 重启恢复，三类 terminal 状态均验证 publisher 调用不增加。
+
+### TDD 证据
+
+RED：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_api.py::test_scheduler_finalizes_resume_success_after_exit_before_local_sync backend/tests/test_api.py::test_scheduler_locally_finalizes_linked_platform_draft backend/tests/test_api.py::test_scheduler_finalizes_stale_failure_after_exit_before_local_sync
+```
+
+结果：退出码 `1`，`6 failed, 1 warning in 1.17s`。六个 once/repeat 场景均复现 task/run/package 停留“待人工确认”，linked job 已分别成为 `published`、`platform_draft`、`failed`，后续扫描无法收尾。
+
+### GREEN 与最终验证
+
+focused terminal/recent/stale/awaiting 对照：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_api.py::test_task_scheduler_finalizes_resume_success_after_exit_before_local_sync backend/tests/test_api.py::test_task_scheduler_locally_finalizes_linked_platform_draft_after_restart backend/tests/test_api.py::test_task_scheduler_finalizes_stale_failure_after_exit_before_local_sync backend/tests/test_api.py::test_repeat_task_waits_for_confirmation_before_scheduling_next_run backend/tests/test_api.py::test_scheduler_fails_stale_claimed_resume_and_retry_reuses_job backend/tests/test_api.py::test_scheduler_recognizes_recent_claimed_resume_without_timing_it_out backend/tests/test_api.py::test_recent_checking_login_job_is_not_changed_by_recovery_scan
+```
+
+结果：退出码 `0`，`10 passed, 1 warning in 1.43s`。resume/stale 故障窗口重启后均只做本地收尾；once/repeat、三种 terminal、普通 awaiting、recent/stale、二次扫描幂等和 publisher 零新增调用全部通过。
+
+Task4：
+
+```bash
+cd backend && python -m pytest -q tests/test_api.py tests/test_content_flow.py::test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration tests/test_content_flow.py::test_concurrent_task_execution_claims_generation_once tests/test_content_flow.py::test_concurrent_failed_task_retries_claim_once -k task
+```
+
+结果：退出码 `0`，`48 passed, 38 deselected, 1 warning in 3.62s`。
+
+完整 backend：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests
+```
+
+结果：退出码 `0`，`185 passed, 1 warning in 8.38s`。
+
+```bash
+python3 -m compileall -q backend/app backend/tests
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有发布测试使用 fake publisher，未执行真实平台写入。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。
+
+### Concern
+
+- terminal job 只能重放已持久化的平台结论，不能弥合平台与 SQLite 之间的分布式事务；uncertain stale 状态仍按既有策略 fail closed，要求人工核对平台后再决定是否显式 retry。
