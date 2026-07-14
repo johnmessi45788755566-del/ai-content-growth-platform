@@ -916,11 +916,17 @@ class ContentService:
             task, run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
             if (
                 task["status"] != "执行中"
-                or publish_job_id is None
                 or run is None
                 or run["status"] != "执行中"
             ):
                 return False
+        if publish_job_id is None:
+            if not self._adopt_orphan_pending_publish_job(task, run):
+                return False
+            with self.db.transaction() as conn:
+                task, run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
+                if publish_job_id is None or run is None:
+                    return False
         job = self.get_publish_job(publish_job_id)
         if job["status"] == "pending":
             job = self.execute_publish_job(publish_job_id)
@@ -964,6 +970,78 @@ class ContentService:
             job,
             current,
         )
+
+    def _adopt_orphan_pending_publish_job(
+        self, observed_task: dict[str, Any], observed_run: dict[str, Any]
+    ) -> bool:
+        project_id = observed_task.get("content_project_id")
+        account_id = observed_task.get("account_id")
+        if project_id is None or account_id is None:
+            return False
+        project = self.get_project(int(project_id))
+        account = self.get_account(int(account_id))
+        with self.db.transaction() as conn:
+            task, run, publish_job_id = self._resolve_task_publish_job(
+                conn, int(observed_task["id"])
+            )
+            if publish_job_id is not None:
+                return True
+            if (
+                task["status"] != "执行中"
+                or run is None
+                or run["status"] != "执行中"
+                or int(run["id"]) != int(observed_run["id"])
+                or int(task.get("content_project_id") or 0) != int(project_id)
+            ):
+                return False
+            orphan_rows = conn.execute(
+                """
+                SELECT jobs.id
+                FROM publish_jobs AS jobs
+                WHERE jobs.project_id = ? AND jobs.account_id = ?
+                  AND jobs.action = ? AND jobs.status = 'pending'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM scheduled_tasks
+                    WHERE scheduled_tasks.publish_job_id = jobs.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM task_runs
+                    WHERE task_runs.publish_job_id = jobs.id
+                  )
+                ORDER BY jobs.id
+                """,
+                (project_id, account_id, task["publish_action"]),
+            ).fetchall()
+            if len(orphan_rows) > 1:
+                raise TaskConflictError("任务存在多个未关联的待发布作业")
+            if not orphan_rows:
+                return False
+            publish_job_id = int(orphan_rows[0]["id"])
+            package_rows = conn.execute(
+                "SELECT id FROM publish_packages WHERE publish_job_id = ? ORDER BY id",
+                (publish_job_id,),
+            ).fetchall()
+            if len(package_rows) > 1:
+                raise TaskConflictError("待发布作业存在多个兼容发布包")
+            if package_rows:
+                package_id = int(package_rows[0]["id"])
+            else:
+                package = self._persist_publish_package(
+                    project,
+                    account,
+                    {"id": publish_job_id},
+                    pending=True,
+                    conn=conn,
+                )
+                package_id = int(package["id"])
+            self._link_task_publish_job_in_transaction(
+                conn,
+                int(task["id"]),
+                int(run["id"]),
+                publish_job_id,
+                package_id,
+            )
+            return True
 
     def _execute_task(
         self,
@@ -1306,51 +1384,67 @@ class ContentService:
         publish_package_id: int | None = None,
     ) -> None:
         with self.db.transaction() as conn:
-            run_row = conn.execute(
-                "SELECT generation FROM task_runs WHERE id = ? AND task_id = ?",
-                (run_id, task_id),
-            ).fetchone()
-            if run_row is None:
-                raise RuntimeError("发布作业关联的运行代次不存在")
-            generation = int(run_row["generation"])
-            task_cursor = conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET publish_job_id = ?,
-                    publish_package_id = COALESCE(?, publish_package_id),
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status = '执行中'
-                  AND generation = ?
-                  AND (publish_job_id IS NULL OR publish_job_id = ?)
-                """,
-                (
-                    publish_job_id,
-                    publish_package_id,
-                    task_id,
-                    generation,
-                    publish_job_id,
-                ),
+            self._link_task_publish_job_in_transaction(
+                conn,
+                task_id,
+                run_id,
+                publish_job_id,
+                publish_package_id,
             )
-            run_cursor = conn.execute(
-                """
-                UPDATE task_runs
-                SET publish_job_id = ?,
-                    publish_package_id = COALESCE(?, publish_package_id)
-                WHERE id = ? AND task_id = ? AND status = '执行中'
-                  AND generation = ?
-                  AND (publish_job_id IS NULL OR publish_job_id = ?)
-                """,
-                (
-                    publish_job_id,
-                    publish_package_id,
-                    run_id,
-                    task_id,
-                    generation,
-                    publish_job_id,
-                ),
-            )
-            if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
-                raise RuntimeError("发布作业关联的任务代次已变化")
+
+    @staticmethod
+    def _link_task_publish_job_in_transaction(
+        conn: Any,
+        task_id: int,
+        run_id: int,
+        publish_job_id: int,
+        publish_package_id: int | None = None,
+    ) -> None:
+        run_row = conn.execute(
+            "SELECT generation FROM task_runs WHERE id = ? AND task_id = ?",
+            (run_id, task_id),
+        ).fetchone()
+        if run_row is None:
+            raise RuntimeError("发布作业关联的运行代次不存在")
+        generation = int(run_row["generation"])
+        task_cursor = conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET publish_job_id = ?,
+                publish_package_id = COALESCE(?, publish_package_id),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ? AND status = '执行中'
+              AND generation = ?
+              AND (publish_job_id IS NULL OR publish_job_id = ?)
+            """,
+            (
+                publish_job_id,
+                publish_package_id,
+                task_id,
+                generation,
+                publish_job_id,
+            ),
+        )
+        run_cursor = conn.execute(
+            """
+            UPDATE task_runs
+            SET publish_job_id = ?,
+                publish_package_id = COALESCE(?, publish_package_id)
+            WHERE id = ? AND task_id = ? AND status = '执行中'
+              AND generation = ?
+              AND (publish_job_id IS NULL OR publish_job_id = ?)
+            """,
+            (
+                publish_job_id,
+                publish_package_id,
+                run_id,
+                task_id,
+                generation,
+                publish_job_id,
+            ),
+        )
+        if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
+            raise RuntimeError("发布作业关联的任务代次已变化")
 
     def _recommend_task_title(self, task: dict[str, Any]) -> dict[str, str]:
         prompt = (
@@ -1639,6 +1733,7 @@ class ContentService:
         account: dict[str, Any],
         job: dict[str, Any],
         pending: bool = False,
+        conn: Any | None = None,
     ) -> dict[str, Any]:
         account_id = int(account["id"])
         platform = str(account["platform"])
@@ -1650,35 +1745,43 @@ class ContentService:
             "media_assets": project["media_assets"],
             "layout_blocks": project["layout_blocks"],
         }
-        package_id = self.db.execute(
-            """
+        sql = """
             INSERT INTO publish_packages (
               project_id, account_id, publish_job_id, platform, account_name, payload_json, status,
               platform_draft_id, platform_draft_url, platform_response_json,
               failure_stage, failure_reason, published_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                project["id"],
-                account_id,
-                job["id"],
-                platform,
-                account_name,
-                json.dumps({**payload, "publish_job_id": job["id"]}, ensure_ascii=False),
-                package_status,
-                "" if pending else job["platform_draft_id"],
-                "" if pending else job["platform_url"],
-                "{}" if pending else json.dumps(job["response"], ensure_ascii=False),
-                "" if pending else job["failure_stage"],
-                "" if pending else job["failure_reason"],
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                if not pending and job["status"] in {"platform_draft", "published"}
-                else "",
-            ),
+            """
+        params = (
+            project["id"],
+            account_id,
+            job["id"],
+            platform,
+            account_name,
+            json.dumps({**payload, "publish_job_id": job["id"]}, ensure_ascii=False),
+            package_status,
+            "" if pending else job["platform_draft_id"],
+            "" if pending else job["platform_url"],
+            "{}" if pending else json.dumps(job["response"], ensure_ascii=False),
+            "" if pending else job["failure_stage"],
+            "" if pending else job["failure_reason"],
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if not pending and job["status"] in {"platform_draft", "published"}
+            else "",
         )
+        if conn is None:
+            package_id = self.db.execute(sql, params)
+            package = self.db.fetch_one(
+                "SELECT * FROM publish_packages WHERE id = ?", (package_id,)
+            )
+        else:
+            package_id = int(conn.execute(sql, params).lastrowid)
+            package_row = conn.execute(
+                "SELECT * FROM publish_packages WHERE id = ?", (package_id,)
+            ).fetchone()
+            package = dict(package_row) if package_row else None
         if not pending:
             self._postprocess_publish_package(project, account, job)
-        package = self.db.fetch_one("SELECT * FROM publish_packages WHERE id = ?", (package_id,))
         return package or {}
 
     def _postprocess_publish_package(

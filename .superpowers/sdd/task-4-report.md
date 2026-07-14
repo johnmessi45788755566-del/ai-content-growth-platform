@@ -502,3 +502,75 @@ git diff --check
 
 - 不确定发布状态超时后不会自动判断平台真实结果；这是刻意的 fail-closed 路径，必须由操作人员先核对微信公众号后台，再决定是否通过显式 retry 重试原 job。
 - 平台终态与 SQLite 仍无法组成分布式事务；现有持久 job、同 job 恢复、generation CAS 与终态本地重放继续承担该边界。所有测试均使用 fake publisher，未执行真实平台写入。
+
+## 最新三个 Important findings 修复：迁移归属、准备中断与 attempt ownership
+
+### 修复内容
+
+- legacy `generation=0` 的最新 run 只有在仍可能属于 task 当前代时才会对齐。task 已被 PATCH 为新一代“待执行”且 `publish_job_id` 已清空时，迁移不升级旧 run，也不沿旧 run 回填 task job；下一次执行创建新 project/job 并只发布新主题。
+- 新增 pending orphan job 恢复。当前代 task/run 均为“执行中”但尚未 link 时，扫描按该代已持久化的 project、account、action 只接回唯一且未被其他 task/run 使用的 pending job；已有 package 原位复用，缺 package 时与 task/run link 在同一事务补建。多 job 或多 package 候选 fail closed；重启执行仍使用原 job。
+- 每次 publish/resume claim 生成私有 attempt token，并把 claim 时捕获的 token 传入成功与失败持久化。回调 UPDATE 同时 CAS 当前 in-progress 状态和 token；stale timeout 或新 retry 改变所有权后，旧 attempt 的晚到成功/失败均不能覆盖新状态、平台 ID、evidence 或失败字段。
+- 15 分钟 stale CAS 保持 UTC 边界与 fail-closed 语义；近期 active attempt 不会被 timeout，完成后仍可正常落库。
+
+### TDD 证据
+
+迁移归属 RED：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_content_flow.py::test_migration_does_not_revive_completed_once_run_after_new_generation_patch
+```
+
+结果：退出码 `1`，`1 failed in 0.20s`。迁移把旧 completed run 从 `generation=0` 错误升级为新 task 的 `generation=2`。
+
+prepare/link 中断 RED：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_api.py::test_restart_adopts_pending_job_when_process_exits_before_task_link
+```
+
+结果：退出码 `1`，`1 failed, 1 warning in 0.39s`。重启扫描后 task 仍为“执行中”，不可达 pending job 未被执行。
+
+attempt ownership RED：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_content_flow.py::test_late_stale_attempt_cannot_overwrite_new_attempt_evidence backend/tests/test_content_flow.py::test_recent_active_attempt_is_not_timed_out
+```
+
+结果：退出码 `1`，`2 failed, 1 passed in 0.30s`。旧成功把新平台 ID 改回旧值，旧失败把新成功改为 failed；近期 active 对照保持 in-progress。
+
+### GREEN 与最终验证
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_content_flow.py::test_migration_does_not_revive_completed_once_run_after_new_generation_patch backend/tests/test_content_flow.py::test_existing_task_backfills_publish_job_from_latest_run_or_package backend/tests/test_content_flow.py::test_legacy_task_links_backfill_through_package_and_retry_reuses_job backend/tests/test_content_flow.py::test_retry_publish_job_claim_allows_only_one_publisher_call backend/tests/test_content_flow.py::test_stale_retry_cannot_claim_a_later_failed_generation backend/tests/test_content_flow.py::test_late_stale_attempt_cannot_overwrite_new_attempt_evidence backend/tests/test_content_flow.py::test_recent_active_attempt_is_not_timed_out backend/tests/test_api.py::test_interrupted_pending_publish_job_executes_same_job backend/tests/test_api.py::test_restart_adopts_pending_job_when_process_exits_before_task_link backend/tests/test_api.py::test_stale_checking_login_job_moves_to_manual_interruption_failure backend/tests/test_api.py::test_recent_checking_login_job_is_not_changed_by_recovery_scan
+```
+
+结果：退出码 `0`，`14 passed, 1 warning in 1.14s`。包含参数化 late success/failure、run/package 两种 legacy 回填和 pending 手动/扫描两种既有恢复路径。
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_api.py backend/tests/test_content_flow.py
+```
+
+结果：退出码 `0`，`107 passed, 1 warning in 5.93s`。
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests
+```
+
+结果：退出码 `0`，`174 passed, 1 warning in 7.65s`。
+
+```bash
+python3 -m compileall -q backend/app backend/tests
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有发布测试使用 fake publisher，未执行真实平台写入。
+
+### Concern
+
+- orphan adoption 只处理当前代执行中 task/run 对应的唯一未关联 pending job；候选不唯一时刻意不猜测，任务保持可人工检查状态。
+- stale timeout 仍无法确认微信公众号后台是否已完成旧 attempt；系统只阻止旧回调覆盖新 attempt，是否发起显式 retry 仍需操作人员先核对平台。

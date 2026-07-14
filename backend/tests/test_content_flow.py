@@ -310,6 +310,138 @@ def test_stale_retry_cannot_claim_a_later_failed_generation(tmp_path):
     assert fresh_token not in str(fresh_retry)
 
 
+@pytest.mark.parametrize("late_outcome", ["success", "failure"])
+def test_late_stale_attempt_cannot_overwrite_new_attempt_evidence(
+    tmp_path, late_outcome
+):
+    class BlockingFirstAttemptPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+            self.first_started = threading.Event()
+            self.release_first = threading.Event()
+
+        def publish(self, payload, account, action):
+            with self.lock:
+                self.calls += 1
+                call_number = self.calls
+            if call_number == 1:
+                self.first_started.set()
+                assert self.release_first.wait(timeout=5)
+                if late_outcome == "failure":
+                    raise RuntimeError("旧 attempt 晚到失败")
+                publish_id = "old-attempt-publish"
+            else:
+                publish_id = "new-attempt-publish"
+            return PublishResult(
+                status="published",
+                platform_publish_id=publish_id,
+                platform_url=f"https://mp.weixin.qq.com/s/{publish_id}",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": publish_id,
+                    "corroboration": "publish_success",
+                },
+            )
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "晚到 attempt ownership")
+    publisher = BlockingFirstAttemptPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        old_attempt = executor.submit(
+            service.create_publish_job, project["id"], account_id, "publish"
+        )
+        assert publisher.first_started.wait(timeout=5)
+        job = service.db.fetch_one(
+            "SELECT id, status FROM publish_jobs ORDER BY id DESC LIMIT 1"
+        )
+        assert job is not None
+        assert job["status"] == "checking_login"
+        service.db.execute(
+            "UPDATE publish_jobs SET updated_at = '2026-07-14 01:00:00' WHERE id = ?",
+            (job["id"],),
+        )
+
+        timed_out = service.publish_coordinator.fail_stale_in_progress_job(
+            int(job["id"]), "2026-07-14 01:15:00"
+        )
+        assert timed_out["status"] == "failed"
+        assert timed_out["failure_stage"] == "发布中断"
+
+        retried = service.retry_publish_job(int(job["id"]))
+        new_private = service.db.fetch_one(
+            "SELECT response_json FROM publish_jobs WHERE id = ?", (job["id"],)
+        )["response_json"]
+        assert retried["status"] == "published"
+        assert retried["platform_publish_id"] == "new-attempt-publish"
+        assert retried["response"]["receipt_id"] == "new-attempt-publish"
+
+        publisher.release_first.set()
+        old_attempt.result(timeout=5)
+
+    final = service.get_publish_job(int(job["id"]))
+    final_private = service.db.fetch_one(
+        "SELECT response_json FROM publish_jobs WHERE id = ?", (job["id"],)
+    )["response_json"]
+    assert publisher.calls == 2
+    assert final["status"] == "published"
+    assert final["platform_publish_id"] == "new-attempt-publish"
+    assert final["response"]["receipt_id"] == "new-attempt-publish"
+    assert final["failure_stage"] == ""
+    assert final["failure_reason"] == ""
+    assert final_private == new_private
+
+
+def test_recent_active_attempt_is_not_timed_out(tmp_path):
+    class BlockingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def publish(self, payload, account, action):
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return PublishResult(
+                status="published",
+                platform_publish_id="recent-active-publish",
+                platform_url="https://mp.weixin.qq.com/s/recent-active-publish",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "recent-active-publish",
+                    "corroboration": "publish_success",
+                },
+            )
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "近期 active attempt")
+    publisher = BlockingPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        active_attempt = executor.submit(
+            service.create_publish_job, project["id"], account_id, "publish"
+        )
+        assert publisher.started.wait(timeout=5)
+        job = service.db.fetch_one(
+            "SELECT id, status FROM publish_jobs ORDER BY id DESC LIMIT 1"
+        )
+        assert job is not None
+
+        unchanged = service.publish_coordinator.fail_stale_in_progress_job(
+            int(job["id"]), "2000-01-01 00:00:00"
+        )
+        assert unchanged["status"] == "checking_login"
+
+        publisher.release.set()
+        active_attempt.result(timeout=5)
+
+    assert service.get_publish_job(int(job["id"]))["status"] == "published"
+
+
 def test_resume_publish_job_claim_allows_only_one_publisher_call(tmp_path):
     class AwaitingPublisher(FakePlatformPublisher):
         def publish(self, payload, account, action):
@@ -666,6 +798,100 @@ def test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration(
 
     with pytest.raises(sqlite3.IntegrityError):
         db.execute("UPDATE scheduled_tasks SET publish_action = ? WHERE id = ?", ("invalid", task_id))
+
+
+def test_migration_does_not_revive_completed_once_run_after_new_generation_patch(
+    tmp_path,
+):
+    class TopicAIClient(FakeAIClient):
+        def recommend_topics(self, user_prompt: str):
+            topic = "新主题" if "新主题" in user_prompt else "旧主题"
+            return [
+                TopicRecommendation(
+                    direction="代际隔离",
+                    subtitle="",
+                    titles=[f"{topic}标题"],
+                )
+            ]
+
+    class RecordingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = []
+
+        def publish(self, payload, account, action):
+            self.calls.append(payload["title"])
+            return PublishResult(
+                status="published",
+                platform_publish_id=f"publish-{len(self.calls)}",
+                platform_url=f"https://mp.weixin.qq.com/s/publish-{len(self.calls)}",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": f"publish-{len(self.calls)}",
+                    "corroboration": "publish_success",
+                },
+            )
+
+    db = Database(tmp_path / "patched-once-migration.db")
+    db.init_schema()
+    publisher = RecordingPublisher()
+    service = ContentService(
+        db=db,
+        ai_client=TopicAIClient(),
+        upload_dir=tmp_path / "patched-once-uploads",
+        platform_publisher=publisher,
+    )
+    account_id = db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '迁移代际账号', '已授权')"
+    )
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "迁移代际账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "旧主题",
+        }
+    )
+    first = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    old_run_id = first["runs"][0]["id"]
+    old_job_id = first["publish_job_id"]
+
+    with db.transaction() as conn:
+        conn.execute(
+            "UPDATE task_runs SET generation = 0 WHERE id = ?",
+            (old_run_id,),
+        )
+        conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET topic = '新主题', status = '待执行', next_run_at = '2026-07-15 09:30',
+                selected_title = '', title_direction = '', publish_result = '',
+                content_project_id = NULL, publish_package_id = NULL,
+                publish_job_id = NULL, generation = generation + 1
+            WHERE id = ?
+            """,
+            (task["id"],),
+        )
+
+    db.init_schema()
+
+    assert db.fetch_one(
+        "SELECT generation, publish_job_id FROM task_runs WHERE id = ?",
+        (old_run_id,),
+    ) == {"generation": 0, "publish_job_id": old_job_id}
+    assert db.fetch_one(
+        "SELECT status, publish_job_id FROM scheduled_tasks WHERE id = ?",
+        (task["id"],),
+    ) == {"status": "待执行", "publish_job_id": None}
+
+    second = service.execute_task(task["id"], datetime(2026, 7, 15, 9, 30))
+
+    assert second["status"] == "已发布"
+    assert second["publish_job_id"] != old_job_id
+    assert db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 2
+    assert publisher.calls == ["旧主题标题", "新主题标题"]
 
 
 def test_existing_publish_package_backfills_publish_job_id_from_payload(tmp_path):

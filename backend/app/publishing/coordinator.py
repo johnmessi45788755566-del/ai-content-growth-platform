@@ -209,14 +209,15 @@ class PublishCoordinator:
         if job["status"] != "awaiting_confirmation":
             raise PublishJobValidationError("只有待人工确认的发布任务可以恢复")
         account = self.account_loader(int(job["account_id"]))
-        if not self._claim_execution(job, "awaiting_confirmation"):
+        attempt_token = self._claim_execution(job, "awaiting_confirmation")
+        if attempt_token is None:
             return self.get_publish_job(job_id)
         try:
             context = self._job_context(job)
             result = self.publisher.resume(account, context)
-            self._persist_result(job_id, str(job["action"]), result)
+            self._persist_result(job_id, str(job["action"]), result, attempt_token)
         except Exception as exc:
-            self._persist_failure(job_id, "恢复人工确认", exc)
+            self._persist_failure(job_id, "恢复人工确认", exc, attempt_token)
         return self.get_publish_job(job_id)
 
     def _execute(
@@ -229,14 +230,17 @@ class PublishCoordinator:
         observed_job: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         job = dict(observed_job or self._get_row(job_id))
-        if not self._claim_execution(job, expected_status, clear_previous_result):
+        attempt_token = self._claim_execution(
+            job, expected_status, clear_previous_result
+        )
+        if attempt_token is None:
             return self.get_publish_job(job_id)
         try:
             result = self.publisher.publish(payload, account, str(job["action"]))
-            self._persist_result(job_id, str(job["action"]), result)
+            self._persist_result(job_id, str(job["action"]), result, attempt_token)
         except Exception as exc:
             stage = "提交平台草稿" if job["action"] == "draft" else "发布文章"
-            self._persist_failure(job_id, stage, exc)
+            self._persist_failure(job_id, stage, exc, attempt_token)
         return self.get_publish_job(job_id)
 
     def _load_inputs(
@@ -266,12 +270,11 @@ class PublishCoordinator:
         observed_job: Mapping[str, Any],
         expected_status: str,
         clear_previous_result: bool = False,
-    ) -> bool:
+    ) -> str | None:
         job_id = int(observed_job["id"])
         observed_response_json = str(observed_job.get("response_json") or "{}")
-        attempt_response_json = json.dumps(
-            {ATTEMPT_TOKEN_KEY: secrets.token_urlsafe(32)}, ensure_ascii=False
-        )
+        attempt_token = secrets.token_urlsafe(32)
+        attempt_response_json = self._attempt_response_json(attempt_token)
         reset = """
             , platform_draft_id = '', platform_publish_id = '', platform_url = ''
         """ if clear_previous_result else ""
@@ -288,9 +291,11 @@ class PublishCoordinator:
                 (attempt_response_json, job_id, expected_status, observed_response_json),
             )
             conn.commit()
-            return cursor.rowcount == 1
+            return attempt_token if cursor.rowcount == 1 else None
 
-    def _persist_result(self, job_id: int, action: str, result: PublishResult) -> None:
+    def _persist_result(
+        self, job_id: int, action: str, result: PublishResult, attempt_token: str
+    ) -> None:
         response = result.response if isinstance(result.response, Mapping) else {}
         if result.status == "awaiting_confirmation":
             if action != "publish" or not result.requires_confirmation:
@@ -309,44 +314,61 @@ class PublishCoordinator:
                 result.platform_publish_id, result.platform_url, response, "publish"
             )
         private_response = dict(response)
-        private_response[ATTEMPT_TOKEN_KEY] = self._attempt_token(self._get_row(job_id))
+        private_response[ATTEMPT_TOKEN_KEY] = attempt_token
         response_json = json.dumps(private_response, ensure_ascii=False)
-        self.db.execute(
-            """
-            UPDATE publish_jobs
-            SET status = ?, platform_draft_id = ?, platform_publish_id = ?,
-                platform_url = ?, response_json = ?, requires_confirmation = ?,
-                failure_stage = '', failure_reason = '', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (
-                result.status,
-                result.platform_draft_id,
-                result.platform_publish_id,
-                result.platform_url,
-                response_json,
-                int(result.requires_confirmation),
-                job_id,
-            ),
-        )
+        with self.db.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE publish_jobs
+                SET status = ?, platform_draft_id = ?, platform_publish_id = ?,
+                    platform_url = ?, response_json = ?, requires_confirmation = ?,
+                    failure_stage = '', failure_reason = '', updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+                  AND response_json = ?
+                """,
+                (
+                    result.status,
+                    result.platform_draft_id,
+                    result.platform_publish_id,
+                    result.platform_url,
+                    response_json,
+                    int(result.requires_confirmation),
+                    job_id,
+                    *UNCERTAIN_IN_PROGRESS_STATUSES,
+                    self._attempt_response_json(attempt_token),
+                ),
+            )
+            conn.commit()
 
-    def _persist_failure(self, job_id: int, stage: str, exc: Exception) -> None:
+    def _persist_failure(
+        self, job_id: int, stage: str, exc: Exception, attempt_token: str
+    ) -> None:
         job = self._get_row(job_id)
         reason = str(exc).strip() or exc.__class__.__name__
         reason = self._redact_sensitive_text(job, reason)
-        response_json = json.dumps(
-            {ATTEMPT_TOKEN_KEY: self._attempt_token(job)}, ensure_ascii=False
-        )
-        self.db.execute(
-            """
-            UPDATE publish_jobs
-            SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
-                platform_url = '', response_json = ?, requires_confirmation = 0,
-                failure_stage = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (response_json, stage, reason, job_id),
-        )
+        response_json = self._attempt_response_json(attempt_token)
+        with self.db.connect() as conn:
+            conn.execute(
+                f"""
+                UPDATE publish_jobs
+                SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
+                    platform_url = '', response_json = ?, requires_confirmation = 0,
+                    failure_stage = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+                  AND response_json = ?
+                """,
+                (
+                    response_json,
+                    stage,
+                    reason,
+                    job_id,
+                    *UNCERTAIN_IN_PROGRESS_STATUSES,
+                    response_json,
+                ),
+            )
+            conn.commit()
 
     def _get_row(self, job_id: int) -> dict[str, Any]:
         job = self.db.fetch_one("SELECT * FROM publish_jobs WHERE id = ?", (job_id,))
@@ -389,6 +411,10 @@ class PublishCoordinator:
         except json.JSONDecodeError as exc:
             raise PublishJobValidationError("发布任务的恢复上下文已损坏") from exc
         return self._require_job_context(response)
+
+    @staticmethod
+    def _attempt_response_json(attempt_token: str) -> str:
+        return json.dumps({ATTEMPT_TOKEN_KEY: attempt_token}, ensure_ascii=False)
 
     @staticmethod
     def _attempt_token(job: Mapping[str, Any]) -> str:

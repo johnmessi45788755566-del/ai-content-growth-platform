@@ -321,6 +321,10 @@ class Database:
                     FROM scheduled_tasks
                     WHERE scheduled_tasks.id = task_runs.task_id
                       AND scheduled_tasks.generation <> 0
+                      AND NOT (
+                        scheduled_tasks.status = '待执行'
+                        AND scheduled_tasks.publish_job_id IS NULL
+                      )
                   )
                 """,
                 """

@@ -2219,6 +2219,74 @@ def test_interrupted_pending_publish_job_executes_same_job(
     assert len(publisher.calls) == 1
 
 
+def test_restart_adopts_pending_job_when_process_exits_before_task_link(tmp_path: Path):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    database_path = tmp_path / "prepare-before-link-exit.db"
+    upload_dir = tmp_path / "prepare-before-link-uploads"
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "prepare 后中断账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "prepare 后中断账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "prepare 后 link 前中断恢复",
+        }
+    )
+
+    def exit_before_link(*args, **kwargs):
+        raise SimulatedProcessExit
+
+    service._link_task_publish_job = exit_before_link
+    with pytest.raises(SimulatedProcessExit):
+        service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+
+    orphan = service.db.fetch_one(
+        "SELECT id, status FROM publish_jobs ORDER BY id DESC LIMIT 1"
+    )
+    interrupted = service.get_task(task["id"])
+    assert orphan is not None
+    assert orphan["status"] == "pending"
+    assert interrupted["status"] == "执行中"
+    assert interrupted["publish_job_id"] is None
+    assert interrupted["runs"][0]["publish_job_id"] is None
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    assert publisher.calls == []
+
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+    scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
+    recovered = restarted.get_task(task["id"])
+
+    assert scan["executed"] == 0
+    assert recovered["status"] == "已发布"
+    assert recovered["publish_job_id"] == orphan["id"]
+    assert recovered["runs"][0]["publish_job_id"] == orphan["id"]
+    assert recovered["publish_package"]["publish_job_id"] == orphan["id"]
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    assert len(publisher.calls) == 1
+
+
 def test_stale_checking_login_job_moves_to_manual_interruption_failure(tmp_path: Path):
     service, publisher, task, interrupted = prepare_task_interrupted_with_pending_job(
         tmp_path, "stale-checking-login"
