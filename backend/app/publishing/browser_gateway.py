@@ -604,6 +604,77 @@ class ChromeCDPBrowserGateway:
             raise WeChatPublishingError("微信页面无法建立本次发布操作基线")
 
     @staticmethod
+    def _baseline_state_collector_source() -> str:
+        return """
+        (stateRoots, normalizeTitle, maxDepth, maxEntries) => {
+          const receipts = [];
+          let baselineComplete = true;
+          const baselineIncompleteReasons = [];
+          const markBaselineIncomplete = (root, kind, details = {}) => {
+            baselineComplete = false;
+            baselineIncompleteReasons.push({root, kind, ...details});
+          };
+          const collectStateRecords = (value, rootName) => {
+            const seen = new WeakSet();
+            let entries = 0;
+            const idKeys = ['draft_id', 'draftId', 'media_id', 'mediaId', 'appmsgid', 'appMsgId', 'publish_id', 'publishId', 'msgid', 'msgId'];
+            const titleKeys = ['title', 'appmsg_title', 'appMsgTitle', 'name'];
+            const visit = (current, depth) => {
+              if (!current || typeof current !== 'object' || seen.has(current)) return;
+              if (depth > maxDepth) {
+                markBaselineIncomplete(rootName, 'depth_budget_exceeded', {depth});
+                return;
+              }
+              seen.add(current);
+              const values = new Map();
+              const read = (key) => {
+                if (values.has(key)) return values.get(key);
+                try {
+                  const result = current[key];
+                  values.set(key, result);
+                  return result;
+                } catch (_error) {
+                  markBaselineIncomplete(rootName, 'state_access_failed');
+                  return undefined;
+                }
+              };
+              const idKey = idKeys.find((key) => ['string', 'number'].includes(typeof read(key)));
+              if (idKey) {
+                const titleKey = titleKeys.find((key) => typeof read(key) === 'string');
+                receipts.push({
+                  id: String(read(idKey)).trim(),
+                  title: normalizeTitle(titleKey ? read(titleKey) : ''),
+                  source: 'platform_state',
+                  observed_after_baseline: false,
+                  visible: false
+                });
+              }
+              try {
+                for (const key in current) {
+                  if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
+                  if (entries >= maxEntries) {
+                    markBaselineIncomplete(rootName, 'entry_budget_exceeded', {entries: entries + 1});
+                    return;
+                  }
+                  entries += 1;
+                  visit(read(key), depth + 1);
+                }
+              } catch (_error) {
+                markBaselineIncomplete(rootName, 'state_access_failed');
+              }
+            };
+            visit(value, 0);
+          };
+          for (const [rootName, root] of stateRoots) collectStateRecords(root, rootName);
+          return {
+            receipts,
+            baseline_complete: baselineComplete,
+            baseline_incomplete_reasons: baselineIncompleteReasons
+          };
+        }
+        """.strip()
+
+    @staticmethod
     def _observation_expression(
         title: str, kind: str, include_hidden: bool = False
     ) -> str:
@@ -636,6 +707,7 @@ class ChromeCDPBrowserGateway:
             if kind == "draft"
             else ["发表成功", "发送成功", "群发成功", "发布成功"]
         )
+        state_collector = ChromeCDPBrowserGateway._baseline_state_collector_source()
         return f"""
         (() => {{
           const selectors = {json.dumps(success_selectors)};
@@ -679,63 +751,6 @@ class ChromeCDPBrowserGateway:
               if (platformId) receipts.push({{id: platformId, title: receiptTitle, source: 'dom', observed_after_baseline: changed(node) || changed(container) || changed(link), visible: visible(node)}});
             }}
           }}
-          let baselineComplete = true;
-          const baselineIncompleteReasons = [];
-          const markBaselineIncomplete = (root, kind, details = {{}}) => {{
-            baselineComplete = false;
-            baselineIncompleteReasons.push({{root, kind, ...details}});
-          }};
-          const collectStateRecords = (value, rootName) => {{
-            const seen = new WeakSet();
-            let entries = 0;
-            const idKeys = ['draft_id', 'draftId', 'media_id', 'mediaId', 'appmsgid', 'appMsgId', 'publish_id', 'publishId', 'msgid', 'msgId'];
-            const titleKeys = ['title', 'appmsg_title', 'appMsgTitle', 'name'];
-            const visit = (current, depth) => {{
-              if (!includeHidden || !current || typeof current !== 'object' || seen.has(current)) return;
-              if (depth > {STATE_TRAVERSAL_MAX_DEPTH}) {{
-                markBaselineIncomplete(rootName, 'depth_budget_exceeded', {{depth}});
-                return;
-              }}
-              seen.add(current);
-              const values = new Map();
-              const read = (key) => {{
-                if (values.has(key)) return values.get(key);
-                try {{
-                  const result = current[key];
-                  values.set(key, result);
-                  return result;
-                }} catch (_error) {{
-                  markBaselineIncomplete(rootName, 'state_access_failed');
-                  return undefined;
-                }}
-              }};
-              const idKey = idKeys.find((key) => ['string', 'number'].includes(typeof read(key)));
-              if (idKey) {{
-                const titleKey = titleKeys.find((key) => typeof read(key) === 'string');
-                receipts.push({{
-                  id: String(read(idKey)).trim(),
-                  title: normalizeTitle(titleKey ? read(titleKey) : ''),
-                  source: 'platform_state',
-                  observed_after_baseline: false,
-                  visible: false
-                }});
-              }}
-              try {{
-                for (const key in current) {{
-                  if (!Object.prototype.hasOwnProperty.call(current, key)) continue;
-                  if (entries >= {STATE_TRAVERSAL_MAX_ENTRIES}) {{
-                    markBaselineIncomplete(rootName, 'entry_budget_exceeded', {{entries: entries + 1}});
-                    return;
-                  }}
-                  entries += 1;
-                  visit(read(key), depth + 1);
-                }}
-              }} catch (_error) {{
-                markBaselineIncomplete(rootName, 'state_access_failed');
-              }}
-            }};
-            visit(value, 0);
-          }};
           const stateRoots = [
             ['wx.cgiData', window.wx?.cgiData],
             ['cgiData', window.cgiData],
@@ -743,7 +758,10 @@ class ChromeCDPBrowserGateway:
             ['__INITIAL_DATA__', window.__INITIAL_DATA__],
             ['__NEXT_DATA__', window.__NEXT_DATA__]
           ];
-          for (const [rootName, root] of stateRoots) collectStateRecords(root, rootName);
+          const stateCollection = includeHidden
+            ? ({state_collector})(stateRoots, normalizeTitle, {STATE_TRAVERSAL_MAX_DEPTH}, {STATE_TRAVERSAL_MAX_ENTRIES})
+            : {{receipts: [], baseline_complete: true, baseline_incomplete_reasons: []}};
+          receipts.push(...stateCollection.receipts);
           const successSelectors = ['.weui-desktop-toast', '.weui-desktop-tips', '[role=alert]', '.js_success', '.publish_success'];
           const successWords = {json.dumps(success_words, ensure_ascii=False)};
           const successMessage = successSelectors.some((selector) => [...document.querySelectorAll(selector)].some((node) => visible(node) && changed(node) && successWords.some((word) => (node.innerText || '').includes(word))));
@@ -758,8 +776,8 @@ class ChromeCDPBrowserGateway:
             baseline_id: operation?.id || '',
             confirmation,
             confirmation_after_baseline: confirmationAfterBaseline,
-            baseline_complete: includeHidden ? baselineComplete : true,
-            baseline_incomplete_reasons: includeHidden ? baselineIncompleteReasons : [],
+            baseline_complete: stateCollection.baseline_complete,
+            baseline_incomplete_reasons: stateCollection.baseline_incomplete_reasons,
             receipts: [...receiptMap.values()],
             signals: successMessage ? [{{kind: {json.dumps(signal_kind)}, observed_after_baseline: true}}] : []
           }};

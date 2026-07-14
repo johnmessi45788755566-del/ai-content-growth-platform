@@ -1,3 +1,5 @@
+import json
+import subprocess
 import time
 from pathlib import Path
 
@@ -6,6 +8,8 @@ import pytest
 from app.publishing.browser_gateway import (
     COVER_FILE_SELECTORS,
     INLINE_FILE_SELECTORS,
+    STATE_TRAVERSAL_MAX_DEPTH,
+    STATE_TRAVERSAL_MAX_ENTRIES,
     BrowserSession,
     ChromeCDPBrowserGateway,
 )
@@ -14,16 +18,8 @@ from app.publishing.wechat import WeChatBrowserPublisher, WeChatPublishingError
 
 
 class FakeWeChatGateway:
-    def __init__(
-        self,
-        outcomes,
-        *,
-        baseline_complete=True,
-        baseline_incomplete_reasons=None,
-    ):
+    def __init__(self, outcomes):
         self.outcomes = list(outcomes) if isinstance(outcomes, list) else [outcomes]
-        self.baseline_complete = baseline_complete
-        self.baseline_incomplete_reasons = baseline_incomplete_reasons or []
         self.actions = []
         self.closed_sessions = []
         self.filled_payload = None
@@ -55,8 +51,8 @@ class FakeWeChatGateway:
         self.actions.append("capture_baseline")
         return {
             "baseline_id": "baseline-1",
-            "baseline_complete": self.baseline_complete,
-            "baseline_incomplete_reasons": self.baseline_incomplete_reasons,
+            "baseline_complete": True,
+            "baseline_incomplete_reasons": [],
             "receipt_ids": ["old-receipt"],
             "title": title,
             "action": action,
@@ -93,6 +89,48 @@ class FakeWeChatGateway:
 
     def close(self, session):
         self.closed_sessions.append(session)
+
+
+def execute_baseline_state_collector(state_setup: str):
+    collector = ChromeCDPBrowserGateway._baseline_state_collector_source()
+    script = f"""
+    const collectBaselineState = {collector};
+    {state_setup}
+    const result = collectBaselineState(
+      [['test_state', state]],
+      (value) => String(value || '').normalize('NFKC').replace(/\\s+/gu, ' ').trim(),
+      {STATE_TRAVERSAL_MAX_DEPTH},
+      {STATE_TRAVERSAL_MAX_ENTRIES}
+    );
+    process.stdout.write(JSON.stringify(result));
+    """
+    completed = subprocess.run(
+        ["node", "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+class CollectorBackedFakeGateway(FakeWeChatGateway):
+    def __init__(self, outcomes, state_setup):
+        super().__init__(outcomes)
+        self.state_setup = state_setup
+        self.collector_result = None
+
+    def capture_baseline(self, session, title, action):
+        self.actions.append("capture_baseline")
+        self.collector_result = execute_baseline_state_collector(self.state_setup)
+        return {
+            "baseline_id": "baseline-1",
+            **self.collector_result,
+            "receipt_ids": [
+                receipt["id"] for receipt in self.collector_result["receipts"]
+            ],
+            "title": title,
+            "action": action,
+        }
 
 
 def article_payload(tmp_path: Path):
@@ -196,30 +234,39 @@ def test_wechat_browser_publisher_returns_verified_publish_receipt(tmp_path: Pat
 
 
 @pytest.mark.parametrize(
-    ("action", "reason"),
+    ("action", "state_setup", "expected_reason"),
     [
         (
             "draft",
-            {"root": "cgiData", "kind": "depth_budget_exceeded", "depth": 8},
+            "let state = {}; let cursor = state; "
+            f"for (let depth = 0; depth < {STATE_TRAVERSAL_MAX_DEPTH + 1}; depth += 1) {{ "
+            "cursor.child = {}; cursor = cursor.child; }",
+            {
+                "root": "test_state",
+                "kind": "depth_budget_exceeded",
+                "depth": STATE_TRAVERSAL_MAX_DEPTH + 1,
+            },
         ),
         (
             "publish",
+            "const state = {}; "
+            f"for (let entry = 0; entry < {STATE_TRAVERSAL_MAX_ENTRIES + 1}; entry += 1) "
+            "state[`item_${entry}`] = entry;",
             {
-                "root": "__INITIAL_STATE__",
+                "root": "test_state",
                 "kind": "entry_budget_exceeded",
-                "entries": 501,
+                "entries": STATE_TRAVERSAL_MAX_ENTRIES + 1,
             },
         ),
     ],
     ids=["depth-8", "entries-501"],
 )
-def test_wechat_browser_publisher_aborts_before_click_when_baseline_is_incomplete(
-    tmp_path: Path, action, reason
+def test_actual_state_collector_aborts_publisher_before_click_at_budget_boundary(
+    tmp_path: Path, action, state_setup, expected_reason
 ):
-    gateway = FakeWeChatGateway(
+    gateway = CollectorBackedFakeGateway(
         draft_outcome() if action == "draft" else published_outcome(),
-        baseline_complete=False,
-        baseline_incomplete_reasons=[reason],
+        state_setup,
     )
 
     with pytest.raises(WeChatPublishingError, match="操作前基线采集不完整"):
@@ -229,6 +276,11 @@ def test_wechat_browser_publisher_aborts_before_click_when_baseline_is_incomplet
 
     assert "click_save_draft" not in gateway.actions
     assert "click_publish" not in gateway.actions
+    assert gateway.collector_result == {
+        "receipts": [],
+        "baseline_complete": False,
+        "baseline_incomplete_reasons": [expected_reason],
+    }
     assert len(gateway.closed_sessions) == 1
 
 
@@ -562,39 +614,6 @@ class ObservationGateway(ChromeCDPBrowserGateway):
         return observation
 
 
-@pytest.mark.parametrize(
-    "reason",
-    [
-        {"root": "cgiData", "kind": "depth_budget_exceeded", "depth": 8},
-        {
-            "root": "__INITIAL_STATE__",
-            "kind": "entry_budget_exceeded",
-            "entries": 501,
-        },
-    ],
-    ids=["depth-8", "entries-501"],
-)
-def test_browser_gateway_rejects_incomplete_state_traversal_baseline(
-    tmp_path: Path, reason
-):
-    gateway = ObservationGateway(
-        [
-            {
-                "url": "https://mp.weixin.qq.com/cgi-bin/appmsg",
-                "baseline_complete": False,
-                "baseline_incomplete_reasons": [reason],
-                "receipts": [],
-                "signals": [],
-            }
-        ]
-    )
-
-    with pytest.raises(WeChatPublishingError, match="操作前基线采集不完整"):
-        gateway.capture_baseline(
-            browser_session(tmp_path), "浏览器发布测试", "draft"
-        )
-
-
 def test_browser_gateway_accepts_only_new_title_bound_receipt_with_post_action_signal(tmp_path: Path):
     baseline_observation = {
         "url": "https://mp.weixin.qq.com/cgi-bin/appmsg?token=secret",
@@ -817,6 +836,7 @@ def test_baseline_expression_collects_unrendered_platform_state_records():
     assert "entry_budget_exceeded" in expression
     assert "baseline_complete" in expression
     assert ".slice(0, 500)" not in expression
+    assert ChromeCDPBrowserGateway._baseline_state_collector_source().strip() in expression
 
 
 @pytest.mark.parametrize(
