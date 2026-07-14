@@ -1,7 +1,7 @@
 import sqlite3
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 class Database:
@@ -73,11 +73,19 @@ class Database:
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
                   account_id INTEGER,
+                  publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL,
                   platform TEXT NOT NULL,
                   account_name TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
                   status TEXT NOT NULL DEFAULT 'pending_publish',
-                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                  platform_draft_id TEXT NOT NULL DEFAULT '',
+                  platform_draft_url TEXT NOT NULL DEFAULT '',
+                  platform_response_json TEXT NOT NULL DEFAULT '{}',
+                  failure_stage TEXT NOT NULL DEFAULT '',
+                  failure_reason TEXT NOT NULL DEFAULT '',
+                  published_at TEXT NOT NULL DEFAULT '',
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
 
                 CREATE TABLE IF NOT EXISTS platform_accounts (
@@ -90,6 +98,7 @@ class Database:
                   auth_status TEXT NOT NULL DEFAULT '已授权',
                   monitor_status TEXT NOT NULL DEFAULT '监测中',
                   sync_status TEXT NOT NULL DEFAULT '已同步',
+                  sync_error TEXT NOT NULL DEFAULT '',
                   role TEXT NOT NULL DEFAULT '',
                   audience TEXT NOT NULL DEFAULT '',
                   style TEXT NOT NULL DEFAULT '',
@@ -97,6 +106,8 @@ class Database:
                   preference TEXT NOT NULL DEFAULT '',
                   auth_method TEXT NOT NULL DEFAULT '扫码授权',
                   qr_url TEXT NOT NULL DEFAULT '',
+                  profile_path TEXT NOT NULL DEFAULT '',
+                  login_url TEXT NOT NULL DEFAULT '',
                   last_sync_at TEXT NOT NULL DEFAULT '',
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -235,6 +246,17 @@ class Database:
             )
             for column_sql in [
                 "ALTER TABLE publish_packages ADD COLUMN account_id INTEGER",
+                "ALTER TABLE publish_packages ADD COLUMN publish_job_id INTEGER REFERENCES publish_jobs(id) ON DELETE SET NULL",
+                "ALTER TABLE publish_packages ADD COLUMN platform_draft_id TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE publish_packages ADD COLUMN platform_draft_url TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE publish_packages ADD COLUMN platform_response_json TEXT NOT NULL DEFAULT '{}'",
+                "ALTER TABLE publish_packages ADD COLUMN failure_stage TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE publish_packages ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE publish_packages ADD COLUMN published_at TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE publish_packages ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE platform_accounts ADD COLUMN profile_path TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE platform_accounts ADD COLUMN login_url TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE platform_accounts ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE scheduled_tasks ADD COLUMN account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_action TEXT NOT NULL DEFAULT 'publish'",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_result TEXT NOT NULL DEFAULT ''",
@@ -258,8 +280,22 @@ class Database:
                 with suppress(sqlite3.OperationalError):
                     conn.execute(column_sql)
 
+            with suppress(sqlite3.OperationalError):
+                conn.execute(
+                    """
+                    UPDATE publish_packages
+                    SET publish_job_id = CAST(json_extract(payload_json, '$.publish_job_id') AS INTEGER)
+                    WHERE publish_job_id IS NULL
+                      AND json_valid(payload_json)
+                      AND json_extract(payload_json, '$.publish_job_id') IS NOT NULL
+                    """
+                )
+
             conn.executescript(
                 """
+                CREATE INDEX IF NOT EXISTS publish_packages_publish_job_id_idx
+                ON publish_packages(publish_job_id);
+
                 DROP TRIGGER IF EXISTS publish_jobs_platform_insert;
                 DROP TRIGGER IF EXISTS publish_jobs_platform_update;
                 DROP TRIGGER IF EXISTS publish_jobs_platform_refs_insert;
@@ -422,6 +458,19 @@ class Database:
                 END;
                 """
             )
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def fetch_one(self, sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         with self.connect() as conn:

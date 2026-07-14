@@ -15,6 +15,7 @@ except Exception:  # pragma: no cover
     load_dotenv = None
 
 from .ai import AIConfigurationError, AIResponseError, OpenAICompatibleClient
+from .browser_auth import BrowserAuthManager
 from .database import Database
 from .publishing.coordinator import PublishJobValidationError
 from .publishing.wechat import WeChatDraftPublisher
@@ -91,6 +92,8 @@ class AccountAuthRequest(BaseModel):
 
 
 class AccountUpdateRequest(BaseModel):
+    name: str | None = None
+    external_id: str | None = None
     owner: str = "未分配"
     tag: str = ""
     monitor_status: str = "监测中"
@@ -144,6 +147,7 @@ def create_app(
     database_path: str | Path | None = None,
     upload_dir: str | Path | None = None,
     ai_client: Any | None = None,
+    browser_auth_manager: Any | None = None,
     platform_publisher: Any | None = None,
     scheduler_enabled: bool = True,
 ) -> FastAPI:
@@ -153,10 +157,12 @@ def create_app(
     db = Database(database_path or BACKEND_ROOT / "data" / "content.db")
     db.init_schema()
     uploads = Path(upload_dir or BACKEND_ROOT / "uploads")
+    browser_auth = browser_auth_manager or BrowserAuthManager(BACKEND_ROOT / "data" / "browser_profiles")
     service = ContentService(
         db=db,
         ai_client=ai_client or OpenAICompatibleClient(),
         upload_dir=uploads,
+        browser_auth_manager=browser_auth,
         platform_publisher=platform_publisher or WeChatDraftPublisher(),
     )
 
@@ -179,6 +185,7 @@ def create_app(
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        browser_auth.close_all()
 
     app = FastAPI(title="AI 内容创作后端", version="0.1.0", lifespan=lifespan)
     app.state.content_service = service
@@ -311,6 +318,20 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/accounts/auth/{session_id}")
+    def get_account_auth_status(session_id: str) -> dict[str, Any]:
+        try:
+            return service.get_account_auth_status(session_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/accounts/auth/{session_id}/cancel")
+    def cancel_account_auth(session_id: str) -> dict[str, Any]:
+        try:
+            return service.cancel_account_auth(session_id)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.get("/api/accounts/{account_id}")
     def get_account(account_id: int) -> dict[str, Any]:
         try:
@@ -324,6 +345,8 @@ def create_app(
             return service.sync_account(account_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.patch("/api/accounts/{account_id}")
     def update_account(account_id: int, payload: AccountUpdateRequest) -> dict[str, Any]:

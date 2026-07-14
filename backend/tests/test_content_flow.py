@@ -659,6 +659,35 @@ def test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration(
         db.execute("UPDATE scheduled_tasks SET publish_action = ? WHERE id = ?", ("invalid", task_id))
 
 
+def test_existing_publish_package_backfills_publish_job_id_from_payload(tmp_path):
+    db = Database(tmp_path / "legacy-package.db")
+    db.init_schema()
+    project_id = db.execute("INSERT INTO content_projects (title) VALUES ('legacy package')")
+    account_id = db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '旧包账号', '已授权')"
+    )
+    job_id = db.execute(
+        """
+        INSERT INTO publish_jobs (project_id, account_id, platform, action, status)
+        VALUES (?, ?, '微信公众号', 'publish', 'pending')
+        """,
+        (project_id, account_id),
+    )
+    package_id = db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status, publish_job_id
+        ) VALUES (?, ?, '微信公众号', '旧包账号', ?, 'pending', NULL)
+        """,
+        (project_id, account_id, json.dumps({"publish_job_id": job_id})),
+    )
+
+    db.init_schema()
+
+    package = db.fetch_one("SELECT publish_job_id FROM publish_packages WHERE id = ?", (package_id,))
+    assert package["publish_job_id"] == job_id
+
+
 def test_concurrent_task_execution_claims_generation_once(tmp_path):
     class CountingPublisher(FakePlatformPublisher):
         def __init__(self):
@@ -756,6 +785,7 @@ def test_concurrent_failed_task_retries_claim_once(tmp_path):
     assert sum(result["updated"] for result in results) == 1
     assert publisher.calls == 1
     assert service.db.fetch_one("SELECT COUNT(*) AS count FROM task_runs")["count"] == 2
+    assert service.get_task(task["id"])["status"] == "已生成平台草稿"
 
 
 def test_existing_publish_jobs_rebuilds_same_named_relaxed_result_triggers(tmp_path):

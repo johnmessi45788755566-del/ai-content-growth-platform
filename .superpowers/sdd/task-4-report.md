@@ -91,3 +91,125 @@ python -m compileall -q app tests
 - 任务列表通过与详情相同的公开协调器资源水合关联作业，可直接显示真实状态、平台 ID、失败信息和确认动作。
 - 重复任务处于 `待人工确认` 时 `next_run_at` 为空，run 不写 `finished_at`；恢复成功后才完成 run 并排下次执行。
 - 失败阶段和原因来自公开作业资源，因此沿用协调器的浏览器上下文脱敏。
+
+## 审查修复
+
+- `publish_packages` 新增显式 `publish_job_id`，旧数据从 `payload_json.publish_job_id` 幂等回填。
+- 协调器返回 job 后立即在事务中关联 task/run；package、作品或 autosave 后处理失败时重新读取 job，以平台成功事实终结任务，不进入再次发布路径。
+- 失败任务若已关联 job，会重试或复用同一 job；重复任务进入下一周期时才清空上一代关联并创建新 job。
+- task、run、package 的最终状态在同一事务内提交；恢复写入使用 task 状态、job ID、run ID 和 run 状态 CAS，陈旧恢复不再覆盖新一代。
+- 创建和更新先比较请求平台与账号平台，再执行 V1 微信限制；非微信请求不会被账号静默改写。
+- `execute_due_tasks` 返回实际成功 claim 数；任务详情和列表公开 job 测试显式排除 `resume_context`、`token`、`credentials`、`job_context`。
+
+### RED: 审查问题复现
+
+```bash
+python -m pytest -q tests/test_api.py -k 'platform_account_mismatch or local_postprocessing_failure or stale_resume or roll_back_together or reports_only_successful_claims'
+```
+
+结果：退出码 `1`，`5 failed, 33 deselected, 1 warning in 0.79s`。分别复现平台静默改写、平台成功被本地失败覆盖、陈旧恢复覆盖新代次、分裂提交和 claim 虚报。
+
+```bash
+python -m pytest -q tests/test_content_flow.py::test_existing_publish_package_backfills_publish_job_id_from_payload tests/test_content_flow.py::test_concurrent_failed_task_retries_claim_once
+```
+
+结果：退出码 `1`，`2 failed in 0.24s`。旧 package 未回填 job ID，失败重试调用平台后任务仍停留在 `执行中`。
+
+```bash
+python -m pytest -q tests/test_api.py::test_confirmation_resume_recovers_when_local_package_was_not_created
+```
+
+结果：退出码 `1`，`1 failed, 1 warning in 0.38s`。无本地 package 的等待确认任务恢复时对空 ID 执行 `int(None)`。
+
+### GREEN: 审查覆盖测试
+
+```bash
+python -m pytest -q tests/test_api.py -k 'platform_account_mismatch or local_postprocessing_failure or stale_resume or package_was_not_created or roll_back_together or reports_only_successful_claims or starts_next_generation or task_list_hydrates or waits_for_confirmation'
+```
+
+结果：退出码 `0`，`9 passed, 31 deselected, 1 warning in 0.93s`。
+
+```bash
+python -m pytest -q tests/test_content_flow.py::test_existing_publish_package_backfills_publish_job_id_from_payload tests/test_content_flow.py::test_concurrent_failed_task_retries_claim_once
+```
+
+结果：退出码 `0`，`2 passed in 0.21s`。
+
+### 最终验证
+
+```bash
+python -m pytest -q tests/test_api.py
+```
+
+结果：退出码 `0`，`40 passed, 1 warning in 2.50s`。
+
+```bash
+python -m pytest -q
+```
+
+结果：退出码 `0`，`132 passed, 1 warning in 4.13s`。
+
+```bash
+python -m compileall -q app tests
+```
+
+结果：无输出，退出码 `0`。warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。
+
+### Concern
+
+- 平台已成功但本地后处理失败时，任务会忠实显示平台成功且不会重发；对应作品、autosave 或兼容 package 仍可能缺失，需要后续独立的本地补偿机制修复展示数据，但不能再次调用平台发布。
+
+## 收尾复核
+
+- 复核发现人工确认恢复还有同类窗口：平台恢复成功后，若 task/run/package 本地同步事务失败，job 已进入终态，后续恢复会被协调器拒绝。
+- 服务层现在仅在终态 job 仍关联“待人工确认”任务时重做本地同步；不会再次调用平台。没有待同步任务的终态 job 仍保持原有非法恢复语义。
+
+### RED: 平台成功后恢复本地同步
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_resume_retries_local_sync_without_republishing_after_platform_success -q
+```
+
+结果：退出码 `1`，`1 failed, 1 warning in 0.38s`。第一次恢复已使平台 job 成功，但本地事务被故障注入回滚；第二次恢复因 job 不再是 `awaiting_confirmation` 被拒绝。
+
+### GREEN: 恢复与并发聚焦测试
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_resume_retries_local_sync_without_republishing_after_platform_success -q
+```
+
+结果：退出码 `0`，`1 passed, 1 warning in 0.36s`；两次本地同步尝试只调用了一次平台 resume。
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py -q -k 'waits_for_confirmation or stale_resume or package_was_not_created or roll_back_together or retries_local_sync'
+```
+
+结果：退出码 `0`，`5 passed, 36 deselected, 1 warning in 0.69s`。
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py::test_resume_publish_job_claim_allows_only_one_publisher_call -q
+```
+
+结果：退出码 `0`，`1 passed in 0.17s`。
+
+### 最终指定验证
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+结果：退出码 `0`，`133 passed, 1 warning in 3.34s`。
+
+```bash
+python3 -m compileall -q backend/app
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。
+
+唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。

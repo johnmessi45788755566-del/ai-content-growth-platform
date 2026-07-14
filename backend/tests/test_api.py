@@ -1,4 +1,7 @@
 import json
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -30,6 +33,79 @@ class FakeAIClient:
 
     def generate_image(self, prompt: str, image_type: str):
         return GeneratedImage(filename=f"{image_type}.svg", content=b"<svg></svg>", content_type="image/svg+xml")
+
+
+class FailingImageAIClient(FakeAIClient):
+    def generate_image(self, prompt: str, image_type: str):
+        raise RuntimeError("图片模型账户欠费")
+
+
+class FakeBrowserAuthManager:
+    def __init__(self):
+        self.sessions = {}
+
+    def start(self, platform, account_name, on_success):
+        account = on_success(
+            {
+                "platform": platform,
+                "account_name": account_name or f"{platform}测试账号",
+                "external_id": "real-platform-id",
+                "profile_path": f"/tmp/browser-profiles/{platform}",
+                "login_url": "https://example.com/logged-in",
+            }
+        )
+        session = {
+            "session_id": "fake-session",
+            "platform": platform,
+            "status": "success",
+            "message": "登录成功",
+            "login_url": "https://example.com/login",
+            "account": account,
+            "error": "",
+        }
+        self.sessions["fake-session"] = session
+        return session
+
+    def get_status(self, session_id):
+        return self.sessions[session_id]
+
+    def cancel(self, session_id):
+        self.sessions[session_id]["status"] = "cancelled"
+        return self.sessions[session_id]
+
+    def sync(self, account):
+        return {
+            "source": "browser",
+            "account_name": account["name"],
+            "external_id": account["external_id"],
+            "metrics": {
+                "fans": 321,
+                "reads": 654,
+                "recommends": 21,
+                "likes": 34,
+                "comments": 5,
+                "shares": 8,
+                "favorites": 13,
+            },
+            "works": [
+                {
+                    "title": "真实平台作品",
+                    "content_type": "图文",
+                    "status": "已发布",
+                    "publish_url": "https://example.com/real-work",
+                    "published_at": "2026-07-09 12:00",
+                    "reads": 144,
+                    "recommends": 12,
+                    "likes": 9,
+                    "comments": 2,
+                    "shares": 3,
+                    "favorites": 4,
+                }
+            ],
+        }
+
+    def close_all(self):
+        return None
 
 
 class FakePlatformPublisher:
@@ -64,6 +140,17 @@ class FakePlatformPublisher:
 
     def resume(self, account, job_context):
         raise AssertionError("draft jobs cannot be resumed")
+
+    def cancel(self, account, job_context):
+        return None
+
+
+class FailingPlatformPublisher:
+    def publish(self, payload, account, action):
+        raise RuntimeError("微信接口错误 40164：IP 不在白名单")
+
+    def resume(self, account, job_context):
+        raise RuntimeError("微信接口错误 40164：IP 不在白名单")
 
     def cancel(self, account, job_context):
         return None
@@ -669,6 +756,52 @@ def test_api_content_creation_flow(tmp_path: Path):
     assert drafts_response.json()["drafts"][0]["restore_stage"] == "title"
 
 
+def test_draft_updated_at_is_returned_in_local_time(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    project_id = db.execute(
+        "INSERT INTO content_projects (title, platform, current_stage) VALUES ('时区测试', '微信公众号', 'article')"
+    )
+    db.execute(
+        """
+        INSERT INTO draft_snapshots (project_id, title, platform, stage, restore_stage, snapshot_json, updated_at)
+        VALUES (?, '时区测试', '微信公众号', '文章已完成，待生成图片', 'images', '{}', '2026-07-10 08:30:10')
+        """,
+        (project_id,),
+    )
+    service = ContentService(db=db, ai_client=FakeAIClient(), upload_dir=tmp_path / "uploads")
+
+    drafts = service.list_drafts(start_date="2026-07-10", end_date="2026-07-10")
+
+    assert drafts[0]["updated_at"] == "2026-07-10 16:30:10"
+
+
+def test_legacy_publish_packages_table_gets_updated_at_column(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE publish_packages (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL,
+              platform TEXT NOT NULL,
+              account_name TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending_publish',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO publish_packages (project_id, platform, account_name, payload_json) VALUES (1, '微信公众号', '旧账号', '{}')"
+        )
+
+    db.init_schema()
+
+    columns = {row["name"] for row in db.fetch_all("PRAGMA table_info(publish_packages)")}
+    assert "updated_at" in columns
+
+
 def test_api_task_center_flow(tmp_path: Path):
     app = create_app(
         database_path=tmp_path / "content.db",
@@ -712,7 +845,12 @@ def test_api_task_center_flow(tmp_path: Path):
 
 
 def test_accounts_auth_sync_and_analytics_flow(tmp_path: Path):
-    app = create_app(database_path=tmp_path / "content.db", upload_dir=tmp_path / "uploads", ai_client=FakeAIClient())
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+    )
     client = TestClient(app)
 
     auth_response = client.post(
@@ -720,10 +858,16 @@ def test_accounts_auth_sync_and_analytics_flow(tmp_path: Path):
         json={"platform": "微信公众号", "account_name": "AI记账助手"},
     )
     assert auth_response.status_code == 200
+    assert auth_response.json()["status"] == "success"
+    assert auth_response.json()["session_id"] == "fake-session"
     account = auth_response.json()["account"]
     assert account["platform"] == "微信公众号"
     assert account["auth_status"] == "已授权"
-    assert auth_response.json()["qr_url"]
+    assert account["auth_method"] == "真实浏览器扫码"
+    assert account["profile_path"]
+    assert account["external_id"] == "real-platform-id"
+    assert account["owner"] == "未分配"
+    assert account["tag"] == ""
 
     accounts_response = client.get("/api/accounts", params={"platform": "微信公众号"})
     assert accounts_response.status_code == 200
@@ -732,18 +876,109 @@ def test_accounts_auth_sync_and_analytics_flow(tmp_path: Path):
     sync_response = client.post(f"/api/accounts/{account['id']}/sync")
     assert sync_response.status_code == 200
     assert sync_response.json()["synced"] is True
+    assert sync_response.json()["source"] == "browser"
 
     account_analytics_response = client.get("/api/analytics/accounts", params={"range": "30d"})
     assert account_analytics_response.status_code == 200
     account_rows = account_analytics_response.json()["accounts"]
     assert account_rows[0]["account_name"] == "AI记账助手"
-    assert account_rows[0]["reads"] > 0
+    assert account_rows[0]["fans"] == 321
+    assert account_rows[0]["reads"] == 654
 
     work_analytics_response = client.get("/api/analytics/works", params={"range": "30d"})
     assert work_analytics_response.status_code == 200
     works = work_analytics_response.json()["works"]
     assert works[0]["account_name"] == "AI记账助手"
-    assert works[0]["reads"] > 0
+    assert works[0]["title"] == "真实平台作品"
+    assert works[0]["reads"] == 144
+
+
+def test_publish_package_uses_latest_authorized_account_by_id(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        platform_publisher=publisher,
+    )
+    client = TestClient(app)
+    account = client.post(
+        "/api/accounts/auth/start",
+        json={"platform": "微信公众号", "account_name": "真实授权账号"},
+    ).json()["account"]
+    project = client.post(
+        "/api/content-projects",
+        json={"title": "发布账号绑定测试", "platform": "微信公众号"},
+    ).json()
+    article = client.post(f"/api/content-projects/{project['id']}/generate-article").json()
+    assets = client.post(f"/api/content-projects/{project['id']}/generate-images").json()["assets"]
+    cover = next(asset for asset in assets if asset["asset_type"] == "cover")
+    inline = next(asset for asset in assets if asset["asset_type"] == "inline")
+    client.patch(
+        f"/api/content-projects/{project['id']}/layout",
+        json={
+            "blocks": [
+                {"section_type": "title", "content": project["title"], "media_asset_id": cover["id"], "sort_order": 1},
+                {"section_type": "intro", "content": article["blocks"][0]["content"], "media_asset_id": None, "sort_order": 2},
+                {"section_type": "body", "content": article["blocks"][1]["content"], "media_asset_id": inline["id"], "sort_order": 3},
+            ]
+        },
+    )
+
+    response = client.post(
+        f"/api/content-projects/{project['id']}/publish-package",
+        json={
+            "platform": "微信公众号",
+            "account_id": account["id"],
+            "account_name": "前端缓存的旧账号名",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["account_id"] == account["id"]
+    assert response.json()["account_name"] == "真实授权账号"
+    assert response.json()["status"] == "platform_draft"
+    assert response.json()["platform_draft_id"] == "wechat-draft-media-id"
+    assert publisher.calls[0][1]["id"] == account["id"]
+    assert publisher.calls[0][2] == "draft"
+
+
+def test_task_platform_failure_copies_sanitized_publish_job_failure(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        platform_publisher=PublisherWithSensitiveFailure(),
+    )
+    client = TestClient(app)
+    account = client.post(
+        "/api/accounts/auth/start",
+        json={"platform": "微信公众号", "account_name": "理想说AI"},
+    ).json()["account"]
+    task = client.post(
+        "/api/tasks",
+        json={
+            "platform": "微信公众号",
+            "account_id": account["id"],
+            "account_name": "理想说AI",
+            "execute_time": "2026-07-13 10:13",
+            "task_type": "微信公众号图文生成",
+            "topic": "财务部是公司一笔不小的开支",
+        },
+    ).json()
+
+    app.state.content_service.execute_due_tasks(datetime(2026, 7, 13, 10, 13))
+
+    detail = client.get(f"/api/tasks/{task['id']}").json()
+    assert detail["status"] == "失败"
+    assert detail["failure_stage"] == "发布文章"
+    assert "已隐藏浏览器上下文" in detail["failure_reason"]
+    assert "sensitive-wechat-profile" not in detail["failure_reason"]
+    assert detail["publish_job"]["status"] == "failed"
+    assert detail["publish_package"]["status"] == "failed"
+    assert detail["publish_package"]["platform_draft_id"] == ""
 
 
 def test_task_defaults_to_direct_publish_and_returns_public_publish_job(tmp_path: Path):
@@ -751,6 +986,7 @@ def test_task_defaults_to_direct_publish_and_returns_public_publish_job(tmp_path
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
         platform_publisher=FakePlatformPublisher(),
     )
     client = TestClient(app)
@@ -792,12 +1028,13 @@ def test_task_defaults_to_direct_publish_and_returns_public_publish_job(tmp_path
     assert detail["publish_package"]["account_name"] == "AI记账助手"
 
 
-def test_task_publish_action_can_be_updated_and_rejects_invalid_values(tmp_path: Path):
+def test_task_publish_action_can_be_updated_to_draft_and_rejects_invalid_values(tmp_path: Path):
     app = create_app(
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
         platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
     )
     client = TestClient(app)
     account_id = add_authorized_account(app.state.content_service, "动作测试账号")
@@ -829,6 +1066,39 @@ def test_task_publish_action_can_be_updated_and_rejects_invalid_values(tmp_path:
     assert invalid_update.status_code == 422
 
 
+def test_task_create_and_update_reject_platform_account_mismatch(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "平台一致性账号")
+    payload = {
+        "platform": "微信公众号",
+        "account_id": account_id,
+        "account_name": "平台一致性账号",
+        "execute_time": "2026-07-14 09:30",
+        "task_type": "微信公众号图文生成",
+        "topic": "平台一致性测试",
+    }
+
+    invalid_create = client.post("/api/tasks", json={**payload, "platform": "小红书"})
+    task = client.post("/api/tasks", json=payload).json()
+    invalid_update = client.patch(
+        f"/api/tasks/{task['id']}",
+        json={**payload, "platform": "小红书"},
+    )
+
+    assert invalid_create.status_code == 400
+    assert invalid_update.status_code == 400
+    assert "任务平台与账号平台不一致" in invalid_create.json()["detail"]
+    assert "任务平台与账号平台不一致" in invalid_update.json()["detail"]
+    assert client.get(f"/api/tasks/{task['id']}").json()["platform"] == "微信公众号"
+
+
 def test_task_publishing_rejects_unavailable_platform_on_create_update_and_execute(tmp_path: Path):
     publisher = FakePlatformPublisher()
     app = create_app(
@@ -836,6 +1106,7 @@ def test_task_publishing_rejects_unavailable_platform_on_create_update_and_execu
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
         platform_publisher=publisher,
+        scheduler_enabled=False,
     )
     client = TestClient(app)
     wechat_id = add_authorized_account(app.state.content_service, "可用公众号")
@@ -874,6 +1145,7 @@ def test_task_publishing_rejects_unavailable_platform_on_create_update_and_execu
         "UPDATE scheduled_tasks SET platform = '小红书' WHERE id = ?",
         (task["id"],),
     )
+
     executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
 
     assert invalid_create.status_code == 400
@@ -886,19 +1158,11 @@ def test_task_publishing_rejects_unavailable_platform_on_create_update_and_execu
 
 
 def test_draft_task_remains_distinct_from_direct_publish(tmp_path: Path):
-    publisher = FakePlatformPublisher()
-    app = create_app(
-        database_path=tmp_path / "content.db",
-        upload_dir=tmp_path / "uploads",
-        ai_client=FakeAIClient(),
-        platform_publisher=publisher,
-    )
-    account_id = add_authorized_account(app.state.content_service, "草稿账号")
-    task = app.state.content_service.create_task(
+    service = make_task_service(tmp_path)
+    task = service.create_task(
         {
             "platform": "微信公众号",
-            "account_id": account_id,
-            "account_name": "草稿账号",
+            "account_name": "AI记账助手",
             "execute_time": "2026-07-14 09:30",
             "task_type": "微信公众号图文生成",
             "topic": "只生成平台草稿",
@@ -906,50 +1170,23 @@ def test_draft_task_remains_distinct_from_direct_publish(tmp_path: Path):
         }
     )
 
-    detail = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    detail = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
 
     assert detail["status"] == "已生成平台草稿"
     assert detail["publish_result"] == "已生成平台草稿"
     assert detail["publish_job"]["status"] == "platform_draft"
     assert detail["publish_job"]["action"] == "draft"
     assert detail["runs"][0]["status"] == "已生成平台草稿"
-    assert publisher.calls[0][2] == "draft"
-
-
-def test_task_platform_failure_copies_sanitized_publish_job_failure(tmp_path: Path):
-    app = create_app(
-        database_path=tmp_path / "content.db",
-        upload_dir=tmp_path / "uploads",
-        ai_client=FakeAIClient(),
-        platform_publisher=PublisherWithSensitiveFailure(),
-    )
-    account_id = add_authorized_account(app.state.content_service, "失败账号")
-    task = app.state.content_service.create_task(
-        {
-            "platform": "微信公众号",
-            "account_id": account_id,
-            "account_name": "失败账号",
-            "execute_time": "2026-07-14 09:30",
-            "task_type": "微信公众号图文生成",
-            "topic": "失败脱敏测试",
-        }
-    )
-
-    detail = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
-
-    assert detail["status"] == "失败"
-    assert detail["failure_stage"] == "发布文章"
-    assert "已隐藏浏览器上下文" in detail["failure_reason"]
-    assert "socket-secret" not in detail["failure_reason"]
-    assert detail["publish_job"]["status"] == "failed"
 
 
 def test_repeat_task_waits_for_confirmation_before_scheduling_next_run(tmp_path: Path):
+    publisher = ConfirmationPublisher()
     app = create_app(
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
-        platform_publisher=ConfirmationPublisher(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
     )
     client = TestClient(app)
     account_id = add_authorized_account(app.state.content_service, "人工确认账号")
@@ -970,9 +1207,14 @@ def test_repeat_task_waits_for_confirmation_before_scheduling_next_run(tmp_path:
     waiting = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
 
     assert waiting["status"] == "待人工确认"
+    assert waiting["publish_result"] == "待人工确认"
     assert waiting["next_run_at"] == ""
+    assert waiting["runs"][0]["status"] == "待人工确认"
     assert waiting["runs"][0]["finished_at"] == ""
     assert "sensitive-browser-handle" not in json.dumps(waiting, ensure_ascii=False)
+    public_job_text = json.dumps(waiting["publish_job"], ensure_ascii=False).lower()
+    for private_field in ("resume_context", "token", "credentials", "job_context"):
+        assert private_field not in public_job_text
 
     resumed = client.post(f"/api/publish-jobs/{waiting['publish_job_id']}/resume")
     final_task = client.get(f"/api/tasks/{task['id']}").json()
@@ -992,6 +1234,7 @@ def test_task_list_hydrates_linked_public_publish_job(tmp_path: Path):
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
         platform_publisher=ConfirmationPublisher(),
+        scheduler_enabled=False,
     )
     client = TestClient(app)
     account_id = add_authorized_account(app.state.content_service, "列表发布账号")
@@ -1014,9 +1257,358 @@ def test_task_list_hydrates_linked_public_publish_job(tmp_path: Path):
     listed = response.json()["tasks"][0]
     assert listed["publish_job_id"]
     assert listed["publish_job"]["status"] == "awaiting_confirmation"
-    assert listed["publish_job"]["action"] == "publish"
-    assert "job_context" not in listed["publish_job"].get("response", {})
-    assert "sensitive-browser-handle" not in json.dumps(listed, ensure_ascii=False)
+    assert listed["publish_job"]["requires_confirmation"] is True
+    assert "sensitive-browser-handle" not in response.text
+    public_job_text = json.dumps(listed["publish_job"], ensure_ascii=False).lower()
+    for private_field in ("resume_context", "token", "credentials", "job_context"):
+        assert private_field not in public_job_text
+
+
+def test_platform_success_survives_local_postprocessing_failure_without_republish(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "后处理失败账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "后处理失败账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "平台成功后本地失败",
+        }
+    )
+    original_autosave = service.autosave
+
+    def fail_publish_autosave(project_id, stage="", restore_stage=""):
+        if stage == "publish":
+            raise RuntimeError("forced local postprocessing failure")
+        return original_autosave(project_id, stage=stage, restore_stage=restore_stage)
+
+    service.autosave = fail_publish_autosave
+
+    detail = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    retried = service.retry_failed_tasks([task["id"]])
+
+    assert detail["status"] == "已发布"
+    assert detail["publish_job"]["status"] == "published"
+    assert detail["publish_job_id"]
+    assert detail["runs"][0]["publish_job_id"] == detail["publish_job_id"]
+    assert detail["publish_package"]["publish_job_id"] == detail["publish_job_id"]
+    assert retried["updated"] == 0
+    assert len(publisher.calls) == 1
+
+    service.db.execute("UPDATE scheduled_tasks SET status = '失败' WHERE id = ?", (task["id"],))
+    recovered = service.retry_failed_tasks([task["id"]])
+    recovered_detail = service.get_task(task["id"])
+
+    assert recovered["updated"] == 1
+    assert recovered_detail["status"] == "已发布"
+    assert recovered_detail["publish_job_id"] == detail["publish_job_id"]
+    assert len(publisher.calls) == 1
+
+
+def test_stale_resume_cannot_overwrite_new_task_generation(tmp_path: Path):
+    publisher = ConfirmationPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "陈旧恢复账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "陈旧恢复账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "陈旧恢复不得覆盖",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    old_package_id = waiting["publish_package_id"]
+    entered_finish = threading.Event()
+    release_finish = threading.Event()
+    original_finish = service._finish_task_from_publish_job
+
+    def delayed_finish(*args, **kwargs):
+        entered_finish.set()
+        assert release_finish.wait(timeout=5)
+        return original_finish(*args, **kwargs)
+
+    service._finish_task_from_publish_job = delayed_finish
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        resumed = pool.submit(service.resume_publish_job, waiting["publish_job_id"])
+        assert entered_finish.wait(timeout=5)
+        new_job_id = service.db.execute(
+            """
+            INSERT INTO publish_jobs (project_id, account_id, platform, action, status)
+            VALUES (?, ?, '微信公众号', 'publish', 'pending')
+            """,
+            (waiting["content_project_id"], account_id),
+        )
+        new_run_id = service.db.execute(
+            "INSERT INTO task_runs (task_id, status, started_at, publish_job_id) VALUES (?, '执行中', ?, ?)",
+            (task["id"], "2026-07-14 10:00", new_job_id),
+        )
+        service.db.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = '执行中', publish_result = '', publish_job_id = ?, publish_package_id = NULL
+            WHERE id = ?
+            """,
+            (new_job_id, task["id"]),
+        )
+        release_finish.set()
+        assert resumed.result(timeout=5)["status"] == "published"
+
+    current = service.get_task(task["id"])
+    old_package = service.db.fetch_one("SELECT status FROM publish_packages WHERE id = ?", (old_package_id,))
+    assert current["status"] == "执行中"
+    assert current["publish_job_id"] == new_job_id
+    assert current["runs"][0]["id"] == new_run_id
+    assert current["runs"][0]["status"] == "执行中"
+    assert old_package["status"] == "awaiting_confirmation"
+
+
+def test_confirmation_resume_recovers_when_local_package_was_not_created(tmp_path: Path):
+    publisher = ConfirmationPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "无发布包恢复账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "无发布包恢复账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "无本地发布包也可恢复",
+        }
+    )
+    original_persist = service._persist_publish_package
+
+    def fail_package_persist(project, account, job):
+        raise RuntimeError("forced package insert failure")
+
+    service._persist_publish_package = fail_package_persist
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    service._persist_publish_package = original_persist
+
+    assert waiting["status"] == "待人工确认"
+    assert waiting["publish_job_id"]
+    assert waiting["publish_package_id"] is None
+    assert waiting["runs"][0]["publish_job_id"] == waiting["publish_job_id"]
+
+    resumed = service.resume_publish_job(waiting["publish_job_id"])
+    final_task = service.get_task(task["id"])
+
+    assert resumed["status"] == "published"
+    assert final_task["status"] == "已发布"
+    assert final_task["publish_job_id"] == waiting["publish_job_id"]
+    assert publisher.resume_calls == 1
+
+
+def test_resume_task_package_and_run_statuses_roll_back_together(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=ConfirmationPublisher(),
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "事务回滚账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "事务回滚账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "恢复状态原子提交",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    run_id = waiting["runs"][0]["id"]
+    service.db.execute(
+        f"""
+        CREATE TRIGGER fail_task_run_resume
+        BEFORE UPDATE ON task_runs
+        WHEN OLD.id = {int(run_id)} AND NEW.status = '已发布'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced task run sync failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced task run sync failure"):
+        service.resume_publish_job(waiting["publish_job_id"])
+
+    task_row = service.db.fetch_one("SELECT status FROM scheduled_tasks WHERE id = ?", (task["id"],))
+    run_row = service.db.fetch_one("SELECT status FROM task_runs WHERE id = ?", (run_id,))
+    package_row = service.db.fetch_one(
+        "SELECT status FROM publish_packages WHERE id = ?", (waiting["publish_package_id"],)
+    )
+    assert task_row["status"] == "待人工确认"
+    assert run_row["status"] == "待人工确认"
+    assert package_row["status"] == "awaiting_confirmation"
+
+
+def test_resume_retries_local_sync_without_republishing_after_platform_success(tmp_path: Path):
+    publisher = ConfirmationPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "恢复本地同步账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "恢复本地同步账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "平台成功后重试本地同步",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    run_id = waiting["runs"][0]["id"]
+    service.db.execute(
+        f"""
+        CREATE TRIGGER fail_task_run_resume_once
+        BEFORE UPDATE ON task_runs
+        WHEN OLD.id = {int(run_id)} AND NEW.status = '已发布'
+        BEGIN
+          SELECT RAISE(ABORT, 'forced local resume sync failure');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced local resume sync failure"):
+        service.resume_publish_job(waiting["publish_job_id"])
+
+    service.db.execute("DROP TRIGGER fail_task_run_resume_once")
+    resumed = service.resume_publish_job(waiting["publish_job_id"])
+    final_task = service.get_task(task["id"])
+
+    assert resumed["status"] == "published"
+    assert final_task["status"] == "已发布"
+    assert final_task["runs"][0]["status"] == "已发布"
+    assert final_task["publish_package"]["status"] == "published"
+    assert publisher.resume_calls == 1
+
+
+def test_execute_due_tasks_reports_only_successful_claims(tmp_path: Path):
+    service = make_task_service(tmp_path)
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_name": "AI记账助手",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "并发到期领取计数",
+        }
+    )
+    barrier = threading.Barrier(2)
+    original_claim = service._claim_task_execution
+
+    def synchronized_claim(task_id, started_at):
+        barrier.wait(timeout=5)
+        return original_claim(task_id, started_at)
+
+    service._claim_task_execution = synchronized_claim
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _: service.execute_due_tasks(datetime(2026, 7, 14, 9, 31)),
+                range(2),
+            )
+        )
+
+    assert sorted(result["executed"] for result in results) == [0, 1]
+    assert service.get_task(task["id"])["status"] == "已发布"
+
+
+def test_repeat_task_starts_next_generation_with_a_new_publish_job(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "重复任务代次账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "重复任务代次账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "每天创建新发布作业",
+            "execution_mode": "repeat",
+            "repeat_rule": "daily",
+        }
+    )
+
+    first = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    second_result = service.execute_due_tasks(datetime(2026, 7, 15, 9, 31))
+    second = service.get_task(task["id"])
+
+    assert second_result["executed"] == 1
+    assert second["status"] == "待执行"
+    assert second["publish_job_id"] != first["publish_job_id"]
+    assert len(second["runs"]) == 2
+    assert len(publisher.calls) == 2
+
+
+def test_task_image_failure_keeps_generated_draft_and_reports_exact_stage(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(db=db, ai_client=FailingImageAIClient(), upload_dir=tmp_path / "uploads")
+    add_authorized_account(service, "AI记账助手")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_name": "AI记账助手",
+            "execute_time": "2026-07-11 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "AI记账",
+        }
+    )
+
+    result = service.execute_task(task["id"], datetime(2026, 7, 11, 9, 31))
+
+    assert result["status"] == "失败"
+    assert result["failure_stage"] == "生成图片"
+    assert result["content_project_id"]
+    assert result["content_project"]["current_stage"] == "article"
+    draft = db.fetch_one("SELECT restore_stage FROM draft_snapshots WHERE project_id = ?", (result["content_project_id"],))
+    assert draft and draft["restore_stage"] == "images"
 
 
 def make_task_service(tmp_path: Path) -> ContentService:
@@ -1030,7 +1622,6 @@ def make_task_service(tmp_path: Path) -> ContentService:
     )
     add_authorized_account(service, "AI记账助手")
     add_authorized_account(service, "小微账房")
-    add_authorized_account(service, "老板懂财务")
     return service
 
 
