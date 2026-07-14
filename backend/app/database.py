@@ -333,6 +333,28 @@ class Database:
                       AND publish_packages.publish_job_id IS NOT NULL
                   )
                 """,
+                """
+                UPDATE scheduled_tasks
+                SET publish_job_id = (
+                  SELECT publish_job_id
+                  FROM task_runs
+                  WHERE task_runs.task_id = scheduled_tasks.id
+                  ORDER BY task_runs.id DESC
+                  LIMIT 1
+                )
+                WHERE publish_job_id IS NULL
+                  AND EXISTS (
+                    SELECT 1
+                    FROM task_runs
+                    WHERE task_runs.task_id = scheduled_tasks.id
+                      AND task_runs.publish_job_id IS NOT NULL
+                      AND task_runs.id = (
+                        SELECT MAX(latest_run.id)
+                        FROM task_runs AS latest_run
+                        WHERE latest_run.task_id = scheduled_tasks.id
+                      )
+                  )
+                """,
             ]:
                 with suppress(sqlite3.OperationalError):
                     conn.execute(backfill_sql)

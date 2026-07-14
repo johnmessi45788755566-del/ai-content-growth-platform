@@ -367,3 +367,69 @@ git diff --check
 
 - 平台终态与 SQLite 本地最终化仍无法组成单一分布式事务；当前以持久 job、同 job 恢复、generation CAS 和本地终态重放保证不重发。所有发布测试均使用 fake publisher，未执行真实平台写入。
 - generation 由服务层支持的 PATCH、due 与 retry 路径维护；绕过服务直接更新 `scheduled_tasks` 的外部 SQL 不在并发保证范围内。
+
+## 最新复审剩余阻断项修复
+
+### 修复内容
+
+- publish job 顶层继续使用固定公开字段，`response` 改为严格结构化投影：仅保留平台证据和普通业务回执字段；`receipt` / `platform_receipt` 也只保留显式普通字段。`job_context`、`_attempt_token`、任意未知键和未知嵌套结构不会进入公开资源，保留字符串仍统一执行 URL 查询参数和凭证文本脱敏。
+- 移除依赖不断补充敏感键名的递归 denylist。测试实际注入 `sessiontoken`、`cookieheader`、`clientsecretvalue`、`privatekeypem`、`portnumber` 及对应裸字符串，同时验证 `source`、`event`、`receipt_id`、`title`、`corroboration`、`confirmation`、平台 ID、URL、report/author 和普通 receipt 字段保留。
+- 新增事务内历史关联解析：统一比较 task、最新 run、task/run 所指 package 的非空 `publish_job_id`。唯一关联会按需回填 task 和最新 run；出现多个不同 job 或悬空 job 时 fail closed。
+- 旧库迁移可沿最新 run 或最新 run 的 package 回填 task job；原有 payload JSON 类型及目标 job 存在性检查保持不变。
+- PATCH、失败 retry、手动 execute 和恢复扫描都经过同一历史关联解析。task 链接被清空但 run/package 仍保留终态 job 时，PATCH 返回 `409`，retry/scan 只同步同一 job，不创建新 job、不重复调用 publisher。重复任务仅在上一代 task/run/package 已完整同步成功时清理旧关联并进入新 generation。
+
+### TDD 证据
+
+公开响应白名单 RED：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_public_publish_response_recursively_redacts_sensitive_string_values backend/tests/test_api.py::test_public_publish_job_drops_nested_normalized_secret_keys backend/tests/test_api.py::test_task_list_and_detail_drop_nested_publish_job_secrets -q
+```
+
+结果：退出码 `1`，`3 failed, 1 warning in 0.60s`。未知顶层、未知嵌套和新命名字段仍进入 API。
+
+历史关联 RED：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py::test_existing_task_backfills_publish_job_from_latest_run_or_package backend/tests/test_api.py::test_patch_rejects_publish_job_retained_only_in_history backend/tests/test_api.py::test_retry_recovers_terminal_job_retained_only_in_history backend/tests/test_api.py::test_scan_recovers_terminal_job_retained_only_in_history -q
+```
+
+结果：退出码 `1`，`8 failed, 1 warning in 1.03s`。迁移未回填，PATCH 错误放行，retry 新建 job 2，scan 停留在执行中。
+
+### GREEN 与最终验证
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_public_publish_response_recursively_redacts_sensitive_string_values backend/tests/test_api.py::test_public_publish_job_drops_nested_normalized_secret_keys backend/tests/test_api.py::test_task_list_and_detail_drop_nested_publish_job_secrets -q
+```
+
+结果：退出码 `0`，`3 passed, 1 warning in 0.46s`。
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py::test_existing_task_backfills_publish_job_from_latest_run_or_package backend/tests/test_api.py::test_patch_rejects_publish_job_retained_only_in_history backend/tests/test_api.py::test_retry_recovers_terminal_job_retained_only_in_history backend/tests/test_api.py::test_scan_recovers_terminal_job_retained_only_in_history backend/tests/test_api.py::test_conflicting_task_run_and_package_jobs_fail_closed -q
+```
+
+结果：退出码 `0`，`9 passed, 1 warning in 0.92s`。run-only/package-only 均恢复同一 job；冲突关联 fail closed；publisher 调用与 job 数未增加。
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py backend/tests/test_content_flow.py -q
+```
+
+结果：退出码 `0`，`96 passed, 1 warning in 6.86s`。
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+结果：退出码 `0`，`163 passed, 1 warning in 5.23s`。
+
+```bash
+python3 -m compileall -q backend/app backend/tests
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有发布测试使用 fake publisher，未执行真实平台写入。

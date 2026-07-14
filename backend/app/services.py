@@ -741,12 +741,7 @@ class ContentService:
         self.get_task(task_id)
         normalized = self._normalize_task_payload(payload, force_pending=True)
         with self.db.transaction() as conn:
-            current_row = conn.execute(
-                "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
-            ).fetchone()
-            if current_row is None:
-                raise NotFoundError("任务不存在")
-            current = dict(current_row)
+            current, _, _ = self._resolve_task_publish_job(conn, task_id)
             conflict = current["status"] in {"执行中", "待人工确认"}
             if current.get("publish_job_id"):
                 job_row = conn.execute(
@@ -871,12 +866,10 @@ class ContentService:
         due_at = _format_task_time(current)
         recoverable_tasks = self.db.fetch_all(
             """
-            SELECT scheduled_tasks.id
+            SELECT id
             FROM scheduled_tasks
-            JOIN publish_jobs ON publish_jobs.id = scheduled_tasks.publish_job_id
-            WHERE scheduled_tasks.status = '执行中'
-              AND publish_jobs.status IN ('platform_draft', 'awaiting_confirmation', 'published', 'failed')
-            ORDER BY scheduled_tasks.id ASC
+            WHERE status = '执行中'
+            ORDER BY id ASC
             """
         )
         for task in recoverable_tasks:
@@ -914,24 +907,17 @@ class ContentService:
         return detail
 
     def _recover_task_from_publish_job(self, task_id: int, current: datetime) -> bool:
-        task = self.db.fetch_one(
-            "SELECT * FROM scheduled_tasks WHERE id = ? AND status = '执行中'",
-            (task_id,),
-        )
-        if not task or not task.get("publish_job_id"):
-            return False
-        job = self.get_publish_job(int(task["publish_job_id"]))
+        with self.db.transaction() as conn:
+            task, run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
+            if (
+                task["status"] != "执行中"
+                or publish_job_id is None
+                or run is None
+                or run["status"] != "执行中"
+            ):
+                return False
+        job = self.get_publish_job(publish_job_id)
         if job["status"] not in {"platform_draft", "awaiting_confirmation", "published", "failed"}:
-            return False
-        run = self.db.fetch_one(
-            """
-            SELECT * FROM task_runs
-            WHERE task_id = ? AND publish_job_id = ? AND status = '执行中'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (task_id, job["id"]),
-        )
-        if not run:
             return False
         package = self.db.fetch_one(
             "SELECT id FROM publish_packages WHERE publish_job_id = ? ORDER BY id DESC LIMIT 1",
@@ -1106,29 +1092,80 @@ class ContentService:
         increment_retry: bool = False,
     ) -> int | None:
         status_clause = "status IN ('待执行', '已重试')"
-        params: list[Any] = [started_at, int(increment_retry), task_id]
+        where_params: list[Any] = []
         if expected_status is not None:
             status_clause = "status = ?"
-            params.append(expected_status)
+            where_params.append(expected_status)
         generation_clause = ""
         if expected_generation is not None:
             generation_clause = " AND generation = ?"
-            params.append(expected_generation)
-        with self.db.connect() as conn:
+            where_params.append(expected_generation)
+        with self.db.transaction() as conn:
+            task, latest_run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
+            clear_previous_generation = publish_job_id is None
+            if (
+                task["status"] == "待执行"
+                and task["execution_mode"] == "repeat"
+                and task["next_run_at"]
+                and publish_job_id is not None
+                and latest_run is not None
+            ):
+                job_row = conn.execute(
+                    "SELECT status FROM publish_jobs WHERE id = ?", (publish_job_id,)
+                ).fetchone()
+                job_status = str(job_row["status"]) if job_row else ""
+                expected_run_status = {
+                    "published": "已发布",
+                    "platform_draft": "已生成平台草稿",
+                }.get(job_status)
+                package_ids = {
+                    int(package_id)
+                    for package_id in (
+                        task.get("publish_package_id"),
+                        latest_run.get("publish_package_id"),
+                    )
+                    if package_id is not None
+                }
+                package_synchronized = any(
+                    (
+                        package_row := conn.execute(
+                            "SELECT status, publish_job_id FROM publish_packages WHERE id = ?",
+                            (package_id,),
+                        ).fetchone()
+                    )
+                    and package_row["status"] == job_status
+                    and package_row["publish_job_id"] == publish_job_id
+                    for package_id in package_ids
+                )
+                clear_previous_generation = bool(
+                    expected_run_status
+                    and latest_run["status"] == expected_run_status
+                    and package_synchronized
+                )
+            clear_previous = int(clear_previous_generation)
             cursor = conn.execute(
                 f"""
                 UPDATE scheduled_tasks
                 SET status = '执行中', last_run_at = ?, next_run_at = '',
-                    publish_result = CASE WHEN status = '待执行' THEN '' ELSE publish_result END,
-                    content_project_id = CASE WHEN status = '待执行' THEN NULL ELSE content_project_id END,
-                    publish_package_id = CASE WHEN status = '待执行' THEN NULL ELSE publish_package_id END,
-                    publish_job_id = CASE WHEN status = '待执行' THEN NULL ELSE publish_job_id END,
+                    publish_result = CASE WHEN status = '待执行' AND ? THEN '' ELSE publish_result END,
+                    content_project_id = CASE WHEN status = '待执行' AND ? THEN NULL ELSE content_project_id END,
+                    publish_package_id = CASE WHEN status = '待执行' AND ? THEN NULL ELSE publish_package_id END,
+                    publish_job_id = CASE WHEN status = '待执行' AND ? THEN NULL ELSE publish_job_id END,
                     retry_count = retry_count + ?, generation = generation + 1,
                     failure_stage = '', failure_reason = '',
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND {status_clause}{generation_clause}
                 """,
-                tuple(params),
+                (
+                    started_at,
+                    clear_previous,
+                    clear_previous,
+                    clear_previous,
+                    clear_previous,
+                    int(increment_retry),
+                    task_id,
+                    *where_params,
+                ),
             )
             if cursor.rowcount != 1:
                 return None
@@ -1136,8 +1173,71 @@ class ContentService:
                 "INSERT INTO task_runs (task_id, status, started_at) VALUES (?, '执行中', ?)",
                 (task_id, started_at),
             ).lastrowid
-            conn.commit()
             return int(run_id)
+
+    def _resolve_task_publish_job(
+        self, conn: Any, task_id: int
+    ) -> tuple[dict[str, Any], dict[str, Any] | None, int | None]:
+        task_row = conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task_row is None:
+            raise NotFoundError("任务不存在")
+        task = dict(task_row)
+        latest_run_row = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        latest_run = dict(latest_run_row) if latest_run_row else None
+        candidates = {
+            int(job_id)
+            for job_id in (
+                task.get("publish_job_id"),
+                latest_run.get("publish_job_id") if latest_run else None,
+            )
+            if job_id is not None
+        }
+        package_ids = {
+            int(package_id)
+            for package_id in (
+                task.get("publish_package_id"),
+                latest_run.get("publish_package_id") if latest_run else None,
+            )
+            if package_id is not None
+        }
+        for package_id in package_ids:
+            package_row = conn.execute(
+                "SELECT publish_job_id FROM publish_packages WHERE id = ?",
+                (package_id,),
+            ).fetchone()
+            if package_row and package_row["publish_job_id"] is not None:
+                candidates.add(int(package_row["publish_job_id"]))
+        if len(candidates) > 1:
+            raise TaskConflictError("任务存在相互冲突的历史发布作业关联")
+        publish_job_id = next(iter(candidates), None)
+        if publish_job_id is None:
+            return task, latest_run, None
+        if conn.execute(
+            "SELECT 1 FROM publish_jobs WHERE id = ?", (publish_job_id,)
+        ).fetchone() is None:
+            raise TaskConflictError("任务关联的历史发布作业不存在")
+        if task.get("publish_job_id") is None:
+            conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET publish_job_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND publish_job_id IS NULL
+                """,
+                (publish_job_id, task_id),
+            )
+            task["publish_job_id"] = publish_job_id
+        if latest_run is not None and latest_run.get("publish_job_id") is None:
+            conn.execute(
+                "UPDATE task_runs SET publish_job_id = ? WHERE id = ? AND publish_job_id IS NULL",
+                (publish_job_id, latest_run["id"]),
+            )
+            latest_run["publish_job_id"] = publish_job_id
+        return task, latest_run, publish_job_id
 
     def _link_task_publish_job(
         self,

@@ -731,6 +731,85 @@ def test_publish_package_backfill_ignores_deleted_or_non_integer_job_ids(tmp_pat
     )["publish_job_id"] is None
 
 
+@pytest.mark.parametrize("source", ["run", "package"])
+def test_existing_task_backfills_publish_job_from_latest_run_or_package(
+    tmp_path, source
+):
+    db = Database(tmp_path / f"legacy-{source}-task-link.db")
+    db.init_schema()
+    account_id = db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '历史关联账号', '已授权')"
+    )
+    project_id = db.execute(
+        "INSERT INTO content_projects (title, platform) VALUES ('历史关联项目', '微信公众号')"
+    )
+    job_id = db.execute(
+        """
+        INSERT INTO publish_jobs (
+          project_id, account_id, platform, action, status,
+          platform_publish_id, platform_url, response_json
+        ) VALUES (?, ?, '微信公众号', 'publish', 'published', ?, ?, ?)
+        """,
+        (
+            project_id,
+            account_id,
+            "historical-publish-id",
+            "https://mp.weixin.qq.com/s/historical-publish-id",
+            json.dumps(
+                {
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "historical-publish-id",
+                    "corroboration": "publish_success",
+                }
+            ),
+        ),
+    )
+    package_id = db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status,
+          publish_job_id
+        ) VALUES (?, ?, '微信公众号', '历史关联账号', '{}', 'published', ?)
+        """,
+        (project_id, account_id, job_id if source == "package" else None),
+    )
+    task_id = db.execute(
+        """
+        INSERT INTO scheduled_tasks (
+          platform, account_id, account_name, execute_time, task_type, topic,
+          status, content_project_id, publish_package_id, publish_job_id
+        ) VALUES ('微信公众号', ?, '历史关联账号', '2026-07-14 09:30',
+                  '微信公众号图文生成', '历史关联迁移', '失败', ?, NULL, NULL)
+        """,
+        (account_id, project_id),
+    )
+    run_id = db.execute(
+        """
+        INSERT INTO task_runs (
+          task_id, status, started_at, finished_at, content_project_id,
+          publish_package_id, publish_job_id
+        ) VALUES (?, '失败', '2026-07-14 09:30', '2026-07-14 09:31', ?, ?, ?)
+        """,
+        (
+            task_id,
+            project_id,
+            package_id if source == "package" else None,
+            job_id if source == "run" else None,
+        ),
+    )
+
+    db.init_schema()
+    db.init_schema()
+
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM scheduled_tasks WHERE id = ?", (task_id,)
+    )["publish_job_id"] == job_id
+    assert db.fetch_one(
+        "SELECT publish_job_id FROM task_runs WHERE id = ?", (run_id,)
+    )["publish_job_id"] == job_id
+
+
 def test_legacy_task_links_backfill_through_package_and_retry_reuses_job(tmp_path):
     class UnexpectedPublisher(FakePlatformPublisher):
         def __init__(self):

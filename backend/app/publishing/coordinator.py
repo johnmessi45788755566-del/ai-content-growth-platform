@@ -34,17 +34,6 @@ SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
     r"\s*(?::|=|\s)\s*"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
 )
-SUSPICIOUS_RAW_VALUE_PATTERN = re.compile(
-    r"(?ix)(?<![a-z0-9])(?:"
-    r"storage[_ -]?state|verification[_ -]?code|private[_ -]?key|"
-    r"client[_ -]?secret|api[_ -]?token|cookie[_ -]?jar|"
-    r"profile[_ -]?(?:dir|path)|debug[_ -]?(?:info|port)|"
-    r"resume(?:[_ -]?(?:context|handle))?|"
-    r"auth(?:orization)?(?:[_ -]?(?:context|header))?|"
-    r"session(?:[_ -]?(?:id|cache|state))?|"
-    r"(?:remote[_ -]?debugging[_ -]?)?port(?:[_ -]?binding)?"
-    r")(?![a-z0-9])"
-)
 LOCAL_DEBUG_ADDRESS_PATTERN = re.compile(
     r"(?i)\b(?:localhost|127\.0\.0\.1|\[?::1\]?):\d{2,5}\b"
 )
@@ -64,55 +53,38 @@ PUBLIC_JOB_FIELDS = (
     "created_at",
     "updated_at",
 )
-SENSITIVE_KEY_TOKENS = {
-    "auth",
-    "authorization",
-    "bearer",
-    "cdp",
-    "code",
-    "cookie",
-    "cookies",
-    "credential",
-    "credentials",
-    "debug",
-    "key",
-    "passwd",
-    "password",
-    "port",
-    "profile",
-    "resume",
-    "secret",
-    "session",
-    "state",
-    "token",
-}
-SENSITIVE_COMPACT_KEYS = {
-    "accesstoken",
-    "apitoken",
-    "apikey",
-    "authcontext",
-    "browsercontext",
-    "clientsecret",
-    "cookiejar",
-    "cdpurl",
-    "debuginfo",
-    "debugport",
-    "debuggerurl",
-    "jobcontext",
-    "portbinding",
-    "privatekey",
-    "profiledir",
-    "profilepath",
-    "refreshtoken",
-    "resumecontext",
-    "resumehandle",
-    "sessioncache",
-    "sessionid",
-    "storagestate",
-    "verificationcode",
-    "websocketdebuggerurl",
-    "websocketurl",
-}
+PUBLIC_RESPONSE_FIELDS = (
+    "source",
+    "event",
+    "receipt_id",
+    "title",
+    "corroboration",
+    "confirmation",
+    "delivery_status",
+    "request_id",
+    "platform_draft_id",
+    "publish_id",
+    "url",
+    "report_id",
+    "author_name",
+)
+PUBLIC_RECEIPT_FIELDS = (
+    "id",
+    "source",
+    "event",
+    "receipt_id",
+    "title",
+    "corroboration",
+    "confirmation",
+    "delivery_status",
+    "request_id",
+    "platform_draft_id",
+    "publish_id",
+    "url",
+    "report_id",
+    "author_name",
+)
+PUBLIC_RECEIPT_CONTAINERS = ("platform_receipt", "receipt")
 
 
 class PublishCoordinator:
@@ -387,19 +359,12 @@ class PublishCoordinator:
             response = json.loads(str(job.get("response_json") or "{}"))
         except json.JSONDecodeError:
             response = {}
-        resource = {
-            key: job[key]
-            for key in PUBLIC_JOB_FIELDS
-            if key in job
-        }
+        resource = {key: job[key] for key in PUBLIC_JOB_FIELDS if key in job}
         resource["requires_confirmation"] = bool(resource["requires_confirmation"])
-        resource["failure_reason"] = self._redact_sensitive_text(
-            job, str(resource["failure_reason"])
-        )
-        resource["platform_url"] = self._redact_sensitive_text(
-            job, str(resource["platform_url"])
-        )
-        resource["response"] = self._redact_browser_context(job, response)
+        for key, value in resource.items():
+            if isinstance(value, str):
+                resource[key] = self._redact_sensitive_text(job, value)
+        resource["response"] = self._project_public_response(job, response)
         return resource
 
     def _redact_sensitive_text(self, job: Mapping[str, Any], value: str) -> str:
@@ -443,31 +408,36 @@ class PublishCoordinator:
             return [item for nested in value for item in cls._string_values(nested)]
         return [value] if isinstance(value, str) else []
 
-    def _redact_browser_context(self, job: Mapping[str, Any], value: Any) -> Any:
-        if isinstance(value, Mapping):
-            return {
-                key: self._redact_browser_context(job, item)
-                for key, item in value.items()
-                if not self._is_sensitive_key(key)
-            }
-        if isinstance(value, list):
-            return [self._redact_browser_context(job, item) for item in value]
-        if isinstance(value, str):
-            if SUSPICIOUS_RAW_VALUE_PATTERN.search(value):
-                return REDACTED_BROWSER_CONTEXT
-            return self._redact_sensitive_text(job, value)
-        return value
-
-    @staticmethod
-    def _is_sensitive_key(key: Any) -> bool:
-        value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
-        tokens = {
-            token
-            for token in re.split(r"[^a-z0-9]+", value.lower())
-            if token
+    def _project_public_response(
+        self, job: Mapping[str, Any], response: Any
+    ) -> dict[str, Any]:
+        if not isinstance(response, Mapping):
+            return {}
+        projected = {
+            key: self._redact_sensitive_text(job, value) if isinstance(value, str) else value
+            for key in PUBLIC_RESPONSE_FIELDS
+            if key in response
+            and (
+                (value := response[key]) is None
+                or isinstance(value, (str, int, float, bool))
+            )
         }
-        compact = re.sub(r"[^a-z0-9]", "", value.lower())
-        return bool(tokens & SENSITIVE_KEY_TOKENS) or compact in SENSITIVE_COMPACT_KEYS
+        for container in PUBLIC_RECEIPT_CONTAINERS:
+            receipt = response.get(container)
+            if not isinstance(receipt, Mapping):
+                continue
+            projected[container] = {
+                key: self._redact_sensitive_text(job, value)
+                if isinstance(value, str)
+                else value
+                for key in PUBLIC_RECEIPT_FIELDS
+                if key in receipt
+                and (
+                    (value := receipt[key]) is None
+                    or isinstance(value, (str, int, float, bool))
+                )
+            }
+        return projected
 
 
 __all__ = ["PublishCoordinator", "PublishJobValidationError"]

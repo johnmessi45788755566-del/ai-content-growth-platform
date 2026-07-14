@@ -12,7 +12,7 @@ from app.ai import GeneratedImage, TopicRecommendation
 from app.database import Database
 from app.main import create_app
 from app.publishing.wechat import PublishResult
-from app.services import ContentService
+from app.services import ContentService, TaskConflictError
 
 
 class FakeAIClient:
@@ -163,6 +163,73 @@ def add_authorized_account(service, name: str, platform: str = "微信公众号"
     )
 
 
+def leave_task_publish_job_in_history(service, detail, source: str, status: str) -> None:
+    job_id = detail["publish_job_id"]
+    package_id = detail["publish_package_id"]
+    run_id = detail["runs"][0]["id"]
+    with service.db.transaction() as conn:
+        conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = ?, publish_job_id = NULL, publish_package_id = NULL
+            WHERE id = ?
+            """,
+            (status, detail["id"]),
+        )
+        conn.execute(
+            """
+            UPDATE task_runs
+            SET status = ?, finished_at = CASE WHEN ? = '执行中' THEN '' ELSE finished_at END,
+                publish_job_id = ?, publish_package_id = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                status,
+                job_id if source == "run" else None,
+                package_id if source == "package" else None,
+                run_id,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE publish_packages
+            SET status = 'pending_publish', publish_job_id = ?
+            WHERE id = ?
+            """,
+            (job_id if source == "package" else None, package_id),
+        )
+
+
+def prepare_task_with_historical_publish_link(
+    tmp_path: Path, source: str, status: str, name: str
+):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / f"historical-{name}-{source}.db",
+        upload_dir=tmp_path / f"uploads-{name}-{source}",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, f"历史关联-{name}-{source}")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": f"历史关联-{name}-{source}",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "历史发布作业必须原位恢复",
+        }
+    )
+    finished = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    leave_task_publish_job_in_history(service, finished, source, status)
+    return client, service, publisher, account_id, finished
+
+
 class PublisherWithoutReceipt(FakePlatformPublisher):
     def publish(self, payload, account, action):
         return PublishResult(status="platform_draft")
@@ -289,6 +356,16 @@ class PublisherWithNestedSecretKeys(FakePlatformPublisher):
         "compact-storage-state-secret",
         "compact-verification-code-secret",
         "compact-private-key-secret",
+        "sessiontoken-value-secret",
+        "cookieheader-value-secret",
+        "clientsecretvalue-value-secret",
+        "privatekeypem-value-secret",
+        "portnumber-value-secret",
+        "raw-sessiontoken-secret",
+        "raw-cookieheader-secret",
+        "raw-clientsecretvalue-secret",
+        "raw-privatekeypem-secret",
+        "raw-portnumber-secret",
     )
 
     def publish(self, payload, account, action):
@@ -300,17 +377,37 @@ class PublisherWithNestedSecretKeys(FakePlatformPublisher):
                 "source": "wechat_platform",
                 "event": "article_published",
                 "receipt_id": "nested-secret-publish-id",
+                "title": "ordinary-title",
                 "corroboration": "publish_success",
+                "confirmation": "accepted",
+                "delivery_status": "delivered",
+                "request_id": "ordinary-request-id",
                 "platform_receipt": {
                     "delivery_status": "accepted",
                     "request_id": "ordinary-platform-receipt",
+                    "cookieheader": self.secret_values[34],
                 },
                 "platform_draft_id": "ordinary-platform-draft-id",
                 "publish_id": "ordinary-publish-id",
-                "url": "https://mp.weixin.qq.com/s/ordinary-publish-id",
-                "receipt": {"request_id": "ordinary-receipt-id"},
+                "url": (
+                    "https://mp.weixin.qq.com/s/ordinary-publish-id"
+                    f"?sessiontoken={self.secret_values[38]}#private"
+                ),
+                "receipt": {
+                    "id": "ordinary-receipt-id",
+                    "source": "api",
+                    "title": "ordinary-receipt-title",
+                    "request_id": "ordinary-receipt-request-id",
+                    "clientsecretvalue": self.secret_values[35],
+                },
                 "report_id": "ordinary-report-id",
                 "author_name": "ordinary-author-name",
+                "sessiontoken": self.secret_values[33],
+                "unknown_credentials": {
+                    "clientsecretvalue": self.secret_values[35],
+                    "privatekeypem": self.secret_values[36],
+                    "portnumber": self.secret_values[37],
+                },
                 "nested": [
                     {
                         "resume_context": {"handle": self.secret_values[0]},
@@ -359,6 +456,11 @@ class PublisherWithNestedSecretKeys(FakePlatformPublisher):
                     f"client_secret={self.secret_values[27]}",
                     f"api_token={self.secret_values[28]}",
                     f"session-cache {self.secret_values[29]}",
+                    f"sessiontoken={self.secret_values[38]}",
+                    f"cookieheader={self.secret_values[39]}",
+                    f"clientsecretvalue={self.secret_values[40]}",
+                    f"privatekeypem={self.secret_values[41]}",
+                    f"portnumber={self.secret_values[42]}",
                 ],
             },
         )
@@ -640,8 +742,10 @@ def test_public_publish_response_recursively_redacts_sensitive_string_values(tmp
     for secret in forbidden:
         assert secret not in created.text
         assert secret not in fetched.text
-    assert "message" in created.json()["response"]
-    assert "detail" in created.json()["response"]
+    assert created.json()["response"] == {
+        "source": "wechat_platform",
+        "event": "operator_confirmation_required",
+    }
 
 
 def test_public_publish_job_drops_nested_normalized_secret_keys(tmp_path: Path):
@@ -663,23 +767,31 @@ def test_public_publish_job_drops_nested_normalized_secret_keys(tmp_path: Path):
         assert secret in private_response
     for response in (created, fetched):
         public_job = response.json()
-        assert public_job["response"]["platform_receipt"] == {
-            "delivery_status": "accepted",
-            "request_id": "ordinary-platform-receipt",
+        assert public_job["response"] == {
+            "source": "wechat_platform",
+            "event": "article_published",
+            "receipt_id": "nested-secret-publish-id",
+            "title": "ordinary-title",
+            "corroboration": "publish_success",
+            "confirmation": "accepted",
+            "delivery_status": "delivered",
+            "request_id": "ordinary-request-id",
+            "platform_receipt": {
+                "delivery_status": "accepted",
+                "request_id": "ordinary-platform-receipt",
+            },
+            "platform_draft_id": "ordinary-platform-draft-id",
+            "publish_id": "ordinary-publish-id",
+            "url": "https://mp.weixin.qq.com/s/ordinary-publish-id",
+            "receipt": {
+                "id": "ordinary-receipt-id",
+                "source": "api",
+                "title": "ordinary-receipt-title",
+                "request_id": "ordinary-receipt-request-id",
+            },
+            "report_id": "ordinary-report-id",
+            "author_name": "ordinary-author-name",
         }
-        assert public_job["response"]["platform_draft_id"] == "ordinary-platform-draft-id"
-        assert public_job["response"]["publish_id"] == "ordinary-publish-id"
-        assert public_job["response"]["url"] == "https://mp.weixin.qq.com/s/ordinary-publish-id"
-        assert public_job["response"]["receipt"] == {"request_id": "ordinary-receipt-id"}
-        assert public_job["response"]["report_id"] == "ordinary-report-id"
-        assert public_job["response"]["author_name"] == "ordinary-author-name"
-        assert public_job["response"]["nested"] == [{}, {}, {}, {}, {}, {}]
-        assert public_job["response"]["raw_values"] == [
-            "[已隐藏浏览器上下文]",
-            "[已隐藏浏览器上下文]",
-            "[已隐藏浏览器上下文]",
-            "[已隐藏浏览器上下文]",
-        ]
         for secret in publisher.secret_values:
             assert secret not in response.text
 
@@ -1773,17 +1885,31 @@ def test_task_list_and_detail_drop_nested_publish_job_secrets(tmp_path: Path):
         (listed, listed.json()["tasks"][0]["publish_job"]),
         (detail, detail.json()["publish_job"]),
     ):
-        assert public_job["response"]["platform_receipt"] == {
-            "delivery_status": "accepted",
-            "request_id": "ordinary-platform-receipt",
+        assert public_job["response"] == {
+            "source": "wechat_platform",
+            "event": "article_published",
+            "receipt_id": "nested-secret-publish-id",
+            "title": "ordinary-title",
+            "corroboration": "publish_success",
+            "confirmation": "accepted",
+            "delivery_status": "delivered",
+            "request_id": "ordinary-request-id",
+            "platform_receipt": {
+                "delivery_status": "accepted",
+                "request_id": "ordinary-platform-receipt",
+            },
+            "platform_draft_id": "ordinary-platform-draft-id",
+            "publish_id": "ordinary-publish-id",
+            "url": "https://mp.weixin.qq.com/s/ordinary-publish-id",
+            "receipt": {
+                "id": "ordinary-receipt-id",
+                "source": "api",
+                "title": "ordinary-receipt-title",
+                "request_id": "ordinary-receipt-request-id",
+            },
+            "report_id": "ordinary-report-id",
+            "author_name": "ordinary-author-name",
         }
-        assert public_job["response"]["platform_draft_id"] == "ordinary-platform-draft-id"
-        assert public_job["response"]["publish_id"] == "ordinary-publish-id"
-        assert public_job["response"]["url"] == "https://mp.weixin.qq.com/s/ordinary-publish-id"
-        assert public_job["response"]["receipt"] == {"request_id": "ordinary-receipt-id"}
-        assert public_job["response"]["report_id"] == "ordinary-report-id"
-        assert public_job["response"]["author_name"] == "ordinary-author-name"
-        assert public_job["response"]["nested"] == [{}, {}, {}, {}, {}, {}]
         for secret in publisher.secret_values:
             assert secret not in response.text
 
@@ -2488,6 +2614,97 @@ def test_linked_job_retry_and_patch_keep_same_generation_and_job(tmp_path: Path)
     assert final["publish_job_id"] == original_job_id
     assert len(publisher.calls) == 2
     assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
+@pytest.mark.parametrize("source", ["run", "package"])
+def test_patch_rejects_publish_job_retained_only_in_history(tmp_path: Path, source: str):
+    client, service, publisher, account_id, finished = (
+        prepare_task_with_historical_publish_link(
+            tmp_path, source, "失败", "patch"
+        )
+    )
+
+    response = client.patch(
+        f"/api/tasks/{finished['id']}",
+        json={
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": f"历史关联-patch-{source}",
+            "execute_time": "2026-07-15 10:00",
+            "task_type": "微信公众号图文生成",
+            "topic": "不得覆盖历史发布作业",
+        },
+    )
+
+    unchanged = service.get_task(finished["id"])
+    assert response.status_code == 409
+    assert unchanged["topic"] == "历史发布作业必须原位恢复"
+    assert len(publisher.calls) == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
+@pytest.mark.parametrize("source", ["run", "package"])
+def test_retry_recovers_terminal_job_retained_only_in_history(
+    tmp_path: Path, source: str
+):
+    _, service, publisher, _, finished = prepare_task_with_historical_publish_link(
+        tmp_path, source, "失败", "retry"
+    )
+
+    result = service.retry_failed_tasks([finished["id"]])
+    recovered = service.get_task(finished["id"])
+
+    assert result["updated"] == 1
+    assert recovered["status"] == "已发布"
+    assert recovered["publish_job_id"] == finished["publish_job_id"]
+    assert len(publisher.calls) == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
+@pytest.mark.parametrize("source", ["run", "package"])
+def test_scan_recovers_terminal_job_retained_only_in_history(
+    tmp_path: Path, source: str
+):
+    _, service, publisher, _, finished = prepare_task_with_historical_publish_link(
+        tmp_path, source, "执行中", "scan"
+    )
+
+    result = service.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
+    recovered = service.get_task(finished["id"])
+
+    assert result["executed"] == 0
+    assert recovered["status"] == "已发布"
+    assert recovered["publish_job_id"] == finished["publish_job_id"]
+    assert len(publisher.calls) == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
+def test_conflicting_task_run_and_package_jobs_fail_closed(tmp_path: Path):
+    _, service, publisher, account_id, finished = prepare_task_with_historical_publish_link(
+        tmp_path, "package", "失败", "conflict"
+    )
+    conflicting_job_id = service.db.execute(
+        """
+        INSERT INTO publish_jobs (project_id, account_id, platform, action, status)
+        VALUES (?, ?, '微信公众号', 'publish', 'pending')
+        """,
+        (finished["content_project_id"], account_id),
+    )
+    service.db.execute(
+        "UPDATE task_runs SET publish_job_id = ? WHERE id = ?",
+        (conflicting_job_id, finished["runs"][0]["id"]),
+    )
+
+    with pytest.raises(TaskConflictError, match="相互冲突"):
+        service.retry_failed_tasks([finished["id"]])
+
+    unchanged = service.db.fetch_one(
+        "SELECT status, publish_job_id FROM scheduled_tasks WHERE id = ?",
+        (finished["id"],),
+    )
+    assert unchanged == {"status": "失败", "publish_job_id": None}
+    assert len(publisher.calls) == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 2
 
 
 def test_repeat_task_starts_next_generation_with_a_new_publish_job(tmp_path: Path):
