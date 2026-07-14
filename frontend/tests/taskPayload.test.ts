@@ -15,6 +15,7 @@ describe('buildTaskPayload', () => {
 
     expect(payload.execute_time).toBe('2026-07-09 10:48');
     expect(payload.execution_mode).toBe('once');
+    expect(payload.publish_action).toBe('publish');
   });
 
   it('keeps repeat task execution as time only', () => {
@@ -24,6 +25,7 @@ describe('buildTaskPayload', () => {
       topic: 'AI记账',
       articleRequirements: '面向小微企业老板',
       taskType: '微信公众号图文生成',
+      publishAction: 'draft',
       executionMode: 'repeat',
       repeatRule: 'weekly',
       weeklyDay: 2,
@@ -34,5 +36,6 @@ describe('buildTaskPayload', () => {
     expect(payload.repeat_rule).toBe('weekly');
     expect(payload.weekly_day).toBe(2);
     expect(payload.article_requirements).toBe('面向小微企业老板');
+    expect(payload.publish_action).toBe('draft');
   });
 });

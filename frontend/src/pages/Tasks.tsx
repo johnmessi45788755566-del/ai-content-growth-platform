@@ -3,7 +3,7 @@ import dayjs from 'dayjs';
 import { useEffect, useMemo, useState } from 'react';
 import { Detail, Platform, Status } from '@/components/Common';
 import { api } from '@/services/api';
-import type { PlatformAccount, ScheduledTask } from '@/types';
+import type { PlatformAccount, PublishJobStatus, ScheduledTask } from '@/types';
 import { buildTaskPayload } from '@/utils/taskPayload';
 
 const taskTypeOptions = [
@@ -15,10 +15,27 @@ const taskTypeOptions = [
 
 const platformOptions = ['', '微信公众号', '视频号', '小红书', '抖音'];
 
+const publishJobStatusLabels: Record<PublishJobStatus, string> = {
+  pending: '等待处理',
+  checking_login: '检查登录状态',
+  uploading_assets: '上传素材',
+  filling_content: '填写内容',
+  platform_draft: '已生成平台草稿',
+  publishing: '发布中',
+  awaiting_confirmation: '待人工确认',
+  published: '已发布',
+  failed: '失败',
+};
+
+function publishActionLabel(action?: string) {
+  return action === 'draft' ? '同步到平台草稿箱' : '一键发布';
+}
+
 function taskInitialValues(task?: ScheduledTask | null) {
   if (!task) {
     return {
       task_type: '微信公众号图文生成',
+      publish_action: 'publish',
       execution_mode: 'once',
       repeat_rule: 'daily',
       weekly_day: 1,
@@ -29,6 +46,7 @@ function taskInitialValues(task?: ScheduledTask | null) {
     topic: task.topic,
     article_requirements: task.article_requirements,
     task_type: task.task_type,
+    publish_action: task.publish_action || 'publish',
     execution_mode: task.execution_mode || 'once',
     repeat_rule: task.repeat_rule || 'daily',
     weekly_day: task.weekly_day ?? 1,
@@ -51,9 +69,11 @@ export default function Tasks() {
   const [retryMode, setRetryMode] = useState(false);
   const [selectedRetryIds, setSelectedRetryIds] = useState<number[]>([]);
   const [loadError, setLoadError] = useState('');
+  const [accountsLoading, setAccountsLoading] = useState(false);
+  const [resumingJobId, setResumingJobId] = useState<number | null>(null);
 
-  async function loadTasks() {
-    setLoading(true);
+  async function loadTasks(silent = false) {
+    if (!silent) setLoading(true);
     try {
       const params = new URLSearchParams();
       if (status) params.set('status', status);
@@ -67,17 +87,23 @@ export default function Tasks() {
       setLoadError(text);
       message.error(text);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
   async function loadAccounts() {
+    setAccountsLoading(true);
     try {
-      const params = new URLSearchParams({ auth_status: '已授权' });
+      const params = new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' });
       const data = await api.accounts(params);
-      setAccounts(data.accounts || []);
+      const authorizedAccounts = (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
+      setAccounts(authorizedAccounts);
+      return authorizedAccounts;
     } catch (error) {
       message.error(error instanceof Error ? error.message : '读取账号失败');
+      return [];
+    } finally {
+      setAccountsLoading(false);
     }
   }
 
@@ -87,9 +113,12 @@ export default function Tasks() {
 
   useEffect(() => {
     loadTasks();
+    const timer = window.setInterval(() => loadTasks(true), 10_000);
+    return () => window.clearInterval(timer);
   }, [status, platform]);
 
-  function openForm(task?: ScheduledTask) {
+  async function openForm(task?: ScheduledTask) {
+    await loadAccounts();
     setEditingTask(task || null);
     form.setFieldsValue(taskInitialValues(task));
     setDrawerOpen(true);
@@ -117,6 +146,7 @@ export default function Tasks() {
       topic: values.topic,
       articleRequirements: values.article_requirements,
       taskType: values.task_type,
+      publishAction: values.publish_action,
       executionMode,
       repeatRule: values.repeat_rule,
       weeklyDay: values.weekly_day,
@@ -127,6 +157,7 @@ export default function Tasks() {
       else await api.createTask(payload);
       setDrawerOpen(false);
       await loadTasks();
+      message.success(editingTask ? '任务已更新并进入待执行' : '定时任务已创建并进入待执行');
     } catch (error) {
       message.error(error instanceof Error ? error.message : '保存任务失败');
     }
@@ -161,6 +192,21 @@ export default function Tasks() {
     }
   }
 
+  async function resumeTaskPublish(task: ScheduledTask) {
+    if (!task.publish_job || task.publish_job.status !== 'awaiting_confirmation') return;
+    setResumingJobId(task.publish_job.id);
+    try {
+      await api.resumePublishJob(task.publish_job.id);
+      const updated = await api.task(task.id);
+      if (detailTask?.id === task.id) setDetailTask(updated);
+      await loadTasks(true);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '继续发布失败');
+    } finally {
+      setResumingJobId(null);
+    }
+  }
+
   const executionMode = Form.useWatch('execution_mode', form) || 'once';
   const repeatRule = Form.useWatch('repeat_rule', form) || 'daily';
   const accountOptions = accounts.map((item) => ({
@@ -184,13 +230,14 @@ export default function Tasks() {
               { value: '', label: '全部状态' },
               { value: '待执行', label: '待执行' },
               { value: '执行中', label: '执行中' },
+              { value: '待人工确认', label: '待人工确认' },
               { value: '已生成平台草稿', label: '已生成平台草稿' },
               { value: '已发布', label: '已发布' },
               { value: '失败', label: '失败' },
               { value: '已重试', label: '已重试' },
             ]} />
             <Select value={platform} style={{ width: 150 }} onChange={setPlatform} options={platformOptions.map((value) => ({ value, label: value || '全部平台' }))} />
-            <Input.Search placeholder="搜索主题或账号" value={search} onChange={(event) => setSearch(event.target.value)} onSearch={loadTasks} style={{ width: 240 }} />
+            <Input.Search placeholder="搜索主题或账号" value={search} onChange={(event) => setSearch(event.target.value)} onSearch={() => loadTasks()} style={{ width: 240 }} />
           </Space>
           <Space>
             {retryMode ? (
@@ -217,7 +264,23 @@ export default function Tasks() {
             { title: '下次执行时间', render: (_, row) => row.next_run_at || row.execute_time },
             { title: '任务类型', dataIndex: 'task_type' },
             { title: '主题', render: (_, row) => <><strong>{row.selected_title || row.topic}</strong><br /><span className="muted">主题：{row.topic}</span></> },
+            { title: '发布方式', render: (_, row) => publishActionLabel(row.publish_action) },
             { title: '状态', render: (_, row) => <Status value={row.status} /> },
+            {
+              title: '平台结果',
+              render: (_, row) => row.publish_job ? (
+                <Space direction="vertical" size={0}>
+                  <Status value={publishJobStatusLabels[row.publish_job.status]} />
+                  {row.publish_job.platform_draft_id && <span className="muted">草稿 ID：{row.publish_job.platform_draft_id}</span>}
+                  {row.publish_job.platform_publish_id && <span className="muted">发布 ID：{row.publish_job.platform_publish_id}</span>}
+                  {row.publish_job.platform_url && <a href={row.publish_job.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
+                  {row.publish_job.status === 'failed' && <span className="muted">{row.publish_job.failure_reason || '平台发布失败'}</span>}
+                  {row.publish_job.status === 'awaiting_confirmation' && (
+                    <Button type="link" loading={resumingJobId === row.publish_job.id} onClick={() => resumeTaskPublish(row)}>继续确认发布</Button>
+                  )}
+                </Space>
+              ) : <span className="muted">尚未执行</span>,
+            },
             {
               title: '操作',
               render: (_, row) => (
@@ -237,7 +300,7 @@ export default function Tasks() {
         <Form form={form} layout="vertical" onFinish={submitTask}>
           {!accounts.length && <Alert className="block-gap" showIcon type="warning" message="请先在账号矩阵添加并授权账号，再创建定时任务。" />}
           <Form.Item label="配置账号" name="account_id" rules={[{ required: true, message: '请选择已授权账号' }]}>
-            <Select showSearch optionFilterProp="label" options={accountOptions} placeholder="请选择已授权账号" />
+            <Select loading={accountsLoading} showSearch optionFilterProp="label" options={accountOptions} placeholder="请选择已授权账号" />
           </Form.Item>
           <Form.Item label="配置主题" name="topic" rules={[{ required: true, message: '请输入任务主题' }]}>
             <Input placeholder="请输入任务主题" />
@@ -249,7 +312,12 @@ export default function Tasks() {
           <Form.Item label="配置任务类型" name="task_type" rules={[{ required: true }]}>
             <Select options={taskTypeOptions} />
           </Form.Item>
-          <p className="muted">微信公众号优先走官方接口；视频号、小红书、抖音第一阶段按本地内部流程跑通，失败时提供人工接管。</p>
+          <Form.Item label="发布方式" name="publish_action" rules={[{ required: true, message: '请选择发布方式' }]}>
+            <Select options={[
+              { value: 'publish', label: '一键发布' },
+              { value: 'draft', label: '同步到平台草稿箱' },
+            ]} />
+          </Form.Item>
           <Form.Item label="执行方式" name="execution_mode" rules={[{ required: true }]}>
             <Select options={[
               { value: 'once', label: '单次执行' },
@@ -297,11 +365,26 @@ export default function Tasks() {
             <Detail label="任务类型" value={detailTask.task_type} />
             <Detail label="执行时间" value={detailTask.execute_time} />
             <Detail label="执行方式" value={detailTask.execution_mode === 'repeat' ? '重复执行' : '单次执行'} />
+            <Detail label="发布方式" value={publishActionLabel(detailTask.publish_action)} />
             <Detail label="状态" value={<Status value={detailTask.status} />} />
             <Detail label="发布结果" value={detailTask.publish_result || '-'} />
-            <Detail label="人工接管" value={detailTask.manual_takeover_url || '-'} />
-            <Detail label="失败阶段" value={detailTask.failure_stage || '-'} />
-            <Detail label="失败原因" value={detailTask.failure_reason || '-'} />
+            <Detail label="发布任务状态" value={detailTask.publish_job ? <Status value={publishJobStatusLabels[detailTask.publish_job.status]} /> : '-'} />
+            <Detail label="平台草稿 ID" value={detailTask.publish_job?.platform_draft_id || '-'} />
+            <Detail label="平台发布 ID" value={detailTask.publish_job?.platform_publish_id || '-'} />
+            <Detail label="平台结果地址" value={detailTask.publish_job?.platform_url ? <a href={detailTask.publish_job.platform_url} target="_blank" rel="noreferrer">查看平台结果</a> : '-'} />
+            <Detail label="失败阶段" value={detailTask.publish_job?.failure_stage || detailTask.failure_stage || '-'} />
+            <Detail label="失败原因" value={detailTask.publish_job?.failure_reason || detailTask.failure_reason || '-'} />
+            {detailTask.publish_job?.status === 'awaiting_confirmation' && (
+              <Detail
+                label="人工确认"
+                value={(
+                  <Space direction="vertical" size={4}>
+                    <span>请由运营人员使用微信扫描平台弹出的确认二维码，完成后继续发布。</span>
+                    <Button type="primary" loading={resumingJobId === detailTask.publish_job.id} onClick={() => resumeTaskPublish(detailTask)}>继续确认发布</Button>
+                  </Space>
+                )}
+              />
+            )}
           </div>
         )}
       </Drawer>

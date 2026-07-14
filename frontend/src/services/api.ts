@@ -5,7 +5,11 @@ import type {
   LayoutBlock,
   MediaAsset,
   AccountAnalyticsRow,
+  AccountAuthSession,
   PlatformAccount,
+  PublishAction,
+  PublishJob,
+  PublishPackage,
   ScheduledTask,
   TopicDirection,
   WorkAnalyticsRow,
@@ -99,11 +103,26 @@ export const api = {
       body: JSON.stringify({ blocks }),
     });
   },
-  publishPackage(id: number, payload: { platform: string; account_name: string }) {
-    return request<{ package: { id: number } }>(`/api/content-projects/${id}/publish-package`, {
+  publishPackage(id: number, payload: { platform: string; account_name: string; account_id: number }) {
+    return request<PublishPackage>(`/api/content-projects/${id}/publish-package`, {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+  },
+  createPublishJob(payload: { project_id: number; account_id: number; action: PublishAction }) {
+    return request<PublishJob>('/api/publish-jobs', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+  getPublishJob(id: number) {
+    return request<PublishJob>(`/api/publish-jobs/${id}`);
+  },
+  retryPublishJob(id: number) {
+    return request<PublishJob>(`/api/publish-jobs/${id}/retry`, { method: 'POST' });
+  },
+  resumePublishJob(id: number) {
+    return request<PublishJob>(`/api/publish-jobs/${id}/resume`, { method: 'POST' });
   },
   drafts(params: URLSearchParams) {
     const query = params.toString();
@@ -117,10 +136,16 @@ export const api = {
     return request<{ accounts: PlatformAccount[] }>(`/api/accounts${query ? `?${query}` : ''}`);
   },
   startAccountAuth(payload: { platform: string; account_name?: string }) {
-    return request<{ qr_url: string; account: PlatformAccount; synced: boolean }>('/api/accounts/auth/start', {
+    return request<AccountAuthSession>('/api/accounts/auth/start', {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+  },
+  accountAuthStatus(sessionId: string) {
+    return request<AccountAuthSession>(`/api/accounts/auth/${sessionId}`);
+  },
+  cancelAccountAuth(sessionId: string) {
+    return request<AccountAuthSession>(`/api/accounts/auth/${sessionId}/cancel`, { method: 'POST' });
   },
   syncAccount(id: number) {
     return request<{ synced: boolean; account: PlatformAccount }>(`/api/accounts/${id}/sync`, { method: 'POST' });

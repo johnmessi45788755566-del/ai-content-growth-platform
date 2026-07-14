@@ -1,8 +1,7 @@
-import { Button, Card, Col, Empty, Form, Image, Input, Modal, Row, Select, Space, Spin, Steps, message } from 'antd';
+import { Alert, Button, Card, Col, Empty, Form, Image, Input, Modal, Row, Select, Space, Spin, Steps, message } from 'antd';
 import { useEffect, useMemo, useState } from 'react';
-import { accounts } from '@/data/mock';
 import { api, assetUrl } from '@/services/api';
-import type { ArticleBlock, ContentProject, CreatorStep, LayoutBlock, MediaAsset, TopicDirection } from '@/types';
+import type { ArticleBlock, ContentProject, CreatorStep, LayoutBlock, MediaAsset, PlatformAccount, PublishAction, PublishJob, TopicDirection } from '@/types';
 
 const { TextArea } = Input;
 
@@ -18,6 +17,17 @@ function isIntroBlock(block: ArticleBlock, index: number) {
   return index === 0 || block.block_type === 'intro' || block.type === 'intro' || block.label === '引言';
 }
 
+const publishTerminalStatuses = ['platform_draft', 'published', 'awaiting_confirmation', 'failed'];
+
+async function waitForPublishJob(initialJob: PublishJob) {
+  let job = initialJob;
+  while (!publishTerminalStatuses.includes(job.status)) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    job = await api.getPublishJob(job.id);
+  }
+  return job;
+}
+
 export default function Creator() {
   const [step, setStep] = useState<CreatorStep>('title');
   const [projectId, setProjectId] = useState<number | null>(null);
@@ -30,6 +40,11 @@ export default function Creator() {
   const [layoutBlocks, setLayoutBlocks] = useState<LayoutBlock[]>([]);
   const [layoutImageSelections, setLayoutImageSelections] = useState<Record<number, number | undefined>>({});
   const [publishOpen, setPublishOpen] = useState(false);
+  const [publishAccounts, setPublishAccounts] = useState<PlatformAccount[]>([]);
+  const [publishAccountsLoading, setPublishAccountsLoading] = useState(false);
+  const [publishJob, setPublishJob] = useState<PublishJob | null>(null);
+  const [publishingAction, setPublishingAction] = useState<PublishAction | ''>('');
+  const [publishForm] = Form.useForm();
   const [loading, setLoading] = useState('');
   const [imageLoadingType, setImageLoadingType] = useState('');
 
@@ -231,18 +246,83 @@ export default function Creator() {
     setLayoutBlocks(data.layout_blocks || []);
   }
 
-  async function publishPackage(values: { platform: string; account_name: string }) {
-    if (!projectId) return;
+  async function loadPublishAccounts() {
+    setPublishAccountsLoading(true);
+    try {
+      const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
+      const accounts = (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
+      setPublishAccounts(accounts);
+      const currentId = publishForm.getFieldValue('account_id');
+      const current = accounts.find((account) => account.id === currentId);
+      if (!current && accounts.length) {
+        publishForm.setFieldValue('account_id', accounts[0].id);
+      }
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '加载授权账号失败');
+    } finally {
+      setPublishAccountsLoading(false);
+    }
+  }
+
+  async function openPublishModal() {
     try {
       await saveLayout();
-      const data = await api.publishPackage(projectId, values);
-      setPublishOpen(false);
-      Modal.success({
-        title: '模拟发布成功',
-        content: `已生成待发布包 #${data.package?.id || ''}，后续可替换为真实微信公众号发布接口。`,
+      setPublishOpen(true);
+      await loadPublishAccounts();
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '保存排版失败');
+    }
+  }
+
+  async function runPublishAction(action: PublishAction) {
+    if (!projectId) return;
+    const values = await publishForm.validateFields() as { account_id: number };
+    const account = publishAccounts.find((item) => item.id === values.account_id);
+    if (!account) {
+      message.error('所选账号不存在或授权状态已变化，请刷新账号');
+      return;
+    }
+    setPublishingAction(action);
+    try {
+      const created = await api.createPublishJob({
+        project_id: projectId,
+        account_id: account.id,
+        action,
       });
+      setPublishJob(created);
+      setPublishJob(await waitForPublishJob(created));
     } catch (error) {
       message.error(error instanceof Error ? error.message : '发布失败');
+    } finally {
+      setPublishingAction('');
+    }
+  }
+
+  async function retryPublishJob() {
+    if (!publishJob) return;
+    setPublishingAction(publishJob.action);
+    try {
+      const job = await api.retryPublishJob(publishJob.id);
+      setPublishJob(job);
+      setPublishJob(await waitForPublishJob(job));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '重试失败');
+    } finally {
+      setPublishingAction('');
+    }
+  }
+
+  async function resumePublishJob() {
+    if (!publishJob) return;
+    setPublishingAction('publish');
+    try {
+      const job = await api.resumePublishJob(publishJob.id);
+      setPublishJob(job);
+      setPublishJob(await waitForPublishJob(job));
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '继续发布失败');
+    } finally {
+      setPublishingAction('');
     }
   }
 
@@ -378,7 +458,7 @@ export default function Creator() {
               </div>
               <Space className="block-gap" style={{ width: '100%' }}>
                 <Button onClick={() => goStep('image')}>上一步</Button>
-                <Button type="primary" block onClick={() => { saveLayout(); setPublishOpen(true); }}>发布</Button>
+                <Button type="primary" block onClick={openPublishModal}>发布</Button>
               </Space>
             </Card>
           </Col>
@@ -403,11 +483,51 @@ export default function Creator() {
         </Row>
       )}
       <Modal title="发布配置" open={publishOpen} onCancel={() => setPublishOpen(false)} footer={null}>
-        <Form layout="vertical" initialValues={{ platform: '微信公众号', account_name: accounts[0].name }} onFinish={publishPackage}>
-          <Form.Item label="选择平台" name="platform"><Select options={[{ value: '微信公众号' }]} /></Form.Item>
-          <Form.Item label="选择账号" name="account_name"><Select options={accounts.filter((item) => item.platform === '公众号').map((item) => ({ value: item.name }))} /></Form.Item>
-          <Space>
-            <Button type="primary" htmlType="submit">确认发布</Button>
+        <Form form={publishForm} layout="vertical">
+          <Form.Item label="选择账号" name="account_id" rules={[{ required: true, message: '请选择已授权公众号账号' }]}>
+            <Select
+              disabled={Boolean(publishJob)}
+              loading={publishAccountsLoading}
+              placeholder={publishAccounts.length ? '请选择已授权公众号账号' : '暂无已授权公众号账号，请先到账号矩阵登录'}
+              options={publishAccounts.map((account) => ({ value: account.id, label: account.name }))}
+            />
+          </Form.Item>
+          {publishJob && (
+            <Alert
+              className="block-gap"
+              showIcon
+              type={publishJob.status === 'failed' ? 'error' : publishJob.status === 'awaiting_confirmation' ? 'warning' : ['platform_draft', 'published'].includes(publishJob.status) ? 'success' : 'info'}
+              message={publishJob.status === 'platform_draft' ? '平台草稿已创建' : publishJob.status === 'published' ? '平台发布已完成' : publishJob.status === 'awaiting_confirmation' ? '等待运营人员确认' : publishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
+              description={(
+                <Space direction="vertical" size={4}>
+                  {publishJob.status === 'platform_draft' && <span>平台草稿 ID：{publishJob.platform_draft_id || '-'}</span>}
+                  {publishJob.status === 'published' && <span>平台发布 ID：{publishJob.platform_publish_id || '-'}</span>}
+                  {publishJob.platform_url && <a href={publishJob.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
+                  {publishJob.status === 'awaiting_confirmation' && <span>请由运营人员使用微信扫描平台弹出的确认二维码，完成后点击继续确认发布。</span>}
+                  {publishJob.status === 'awaiting_confirmation' && <Button type="primary" loading={publishingAction === 'publish'} onClick={resumePublishJob}>继续确认发布</Button>}
+                  {publishJob.status === 'failed' && <span>失败阶段：{publishJob.failure_stage || '-'}<br />失败原因：{publishJob.failure_reason || '-'}</span>}
+                  {publishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} onClick={retryPublishJob}>重试</Button>}
+                </Space>
+              )}
+            />
+          )}
+          <Space wrap>
+            <Button
+              loading={publishingAction === 'draft'}
+              disabled={!publishAccounts.length || Boolean(publishingAction) || Boolean(publishJob && !['platform_draft', 'published'].includes(publishJob.status))}
+              onClick={() => runPublishAction('draft')}
+            >
+              同步到平台草稿箱
+            </Button>
+            <Button
+              type="primary"
+              loading={publishingAction === 'publish'}
+              disabled={!publishAccounts.length || Boolean(publishingAction) || Boolean(publishJob && !['platform_draft', 'published'].includes(publishJob.status))}
+              onClick={() => runPublishAction('publish')}
+            >
+              一键发布
+            </Button>
+            <Button disabled={Boolean(publishJob)} loading={publishAccountsLoading} onClick={loadPublishAccounts}>刷新账号</Button>
             <Button onClick={() => setPublishOpen(false)}>取消</Button>
           </Space>
         </Form>

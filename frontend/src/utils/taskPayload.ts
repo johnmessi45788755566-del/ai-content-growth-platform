@@ -1,3 +1,5 @@
+import type { PublishAction } from '@/types';
+
 export interface TaskFormValues {
   platform: string;
   accountId?: number | null;
@@ -5,6 +7,7 @@ export interface TaskFormValues {
   topic: string;
   articleRequirements?: string;
   taskType: string;
+  publishAction?: PublishAction;
   executionMode: 'once' | 'repeat';
   repeatRule?: 'daily' | 'weekly' | '';
   weeklyDay?: number | null;
@@ -20,6 +23,7 @@ export function buildTaskPayload(values: TaskFormValues) {
     article_requirements: values.articleRequirements || '',
     execute_time: values.executeAt,
     task_type: values.taskType,
+    publish_action: values.publishAction || 'publish',
     execution_mode: values.executionMode,
     repeat_rule: values.executionMode === 'repeat' ? values.repeatRule || 'daily' : '',
     weekly_day: values.executionMode === 'repeat' && values.repeatRule === 'weekly' ? values.weeklyDay ?? null : null,

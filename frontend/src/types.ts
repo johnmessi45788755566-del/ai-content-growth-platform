@@ -1,5 +1,16 @@
 export type CreatorStep = 'title' | 'article' | 'image' | 'layout';
 export type BackendStage = 'title' | 'article' | 'images' | 'layout' | 'publish';
+export type PublishAction = 'draft' | 'publish';
+export type PublishJobStatus =
+  | 'pending'
+  | 'checking_login'
+  | 'uploading_assets'
+  | 'filling_content'
+  | 'platform_draft'
+  | 'publishing'
+  | 'awaiting_confirmation'
+  | 'published'
+  | 'failed';
 
 export interface TopicDirection {
   direction: string;
@@ -68,8 +79,9 @@ export interface ScheduledTask {
   selected_title?: string;
   title_direction?: string;
   status: string;
+  publish_action: PublishAction;
+  publish_job_id?: number | null;
   publish_result?: string;
-  manual_takeover_url?: string;
   execution_mode?: 'once' | 'repeat';
   repeat_rule?: 'daily' | 'weekly' | '';
   weekly_day?: number | null;
@@ -77,6 +89,7 @@ export interface ScheduledTask {
   failure_reason?: string;
   runs?: TaskRun[];
   content_project?: ContentProject;
+  publish_job?: PublishJob;
   publish_package?: PublishPackage;
 }
 
@@ -84,15 +97,39 @@ export interface TaskRun {
   id?: number;
   started_at?: string;
   status: string;
+  publish_job_id?: number | null;
   failure_stage?: string;
   failure_reason?: string;
 }
 
+export interface PublishJob {
+  id: number;
+  project_id: number;
+  account_id: number;
+  platform: '微信公众号';
+  action: PublishAction;
+  status: PublishJobStatus;
+  platform_draft_id?: string;
+  platform_publish_id?: string;
+  platform_url?: string;
+  requires_confirmation: boolean;
+  failure_stage?: string;
+  failure_reason?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
 export interface PublishPackage {
   id?: number;
+  account_id?: number | null;
   platform?: string;
   account_name?: string;
   status?: string;
+  platform_draft_id?: string;
+  platform_draft_url?: string;
+  failure_stage?: string;
+  failure_reason?: string;
+  published_at?: string;
 }
 
 export interface PlatformAccount {
@@ -105,6 +142,7 @@ export interface PlatformAccount {
   auth_status: string;
   monitor_status: string;
   sync_status: string;
+  sync_error?: string;
   role: string;
   audience: string;
   style: string;
@@ -112,9 +150,20 @@ export interface PlatformAccount {
   preference: string;
   auth_method?: string;
   qr_url?: string;
+  login_url?: string;
   last_sync_at?: string;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface AccountAuthSession {
+  session_id: string;
+  platform: string;
+  status: 'waiting' | 'success' | 'failed' | 'cancelled';
+  message: string;
+  login_url: string;
+  account?: PlatformAccount | null;
+  error?: string;
 }
 
 export interface AccountAnalyticsRow {
