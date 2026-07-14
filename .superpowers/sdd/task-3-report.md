@@ -53,3 +53,44 @@ git diff --check -- backend/app/publishing/coordinator.py backend/app/services.p
 - 修改仅限 Task 3 所有权文件。
 - 未修改 `browser_gateway.py`、`wechat.py`、`browser_auth.py`、`database.py` 或 frontend。
 - 工作区中其他 worker 的账号、分析、Creator、Tasks 等既有脏改动未回退。
+
+## Review 修复
+
+### 实现
+
+- 草稿成功要求 `source=wechat_platform`、`event=draft_created`、`receipt_id` 等于草稿 ID，且 `corroboration` 为 `draft_saved` 或 `draft_api_response`。
+- 直接发布成功要求 `event=article_published`、匹配的发布 ID，以及 `publish_success` 或 `publish_api_response`；任一字段不匹配均落为失败资源。
+- retry 使用 `WHERE status='failed'`、resume 使用 `WHERE status='awaiting_confirmation'` 的条件 UPDATE 原子 claim，并检查 `rowcount`；竞争失败者不调用 publisher，也不写入结果。
+- resume 上下文在 claim 后、执行 `try` 内解析；上下文缺失或损坏时持久化为 `failed`，HTTP 返回 200 资源。
+- 失败文本持久化前统一清理 URL query/fragment，并不区分大小写地脱敏 token、code、state、resume、CDP、WebSocket、Profile 和调试端口；失败时同时清除内部浏览器上下文。
+- 兼容 package 失败响应保持 HTTP 200，且与关联 job 的状态、失败阶段、失败原因、项目和账号一致。
+
+### Review TDD 证据
+
+RED 命令：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py -k 'weak_or_action or expose_browser or damaged_resume or publish_package_failure' -q
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py -k 'claim_allows_only_one' -q
+```
+
+RED 结果：API 为 `3 failed, 1 passed, 23 deselected`；并发 claim 为 `2 failed, 19 deselected`。失败分别证明弱回执被误判成功、敏感浏览器信息被持久化、损坏 resume 返回 400，以及并发 retry/resume 均调用 publisher 两次。兼容 package 失败合同在新增测试下已满足。
+
+最终 GREEN：
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py -k 'publish_job or publish_package or damaged_resume' -q
+# 12 passed, 15 deselected, 1 warning
+
+PYTHONPATH=backend pytest backend/tests/test_content_flow.py -k 'publish_coordinator or claim_allows_only_one' -q
+# 3 passed, 18 deselected
+
+PYTHONPATH=backend pytest backend/tests -q
+# 115 passed, 1 warning
+
+python -m compileall -q backend/app backend/tests
+git diff --check -- backend/app/publishing/coordinator.py backend/app/services.py backend/app/main.py backend/tests/test_content_flow.py backend/tests/test_api.py .superpowers/sdd/task-3-report.md
+# exit code 0
+```
+
+唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示。

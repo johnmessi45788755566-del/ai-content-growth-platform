@@ -40,7 +40,12 @@ class FakePlatformPublisher:
             status="platform_draft",
             platform_draft_id="wechat-draft-media-id",
             platform_url="https://mp.weixin.qq.com/draft/wechat-draft-media-id",
-            response={"source": "wechat_platform", "media_id": "wechat-draft-media-id"},
+            response={
+                "source": "wechat_platform",
+                "event": "draft_created",
+                "receipt_id": "wechat-draft-media-id",
+                "corroboration": "draft_saved",
+            },
         )
 
     def resume(self, account, job_context):
@@ -64,13 +69,57 @@ class PublisherWithoutReceipt(FakePlatformPublisher):
 
 class PublisherWithSensitiveFailure(FakePlatformPublisher):
     def publish(self, payload, account, action):
-        raise RuntimeError(f"浏览器启动失败：{account['profile_path']}")
+        raise RuntimeError(
+            "浏览器启动失败："
+            f"{account['profile_path']} "
+            "https://mp.weixin.qq.com/cgi-bin/home?t=home/index&token=url-secret#fragment "
+            "webSocketDebuggerUrl=ws://127.0.0.1:9222/devtools/browser/socket-secret "
+            "CDP_URL=http://127.0.0.1:9222/json?token=cdp-secret "
+            "resumeHandle=resume-secret CODE=code-secret state=state-secret "
+            "--remote-debugging-port=9222"
+        )
+
+
+class MutableEvidencePublisher(FakePlatformPublisher):
+    def __init__(self):
+        super().__init__()
+        self.override = {}
+
+    def publish(self, payload, account, action):
+        if action == "draft":
+            response = {
+                "source": "wechat_platform",
+                "event": "draft_created",
+                "receipt_id": "evidence-draft",
+                "corroboration": "draft_saved",
+                **self.override,
+            }
+            return PublishResult(
+                status="platform_draft",
+                platform_draft_id="evidence-draft",
+                platform_url="https://mp.weixin.qq.com/draft/evidence-draft",
+                response=response,
+            )
+        response = {
+            "source": "wechat_platform",
+            "event": "article_published",
+            "receipt_id": "evidence-publish",
+            "corroboration": "publish_success",
+            **self.override,
+        }
+        return PublishResult(
+            status="published",
+            platform_publish_id="evidence-publish",
+            platform_url="https://mp.weixin.qq.com/s/evidence-publish",
+            response=response,
+        )
 
 
 class ConfirmationPublisher(FakePlatformPublisher):
     def __init__(self):
         super().__init__()
         self.resume_context = None
+        self.resume_calls = 0
 
     def publish(self, payload, account, action):
         return PublishResult(
@@ -84,12 +133,18 @@ class ConfirmationPublisher(FakePlatformPublisher):
         )
 
     def resume(self, account, job_context):
+        self.resume_calls += 1
         self.resume_context = job_context
         return PublishResult(
             status="published",
             platform_publish_id="publish-42",
             platform_url="https://mp.weixin.qq.com/s/publish-42",
-            response={"source": "wechat_platform", "publish_id": "publish-42"},
+            response={
+                "source": "wechat_platform",
+                "event": "article_published",
+                "receipt_id": "publish-42",
+                "corroboration": "publish_success",
+            },
         )
 
 
@@ -197,6 +252,31 @@ def test_publish_job_requires_platform_observed_success(tmp_path: Path):
     assert "平台" in response.json()["failure_reason"]
 
 
+def test_publish_job_rejects_weak_or_action_mismatched_platform_evidence(tmp_path: Path):
+    publisher = MutableEvidencePublisher()
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+
+    cases = [
+        ("draft", {"source": "local"}),
+        ("draft", {"event": "article_published"}),
+        ("draft", {"receipt_id": "different-draft"}),
+        ("draft", {"corroboration": "publish_success"}),
+        ("publish", {"source": "local"}),
+        ("publish", {"event": "draft_created"}),
+        ("publish", {"receipt_id": "different-publish"}),
+        ("publish", {"corroboration": "draft_api_response"}),
+    ]
+    for action, override in cases:
+        publisher.override = override
+        response = client.post(
+            "/api/publish-jobs",
+            json={"project_id": project["id"], "account_id": account_id, "action": action},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "failed"
+        assert "平台" in response.json()["failure_reason"]
+
+
 def test_failed_publish_job_does_not_expose_browser_profile_path(tmp_path: Path):
     client, project, account_id = prepare_publish_job_api(
         tmp_path, PublisherWithSensitiveFailure()
@@ -209,7 +289,28 @@ def test_failed_publish_job_does_not_expose_browser_profile_path(tmp_path: Path)
 
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
-    assert "/tmp/sensitive-wechat-profile" not in response.text
+    forbidden = [
+        "/tmp/sensitive-wechat-profile",
+        "url-secret",
+        "fragment",
+        "socket-secret",
+        "cdp-secret",
+        "resume-secret",
+        "code-secret",
+        "state-secret",
+        "9222",
+    ]
+    persisted = client.app.state.content_service.db.fetch_one(
+        "SELECT failure_reason FROM publish_jobs WHERE id = ?",
+        (response.json()["id"],),
+    )
+    assert persisted
+    for secret in forbidden:
+        assert secret not in response.text
+        assert secret not in persisted["failure_reason"]
+    assert "https://mp.weixin.qq.com/cgi-bin/home" in persisted["failure_reason"]
+    assert "?" not in persisted["failure_reason"]
+    assert "#" not in persisted["failure_reason"]
 
 
 def test_publish_job_get_retry_resume_and_redacts_browser_context(tmp_path: Path):
@@ -235,6 +336,30 @@ def test_publish_job_get_retry_resume_and_redacts_browser_context(tmp_path: Path
     assert resumed.json()["status"] == "published"
     assert resumed.json()["platform_publish_id"] == "publish-42"
     assert publisher.resume_context == {"resume_handle": "sensitive-browser-handle"}
+
+
+def test_damaged_resume_context_becomes_failed_resource(tmp_path: Path):
+    publisher = ConfirmationPublisher()
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+    job = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "publish"},
+    ).json()
+    client.app.state.content_service.db.execute(
+        "UPDATE publish_jobs SET response_json = ? WHERE id = ?",
+        ('{"source":"wechat_platform"}', job["id"]),
+    )
+
+    response = client.post(f"/api/publish-jobs/{job['id']}/resume")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["failure_stage"] == "恢复人工确认"
+    assert publisher.resume_calls == 0
+    persisted = client.app.state.content_service.db.fetch_one(
+        "SELECT status, response_json FROM publish_jobs WHERE id = ?", (job["id"],)
+    )
+    assert persisted == {"status": "failed", "response_json": "{}"}
 
 
 def test_failed_publish_job_can_retry_as_same_resource(tmp_path: Path):
@@ -281,6 +406,28 @@ def test_publish_package_compatibility_endpoint_uses_draft_job(tmp_path: Path):
     job = client.app.state.content_service.get_publish_job(package["publish_job_id"])
     assert job["action"] == "draft"
     assert job["account_id"] == account_id
+
+
+def test_publish_package_failure_returns_synchronized_job_resource(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(tmp_path, PublisherWithoutReceipt())
+
+    response = client.post(
+        f"/api/content-projects/{project['id']}/publish-package",
+        json={
+            "platform": "微信公众号",
+            "account_name": "微信公众号测试账号",
+            "account_id": account_id,
+        },
+    )
+
+    assert response.status_code == 200
+    package = response.json()
+    job = client.app.state.content_service.get_publish_job(package["publish_job_id"])
+    assert package["status"] == job["status"] == "failed"
+    assert package["failure_stage"] == job["failure_stage"] == "提交平台草稿"
+    assert package["failure_reason"] == job["failure_reason"]
+    assert package["project_id"] == job["project_id"] == project["id"]
+    assert package["account_id"] == job["account_id"] == account_id
 
 
 def test_api_content_creation_flow(tmp_path: Path):

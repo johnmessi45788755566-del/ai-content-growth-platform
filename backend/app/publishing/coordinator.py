@@ -1,8 +1,9 @@
 import json
+import re
 import sqlite3
 from collections.abc import Callable, Mapping
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from ..database import Database
 from .models import PublishAction, PublishResult
@@ -10,6 +11,22 @@ from .models import PublishAction, PublishResult
 
 class PublishJobValidationError(RuntimeError):
     pass
+
+
+REDACTED_BROWSER_CONTEXT = "[已隐藏浏览器上下文]"
+URL_PATTERN = re.compile(r"(?i)\b(?:https?|wss?)://[^\s<>\"']+")
+SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"(?ix)"
+    r"(?<![\w])"
+    r"(?:token|code|state|resume(?:_?handle)?|cdp(?:_?url)?|"
+    r"websocket(?:_?debugger_?url|_?url)?|debugger_?url|"
+    r"profile(?:_?path)?|remote-debugging-port|port)"
+    r"\s*(?::|=|\s)\s*"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+LOCAL_DEBUG_ADDRESS_PATTERN = re.compile(
+    r"(?i)\b(?:localhost|127\.0\.0\.1|\[?::1\]?):\d{2,5}\b"
+)
 
 
 class PublishCoordinator:
@@ -44,7 +61,7 @@ class PublishCoordinator:
             if "one account_id" in str(exc):
                 raise PublishJobValidationError("内容项目已绑定其他平台账号") from exc
             raise
-        return self._execute(job_id, project, account, payload)
+        return self._execute(job_id, account, payload, expected_status="pending")
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         return self._public_job(self._get_row(job_id))
@@ -56,26 +73,23 @@ class PublishCoordinator:
         project, account, payload = self._load_inputs(
             int(job["project_id"]), int(job["account_id"]), str(job["action"])
         )
-        self.db.execute(
-            """
-            UPDATE publish_jobs
-            SET status = 'pending', platform_draft_id = '', platform_publish_id = '',
-                platform_url = '', response_json = '{}', requires_confirmation = 0,
-                failure_stage = '', failure_reason = '', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (job_id,),
+        return self._execute(
+            job_id,
+            account,
+            payload,
+            expected_status="failed",
+            clear_previous_result=True,
         )
-        return self._execute(job_id, project, account, payload)
 
     def resume_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
         if job["status"] != "awaiting_confirmation":
             raise PublishJobValidationError("只有待人工确认的发布任务可以恢复")
         account = self.account_loader(int(job["account_id"]))
-        context = self._job_context(job)
-        self._persist_running(job_id)
+        if not self._claim_execution(job_id, "awaiting_confirmation"):
+            return self.get_publish_job(job_id)
         try:
+            context = self._job_context(job)
             result = self.publisher.resume(account, context)
             self._persist_result(job_id, str(job["action"]), result)
         except Exception as exc:
@@ -85,12 +99,14 @@ class PublishCoordinator:
     def _execute(
         self,
         job_id: int,
-        project: dict[str, Any],
         account: dict[str, Any],
         payload: dict[str, Any],
+        expected_status: str,
+        clear_previous_result: bool = False,
     ) -> dict[str, Any]:
         job = self._get_row(job_id)
-        self._persist_running(job_id)
+        if not self._claim_execution(job_id, expected_status, clear_previous_result):
+            return self.get_publish_job(job_id)
         try:
             result = self.publisher.publish(payload, account, str(job["action"]))
             self._persist_result(job_id, str(job["action"]), result)
@@ -121,16 +137,26 @@ class PublishCoordinator:
         if existing and int(existing["account_id"]) != account_id:
             raise PublishJobValidationError("内容项目已绑定其他平台账号")
 
-    def _persist_running(self, job_id: int) -> None:
-        self.db.execute(
-            """
-            UPDATE publish_jobs
-            SET status = 'checking_login', failure_stage = '', failure_reason = '',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (job_id,),
-        )
+    def _claim_execution(
+        self, job_id: int, expected_status: str, clear_previous_result: bool = False
+    ) -> bool:
+        reset = """
+            , platform_draft_id = '', platform_publish_id = '', platform_url = '',
+              response_json = '{}'
+        """ if clear_previous_result else ""
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE publish_jobs
+                SET status = 'checking_login', requires_confirmation = 0,
+                    failure_stage = '', failure_reason = '', updated_at = CURRENT_TIMESTAMP
+                    {reset}
+                WHERE id = ? AND status = ?
+                """,
+                (job_id, expected_status),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
 
     def _persist_result(self, job_id: int, action: str, result: PublishResult) -> None:
         response = result.response if isinstance(result.response, Mapping) else {}
@@ -143,13 +169,13 @@ class PublishCoordinator:
             if result.status != "platform_draft":
                 raise RuntimeError("平台未返回可验证的草稿成功结果")
             self._require_platform_evidence(
-                result.platform_draft_id, result.platform_url, response, "草稿"
+                result.platform_draft_id, result.platform_url, response, "draft"
             )
         else:
             if result.status != "published":
                 raise RuntimeError("平台未返回可验证的发布成功结果")
             self._require_platform_evidence(
-                result.platform_publish_id, result.platform_url, response, "发布"
+                result.platform_publish_id, result.platform_url, response, "publish"
             )
         self.db.execute(
             """
@@ -176,7 +202,8 @@ class PublishCoordinator:
         self.db.execute(
             """
             UPDATE publish_jobs
-            SET status = 'failed', requires_confirmation = 0,
+            SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
+                platform_url = '', response_json = '{}', requires_confirmation = 0,
                 failure_stage = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
@@ -191,13 +218,25 @@ class PublishCoordinator:
 
     @staticmethod
     def _require_platform_evidence(
-        platform_id: str, platform_url: str, response: Mapping[str, Any], label: str
+        platform_id: str, platform_url: str, response: Mapping[str, Any], action: str
     ) -> None:
+        label = "草稿" if action == "draft" else "发布"
         parsed = urlparse(platform_url)
         if not platform_id or parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
             raise RuntimeError(f"平台未返回可验证的{label}回执")
-        if not response:
-            raise RuntimeError(f"平台未返回{label}响应证据")
+        expected_event = "draft_created" if action == "draft" else "article_published"
+        expected_corroboration = (
+            {"draft_saved", "draft_api_response"}
+            if action == "draft"
+            else {"publish_success", "publish_api_response"}
+        )
+        if (
+            response.get("source") != "wechat_platform"
+            or response.get("event") != expected_event
+            or str(response.get("receipt_id") or "") != platform_id
+            or response.get("corroboration") not in expected_corroboration
+        ):
+            raise RuntimeError(f"平台返回的{label}证据字段无效或与动作不匹配")
 
     @staticmethod
     def _require_job_context(response: Mapping[str, Any]) -> dict[str, Any]:
@@ -227,7 +266,10 @@ class PublishCoordinator:
         return resource
 
     def _redact_sensitive_text(self, job: Mapping[str, Any], value: str) -> str:
-        account = self.account_loader(int(job["account_id"]))
+        account = self.db.fetch_one(
+            "SELECT profile_path FROM platform_accounts WHERE id = ?",
+            (int(job["account_id"]),),
+        ) or {}
         sensitive_values = [str(account.get("profile_path") or "")]
         try:
             response = json.loads(str(job.get("response_json") or "{}"))
@@ -238,8 +280,18 @@ class PublishCoordinator:
             sensitive_values.extend(self._string_values(context))
         for sensitive in sorted(set(sensitive_values), key=len, reverse=True):
             if sensitive:
-                value = value.replace(sensitive, "[已隐藏浏览器上下文]")
-        return value
+                value = value.replace(sensitive, REDACTED_BROWSER_CONTEXT)
+        value = URL_PATTERN.sub(self._sanitize_url, value)
+        value = SENSITIVE_ASSIGNMENT_PATTERN.sub(REDACTED_BROWSER_CONTEXT, value)
+        return LOCAL_DEBUG_ADDRESS_PATTERN.sub(REDACTED_BROWSER_CONTEXT, value)
+
+    @staticmethod
+    def _sanitize_url(match: re.Match[str]) -> str:
+        value = match.group(0)
+        parsed = urlsplit(value)
+        if parsed.scheme.lower() in {"ws", "wss"}:
+            return REDACTED_BROWSER_CONTEXT
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
     @classmethod
     def _string_values(cls, value: Any) -> list[str]:
@@ -252,22 +304,30 @@ class PublishCoordinator:
     @classmethod
     def _redact_browser_context(cls, value: Any) -> Any:
         sensitive_keys = {
-            "browser_context",
+            "browsercontext",
             "cookies",
-            "debugger_url",
-            "job_context",
-            "profile_path",
-            "resume_handle",
+            "cdp",
+            "cdpurl",
+            "debuggerurl",
+            "jobcontext",
+            "port",
+            "profile",
+            "profilepath",
+            "resume",
+            "resumehandle",
             "session",
-            "session_id",
+            "sessionid",
+            "state",
             "token",
-            "websocket_url",
+            "code",
+            "websocketdebuggerurl",
+            "websocketurl",
         }
         if isinstance(value, Mapping):
             return {
                 key: cls._redact_browser_context(item)
                 for key, item in value.items()
-                if str(key).lower() not in sensitive_keys
+                if re.sub(r"[^a-z0-9]", "", str(key).lower()) not in sensitive_keys
             }
         if isinstance(value, list):
             return [cls._redact_browser_context(item) for item in value]

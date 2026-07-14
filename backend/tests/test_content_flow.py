@@ -1,4 +1,6 @@
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -41,7 +43,12 @@ class FakePlatformPublisher:
             status="platform_draft",
             platform_draft_id="draft-media-id",
             platform_url="https://mp.weixin.qq.com/draft/draft-media-id",
-            response={"source": "wechat_platform", "media_id": "draft-media-id"},
+            response={
+                "source": "wechat_platform",
+                "event": "draft_created",
+                "receipt_id": "draft-media-id",
+                "corroboration": "draft_api_response",
+            },
         )
 
     def resume(self, account, job_context):
@@ -169,6 +176,133 @@ def test_publish_coordinator_persists_transition_before_external_publish(tmp_pat
         "platform_draft_id": "draft-media-id",
         "failure_reason": "",
     }
+
+
+def test_retry_publish_job_claim_allows_only_one_publisher_call(tmp_path):
+    class MissingEvidencePublisher(FakePlatformPublisher):
+        def publish(self, payload, account, action):
+            return PublishResult(status="platform_draft")
+
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def publish(self, payload, account, action):
+            with self.lock:
+                self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "retry claim 测试")
+    service.publish_coordinator.publisher = MissingEvidencePublisher()
+    failed = service.create_publish_job(project["id"], account_id, "draft")
+    assert failed["status"] == "failed"
+
+    barrier = threading.Barrier(2)
+    original_builder = service.publish_coordinator.payload_builder
+
+    def synchronized_builder(project_row, account_name):
+        payload = original_builder(project_row, account_name)
+        barrier.wait(timeout=5)
+        return payload
+
+    publisher = CountingPublisher()
+    service.publish_coordinator.payload_builder = synchronized_builder
+    service.publish_coordinator.publisher = publisher
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: service.retry_publish_job(failed["id"]), range(2)))
+
+    assert publisher.calls == 1
+    assert {result["id"] for result in results} == {failed["id"]}
+    assert service.get_publish_job(failed["id"])["status"] == "platform_draft"
+
+
+def test_resume_publish_job_claim_allows_only_one_publisher_call(tmp_path):
+    class AwaitingPublisher(FakePlatformPublisher):
+        def publish(self, payload, account, action):
+            return PublishResult(
+                status="awaiting_confirmation",
+                response={
+                    "source": "wechat_platform",
+                    "event": "operator_confirmation_required",
+                    "job_context": {"resume_handle": "claim-handle"},
+                },
+                requires_confirmation=True,
+            )
+
+        def __init__(self):
+            self.resume_calls = 0
+            self.lock = threading.Lock()
+
+        def resume(self, account, job_context):
+            with self.lock:
+                self.resume_calls += 1
+            return PublishResult(
+                status="published",
+                platform_publish_id="publish-claim",
+                platform_url="https://mp.weixin.qq.com/s/publish-claim",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "publish-claim",
+                    "corroboration": "publish_api_response",
+                },
+            )
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "resume claim 测试")
+    publisher = AwaitingPublisher()
+    service.publish_coordinator.publisher = publisher
+    awaiting = service.create_publish_job(project["id"], account_id, "publish")
+    assert awaiting["status"] == "awaiting_confirmation"
+
+    barrier = threading.Barrier(2)
+    original_loader = service.publish_coordinator.account_loader
+
+    def synchronized_loader(requested_account_id):
+        account = original_loader(requested_account_id)
+        barrier.wait(timeout=5)
+        return account
+
+    service.publish_coordinator.account_loader = synchronized_loader
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: service.resume_publish_job(awaiting["id"]), range(2)))
+    service.publish_coordinator.account_loader = original_loader
+
+    assert publisher.resume_calls == 1
+    assert {result["id"] for result in results} == {awaiting["id"]}
+    assert service.get_publish_job(awaiting["id"])["status"] == "published"
+
+
+def prepare_publish_project(service: ContentService, title: str):
+    project = service.create_project(title, platform="微信公众号")
+    service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": "intro",
+                "content": "协调器 claim 正文",
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
+        ("微信公众号", f"{title}账号", "已授权"),
+    )
+    return project, account_id
 
 
 def test_publish_jobs_schema_and_default_task_action(tmp_path):
