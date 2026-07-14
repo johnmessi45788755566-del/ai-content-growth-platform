@@ -6,11 +6,13 @@ import { api } from '@/services/api';
 import type { PlatformAccount, PublishJobStatus, ScheduledTask } from '@/types';
 import { buildTaskPayload } from '@/utils/taskPayload';
 
+const wechatTaskType = '微信公众号图文生成';
+
 const taskTypeOptions = [
-  { value: '微信公众号图文生成', label: '微信公众号图文生成' },
-  { value: '小红书图文生成', label: '小红书图文生成（本地内部）' },
-  { value: '视频号内容发布', label: '视频号内容发布（本地内部）' },
-  { value: '抖音内容发布', label: '抖音内容发布（本地内部）' },
+  { value: wechatTaskType, label: wechatTaskType },
+  { value: '小红书图文生成', label: '小红书图文生成（V1 未开放，预留）', disabled: true },
+  { value: '视频号内容发布', label: '视频号内容发布（V1 未开放，预留）', disabled: true },
+  { value: '抖音内容发布', label: '抖音内容发布（V1 未开放，预留）', disabled: true },
 ];
 
 const platformOptions = ['', '微信公众号', '视频号', '小红书', '抖音'];
@@ -31,10 +33,14 @@ function publishActionLabel(action?: string) {
   return action === 'draft' ? '同步到平台草稿箱' : '一键发布';
 }
 
+function isWechatV1Task(task: ScheduledTask) {
+  return task.platform === '微信公众号' && task.task_type === wechatTaskType;
+}
+
 function taskInitialValues(task?: ScheduledTask | null) {
   if (!task) {
     return {
-      task_type: '微信公众号图文生成',
+      task_type: wechatTaskType,
       publish_action: 'publish',
       execution_mode: 'once',
       repeat_rule: 'daily',
@@ -71,6 +77,8 @@ export default function Tasks() {
   const [loadError, setLoadError] = useState('');
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [resumingJobId, setResumingJobId] = useState<number | null>(null);
+  const [retryingJobId, setRetryingJobId] = useState<number | null>(null);
+  const editingUnsupportedTask = Boolean(editingTask && !isWechatV1Task(editingTask));
 
   async function loadTasks(silent = false) {
     if (!silent) setLoading(true);
@@ -120,11 +128,20 @@ export default function Tasks() {
   async function openForm(task?: ScheduledTask) {
     await loadAccounts();
     setEditingTask(task || null);
+    form.resetFields();
     form.setFieldsValue(taskInitialValues(task));
     setDrawerOpen(true);
   }
 
   async function submitTask(values: any) {
+    if (editingTask && !isWechatV1Task(editingTask)) {
+      message.warning('V1 未开放当前任务类型，不能编辑提交');
+      return;
+    }
+    if (values.task_type !== wechatTaskType) {
+      message.warning('V1 仅支持微信公众号图文生成任务');
+      return;
+    }
     const account = accounts.find((item) => item.id === values.account_id);
     if (!account) {
       message.warning('请先选择已授权账号');
@@ -197,14 +214,31 @@ export default function Tasks() {
     setResumingJobId(task.publish_job.id);
     try {
       await api.resumePublishJob(task.publish_job.id);
-      const updated = await api.task(task.id);
-      if (detailTask?.id === task.id) setDetailTask(updated);
-      await loadTasks(true);
+      await refreshTaskPublishState(task);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '继续发布失败');
     } finally {
       setResumingJobId(null);
     }
+  }
+
+  async function retryTaskPublish(task: ScheduledTask) {
+    if (!task.publish_job || task.publish_job.status !== 'failed') return;
+    setRetryingJobId(task.publish_job.id);
+    try {
+      await api.retryPublishJob(task.publish_job.id);
+      await refreshTaskPublishState(task);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '重试发布任务失败');
+    } finally {
+      setRetryingJobId(null);
+    }
+  }
+
+  async function refreshTaskPublishState(task: ScheduledTask) {
+    const updated = await api.task(task.id);
+    if (detailTask?.id === task.id) setDetailTask(updated);
+    await loadTasks(true);
   }
 
   const executionMode = Form.useWatch('execution_mode', form) || 'once';
@@ -275,6 +309,9 @@ export default function Tasks() {
                   {row.publish_job.platform_publish_id && <span className="muted">发布 ID：{row.publish_job.platform_publish_id}</span>}
                   {row.publish_job.platform_url && <a href={row.publish_job.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
                   {row.publish_job.status === 'failed' && <span className="muted">{row.publish_job.failure_reason || '平台发布失败'}</span>}
+                  {row.publish_job.status === 'failed' && (
+                    <Button type="link" loading={retryingJobId === row.publish_job.id} onClick={() => retryTaskPublish(row)}>重试发布任务</Button>
+                  )}
                   {row.publish_job.status === 'awaiting_confirmation' && (
                     <Button type="link" loading={resumingJobId === row.publish_job.id} onClick={() => resumeTaskPublish(row)}>继续确认发布</Button>
                   )}
@@ -299,6 +336,9 @@ export default function Tasks() {
       <Modal centered width={640} title={editingTask ? '编辑任务' : '新增任务'} open={drawerOpen} onCancel={() => setDrawerOpen(false)} footer={null}>
         <Form form={form} layout="vertical" onFinish={submitTask}>
           {!accounts.length && <Alert className="block-gap" showIcon type="warning" message="请先在账号矩阵添加并授权账号，再创建定时任务。" />}
+          {editingUnsupportedTask && (
+            <Alert className="block-gap" showIcon type="warning" message="V1 仅开放已授权微信公众号账号发布，当前旧任务只能查看或删除，不能编辑提交。" />
+          )}
           <Form.Item label="配置账号" name="account_id" rules={[{ required: true, message: '请选择已授权账号' }]}>
             <Select loading={accountsLoading} showSearch optionFilterProp="label" options={accountOptions} placeholder="请选择已授权账号" />
           </Form.Item>
@@ -349,7 +389,7 @@ export default function Tasks() {
             </Form.Item>
           )}
           <Space>
-            <Button type="primary" htmlType="submit">{editingTask ? '保存修改并进入待执行' : '创建任务并进入待执行'}</Button>
+            <Button type="primary" htmlType="submit" disabled={editingUnsupportedTask}>{editingTask ? '保存修改并进入待执行' : '创建任务并进入待执行'}</Button>
             <Button onClick={() => setDrawerOpen(false)}>取消</Button>
           </Space>
         </Form>
@@ -383,6 +423,12 @@ export default function Tasks() {
                     <Button type="primary" loading={resumingJobId === detailTask.publish_job.id} onClick={() => resumeTaskPublish(detailTask)}>继续确认发布</Button>
                   </Space>
                 )}
+              />
+            )}
+            {detailTask.publish_job?.status === 'failed' && (
+              <Detail
+                label="发布任务重试"
+                value={<Button type="primary" loading={retryingJobId === detailTask.publish_job.id} onClick={() => retryTaskPublish(detailTask)}>重试发布任务</Button>}
               />
             )}
           </div>

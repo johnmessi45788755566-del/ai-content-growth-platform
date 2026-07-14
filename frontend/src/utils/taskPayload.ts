@@ -15,6 +15,9 @@ export interface TaskFormValues {
 }
 
 export function buildTaskPayload(values: TaskFormValues) {
+  if (values.platform !== '微信公众号' || values.taskType !== '微信公众号图文生成') {
+    throw new Error('V1 仅支持微信公众号图文生成任务');
+  }
   return {
     platform: values.platform,
     account_id: values.accountId ?? null,

@@ -5,6 +5,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import Creator from '../src/pages/Creator';
 import Drafts from '../src/pages/Drafts';
 import Tasks from '../src/pages/Tasks';
+import type { PublishJob, ScheduledTask } from '../src/types';
 
 const api = vi.hoisted(() => ({
   accounts: vi.fn(),
@@ -60,7 +61,7 @@ function project(id: number, title: string) {
   };
 }
 
-function publishJob(overrides: Record<string, unknown> = {}) {
+function publishJob(overrides: Partial<PublishJob> = {}): PublishJob {
   return {
     id: 81,
     project_id: 1,
@@ -75,7 +76,7 @@ function publishJob(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function scheduledTask(id: number, overrides: Record<string, unknown> = {}) {
+function scheduledTask(id: number, overrides: Partial<ScheduledTask> = {}): ScheduledTask {
   return {
     id,
     platform: '微信公众号',
@@ -89,6 +90,16 @@ function scheduledTask(id: number, overrides: Record<string, unknown> = {}) {
     execution_mode: 'once',
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
 }
 
 function buttonsWithText(text: string) {
@@ -185,14 +196,17 @@ describe('Creator publishing', () => {
     await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-82'));
   });
 
-  it('does not render or use a publish job after the active project changes', async () => {
+  it('ignores a deferred publish response after the active project changes', async () => {
     const firstProject = project(1, '项目一');
     const secondProject = project(2, '项目二');
+    const firstPublish = deferred<ReturnType<typeof publishJob>>();
     window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
     api.getProject.mockResolvedValue(firstProject);
     api.saveLayout.mockImplementation(async (id) => ({ project: id === 1 ? firstProject : secondProject, layout_blocks: [] }));
     api.updateStage.mockResolvedValue({ project: secondProject, article_blocks: secondProject.article_blocks, media_assets: [], layout_blocks: [] });
-    api.createPublishJob.mockResolvedValue(publishJob());
+    api.createPublishJob
+      .mockImplementationOnce(() => firstPublish.promise)
+      .mockResolvedValueOnce(publishJob({ id: 82, project_id: 2, status: 'published', platform_draft_id: '', platform_publish_id: 'publish-82' }));
 
     render(<Creator />);
 
@@ -200,7 +214,7 @@ describe('Creator publishing', () => {
     clickButton('发布');
     await waitFor(() => expect(api.accounts).toHaveBeenCalled());
     clickButton('同步到平台草稿箱');
-    await waitFor(() => expect(screen.queryByText('平台草稿已创建')).not.toBeNull());
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledTimes(1));
     clickButton('取消');
 
     clickStep('标题确认');
@@ -209,10 +223,16 @@ describe('Creator publishing', () => {
     await waitFor(() => expect(api.updateStage).toHaveBeenCalledWith(2, 'layout'));
     clickButton('发布');
     await waitFor(() => expect(api.saveLayout).toHaveBeenLastCalledWith(2, expect.any(Array)));
+    clickButton('一键发布');
+    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-82'));
+
+    firstPublish.reject(new Error('项目一迟到失败'));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
 
     expect(screen.queryByText('平台草稿已创建')).toBeNull();
     expect(screen.queryByText('平台草稿 ID：draft-81')).toBeNull();
-    expect((screen.getByRole('combobox') as HTMLInputElement).disabled).toBe(false);
+    expect(screen.queryByText('项目一迟到失败')).toBeNull();
+    expect(document.body.textContent).toContain('平台发布 ID：publish-82');
   });
 });
 
@@ -250,6 +270,71 @@ describe('Draft publishing', () => {
     await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(81));
     await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-88'));
   });
+
+  it('keeps publish state scoped to the selected draft when responses finish out of order', async () => {
+    const firstPublish = deferred<ReturnType<typeof publishJob>>();
+    const secondPublish = deferred<ReturnType<typeof publishJob>>();
+    api.drafts.mockResolvedValue({
+      drafts: [
+        { id: 1, project_id: 1, title: '草稿 A', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+        { id: 2, project_id: 2, title: '草稿 B', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+      ],
+    });
+    api.createPublishJob
+      .mockImplementationOnce(() => firstPublish.promise)
+      .mockImplementationOnce(() => secondPublish.promise);
+
+    render(<Drafts />);
+
+    await waitFor(() => expect(screen.queryByText('草稿 A')).not.toBeNull());
+    fireEvent.click(buttonsWithText('发布')[0]);
+    await waitFor(() => expect(screen.queryByText('发布配置 · 草稿 A')).not.toBeNull());
+    clickButton('一键发布');
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledTimes(1));
+    clickButton('取消');
+
+    fireEvent.click(buttonsWithText('发布')[1]);
+    await waitFor(() => expect(screen.queryByText('发布配置 · 草稿 B')).not.toBeNull());
+    clickButton('一键发布');
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledTimes(2));
+
+    secondPublish.resolve(publishJob({ id: 82, project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'publish-B' }));
+    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-B'));
+    firstPublish.resolve(publishJob({ id: 81, project_id: 1, action: 'publish', status: 'failed', platform_draft_id: '', failure_reason: '草稿 A 失败' }));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(document.body.textContent).toContain('平台发布 ID：publish-B');
+    expect(screen.queryByText('草稿 A 失败')).toBeNull();
+  });
+
+  it('retains a polling job and recovers awaiting confirmation through status refresh', async () => {
+    api.drafts.mockResolvedValue({
+      drafts: [
+        { id: 2, project_id: 2, title: '轮询草稿', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+      ],
+    });
+    api.createPublishJob.mockResolvedValue(publishJob({ id: 83, project_id: 2, action: 'publish', status: 'publishing', platform_draft_id: '' }));
+    api.getPublishJob
+      .mockRejectedValueOnce(new Error('临时网络失败'))
+      .mockRejectedValueOnce(new Error('临时网络失败'))
+      .mockResolvedValueOnce(publishJob({ id: 83, project_id: 2, action: 'publish', status: 'awaiting_confirmation', platform_draft_id: '', requires_confirmation: true }));
+    api.resumePublishJob.mockResolvedValue(publishJob({ id: 83, project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'publish-83' }));
+
+    render(<Drafts />);
+
+    await waitFor(() => expect(screen.queryByText('轮询草稿')).not.toBeNull());
+    clickButton('发布');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalled());
+    clickButton('一键发布');
+    await waitFor(() => expect(api.getPublishJob).toHaveBeenCalledTimes(2), { timeout: 4_500 });
+
+    expect(document.body.textContent).toContain('发布任务 ID：83');
+    expect(screen.queryByText('刷新发布状态')).not.toBeNull();
+    clickButton('刷新发布状态');
+    await waitFor(() => expect(screen.queryByText('继续确认发布')).not.toBeNull());
+    clickButton('继续确认发布');
+    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-83'));
+  }, 8_000);
 });
 
 describe('Task publishing results', () => {
@@ -283,5 +368,56 @@ describe('Task publishing results', () => {
     expect(api.task).toHaveBeenCalledWith(2);
     await waitFor(() => expect(api.tasks.mock.calls.length).toBeGreaterThanOrEqual(2));
     expect(screen.queryByText('发布 ID：publish-92')).not.toBeNull();
+  });
+
+  it('retries a failed hydrated publish job instead of rerunning the scheduled task', async () => {
+    const failed = scheduledTask(3, {
+      topic: '发布失败任务',
+      status: '失败',
+      publish_job: publishJob({ id: 93, project_id: 3, action: 'publish', status: 'failed', platform_draft_id: '', failure_reason: '平台拒绝' }),
+    });
+    const retried = scheduledTask(3, {
+      topic: '发布失败任务',
+      status: '执行中',
+      publish_job: publishJob({ id: 93, project_id: 3, action: 'publish', status: 'publishing', platform_draft_id: '', failure_reason: '' }),
+    });
+    api.tasks.mockResolvedValueOnce({ tasks: [failed] }).mockResolvedValue({ tasks: [retried] });
+    api.task.mockResolvedValue(retried);
+    api.retryPublishJob.mockResolvedValue(retried.publish_job);
+
+    render(<Tasks />);
+
+    await waitFor(() => expect(screen.queryByText('平台拒绝')).not.toBeNull());
+    clickButton('重试发布任务');
+
+    await waitFor(() => expect(api.retryPublishJob).toHaveBeenCalledWith(93));
+    expect(api.retryTasks).not.toHaveBeenCalled();
+    expect(api.task).toHaveBeenCalledWith(3);
+    await waitFor(() => expect(api.tasks.mock.calls.length).toBeGreaterThanOrEqual(2));
+  });
+
+  it('keeps legacy non-WeChat tasks visible but blocks editing them in V1', async () => {
+    const legacy = scheduledTask(4, {
+      platform: '小红书',
+      account_id: 44,
+      account_name: '旧小红书账号',
+      task_type: '小红书图文生成',
+      topic: '旧平台任务',
+      status: '待执行',
+    });
+    api.tasks.mockResolvedValue({ tasks: [legacy] });
+
+    render(<Tasks />);
+
+    await waitFor(() => expect(screen.queryByText('旧平台任务')).not.toBeNull());
+    expect(buttonsWithText('删除')).toHaveLength(1);
+    clickButton('编辑');
+    await waitFor(() => expect(screen.queryByText('V1 仅开放已授权微信公众号账号发布，当前旧任务只能查看或删除，不能编辑提交。')).not.toBeNull());
+
+    const submit = buttonsWithText('保存修改并进入待执行')[0];
+    expect(submit).toBeDefined();
+    expect(submit.disabled).toBe(true);
+    fireEvent.click(submit);
+    expect(api.updateTask).not.toHaveBeenCalled();
   });
 });

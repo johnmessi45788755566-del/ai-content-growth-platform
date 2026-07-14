@@ -107,3 +107,66 @@ event - Build index.html
 - 只修改 Task 5 归属的前端源文件、前端测试和本报告。
 - 未编辑 backend；工作区中 Task 4 及其他 worker 的既有改动未回退。
 - 保留现有内容创作、草稿恢复/删除、任务 CRUD、账号刷新和任务轮询流程。
+
+## 独立审查修复（2026-07-14）
+
+### 修复内容
+
+- Creator 与 Drafts 的发布、重试、恢复、刷新均绑定 `project_id + request generation`。关闭弹窗、切换项目或切换草稿会使旧请求失效；旧请求的成功、失败和 `finally` 都不能覆盖或解除新请求状态。
+- Creator 与 Drafts 的 publish job 轮询允许最多 2 次连续查询失败。达到上限后保留当前 job ID 和状态，显示“刷新发布状态”；刷新到 `awaiting_confirmation` 后继续保留扫码说明与恢复入口。
+- Tasks 对 hydrated `publish_job.status === 'failed'` 在列表与详情提供“重试发布任务”，调用 `retryPublishJob(job.id)` 后读取任务详情并刷新列表，不调用整任务 `retryTasks`。
+- V1 任务表单仅允许“微信公众号图文生成”与已授权微信公众号账号；其他任务类型作为禁用预留项显示。旧非微信任务仍保留列表、详情和删除能力，编辑弹窗明确提示 V1 未开放并禁用提交。
+- `buildTaskPayload` 拒绝非微信公众号或非微信任务类型，避免把预留平台任务与微信账号组合后错误序列化。
+
+### 行为测试 RED / GREEN
+
+RED 命令：
+
+```bash
+npm --prefix frontend test -- --run tests/publishingUi.test.tsx tests/taskPayload.test.ts --reporter=verbose
+```
+
+退出码 `1`，结果为 `2 failed` test files、`6 failed | 5 passed` tests。失败分别命中 Creator 迟到错误泄漏、Drafts 跨草稿锁定、轮询首次失败即退出、Tasks 缺少 job 级重试、旧非微信任务仍可提交，以及非微信 payload 未拒绝。
+
+GREEN 定向命令退出码 `0`：
+
+```text
+Test Files  2 passed (2)
+Tests       11 passed (11)
+```
+
+### 最终验证
+
+`npm --prefix frontend test` 退出码 `0`：
+
+```text
+Test Files  5 passed (5)
+Tests       15 passed (15)
+```
+
+`npm --prefix frontend run typecheck` 退出码 `0`：
+
+```text
+> tsc --noEmit
+```
+
+`npm --prefix frontend run build` 退出码 `0`，关键输出：
+
+```text
+✔ Webpack: Compiled successfully in 2.44s
+info  - Memory Usage: 362.27 MB (RSS: 928.48 MB)
+info  - [esbuildHelperChecker] No conflicts found.
+225.31 kB  dist/umi.js
+8.81 kB    dist/p__Creator.async.js
+8.18 kB    dist/p__Tasks.async.js
+6.23 kB    dist/p__Drafts.async.js
+event - Build index.html
+```
+
+`git diff --check` 退出码 `0`，无输出。
+
+### Concerns
+
+- Vitest 仍打印 Vite CJS API deprecated 警告及 HMR WebSocket `listen EPERM 0.0.0.0:24678`；不影响测试执行，最终退出码为 `0`。
+- Drafts 的乱序响应测试中 Ant Design 打印 `Warning: There may be circular references`；断言与测试退出码均正常，生产 build 无对应警告。
+- 本次仅修改 Task 5 前端页面、payload 工具、前端测试和本报告；未修改 backend、README、PRD、账号矩阵或数据分析文件。

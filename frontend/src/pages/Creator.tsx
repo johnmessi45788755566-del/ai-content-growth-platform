@@ -18,12 +18,29 @@ function isIntroBlock(block: ArticleBlock, index: number) {
 }
 
 const publishTerminalStatuses = ['platform_draft', 'published', 'awaiting_confirmation', 'failed'];
+const maxPublishPollFailures = 2;
 
-async function waitForPublishJob(initialJob: PublishJob) {
+async function waitForPublishJob(
+  initialJob: PublishJob,
+  isCurrent: () => boolean,
+  onJob: (job: PublishJob) => void,
+) {
   let job = initialJob;
+  let consecutiveFailures = 0;
   while (!publishTerminalStatuses.includes(job.status)) {
     await new Promise((resolve) => window.setTimeout(resolve, 1500));
-    job = await api.getPublishJob(job.id);
+    if (!isCurrent()) return null;
+    try {
+      const nextJob = await api.getPublishJob(job.id);
+      if (!isCurrent()) return null;
+      if (nextJob.project_id !== initialJob.project_id) throw new Error('发布任务归属与当前项目不一致');
+      job = nextJob;
+      consecutiveFailures = 0;
+      onJob(job);
+    } catch (error) {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= maxPublishPollFailures) throw error;
+    }
   }
   return job;
 }
@@ -44,19 +61,50 @@ export default function Creator() {
   const [publishAccountsLoading, setPublishAccountsLoading] = useState(false);
   const [publishJob, setPublishJob] = useState<PublishJob | null>(null);
   const [publishingAction, setPublishingAction] = useState<PublishAction | ''>('');
+  const [publishPollingError, setPublishPollingError] = useState('');
+  const [refreshingPublishJob, setRefreshingPublishJob] = useState(false);
   const [publishForm] = Form.useForm();
   const [loading, setLoading] = useState('');
   const [imageLoadingType, setImageLoadingType] = useState('');
   const activeProjectIdRef = useRef<number | null>(null);
   const publishModalProjectIdRef = useRef<number | null>(null);
+  const publishRequestGenerationRef = useRef(0);
   const currentPublishJob = publishJob?.project_id === projectId ? publishJob : null;
+
+  function invalidatePublishRequest() {
+    publishRequestGenerationRef.current += 1;
+    setPublishingAction('');
+    setRefreshingPublishJob(false);
+  }
+
+  function beginPublishRequest(targetProjectId: number) {
+    const generation = publishRequestGenerationRef.current + 1;
+    publishRequestGenerationRef.current = generation;
+    setPublishPollingError('');
+    return { projectId: targetProjectId, generation };
+  }
+
+  function isPublishRequestCurrent(request: { projectId: number; generation: number }) {
+    return activeProjectIdRef.current === request.projectId
+      && publishModalProjectIdRef.current === request.projectId
+      && publishRequestGenerationRef.current === request.generation;
+  }
+
+  function acceptPublishJob(job: PublishJob, request: { projectId: number; generation: number }) {
+    if (!isPublishRequestCurrent(request)) return false;
+    if (job.project_id !== request.projectId) throw new Error('发布任务归属与当前项目不一致');
+    setPublishJob(job);
+    return true;
+  }
 
   function applyProject(project?: ContentProject) {
     if (!project) return;
     if (activeProjectIdRef.current !== project.id) {
       activeProjectIdRef.current = project.id;
+      publishModalProjectIdRef.current = null;
+      invalidatePublishRequest();
       setPublishJob(null);
-      setPublishingAction('');
+      setPublishPollingError('');
     }
     setProjectId(project.id);
     setSelectedTitle(project.title || '');
@@ -93,7 +141,7 @@ export default function Creator() {
     try {
       if (projectId && step === 'article') await saveArticle();
       setStep(nextStep);
-      setPublishOpen(false);
+      closePublishModal();
       if (projectId) await saveStage(nextStep);
       setStep(nextStep);
     } catch (error) {
@@ -278,8 +326,9 @@ export default function Creator() {
       const currentProjectId = activeProjectIdRef.current;
       if (publishModalProjectIdRef.current !== currentProjectId) {
         publishModalProjectIdRef.current = currentProjectId;
+        invalidatePublishRequest();
         setPublishJob(null);
-        setPublishingAction('');
+        setPublishPollingError('');
       }
       setPublishOpen(true);
       await loadPublishAccounts();
@@ -291,60 +340,110 @@ export default function Creator() {
   async function runPublishAction(action: PublishAction) {
     if (!projectId) return;
     const targetProjectId = projectId;
+    const request = beginPublishRequest(targetProjectId);
     const values = await publishForm.validateFields() as { account_id: number };
     const account = publishAccounts.find((item) => item.id === values.account_id);
     if (!account) {
       message.error('所选账号不存在或授权状态已变化，请刷新账号');
       return;
     }
-    if (activeProjectIdRef.current !== targetProjectId) return;
+    if (!isPublishRequestCurrent(request)) return;
     setPublishingAction(action);
+    let acceptedJob = false;
     try {
       const created = await api.createPublishJob({
         project_id: targetProjectId,
         account_id: account.id,
         action,
       });
-      if (activeProjectIdRef.current === created.project_id) setPublishJob(created);
-      const completed = await waitForPublishJob(created);
-      if (activeProjectIdRef.current === completed.project_id) setPublishJob(completed);
+      acceptedJob = acceptPublishJob(created, request);
+      if (!acceptedJob) return;
+      await waitForPublishJob(
+        created,
+        () => isPublishRequestCurrent(request),
+        (job) => acceptPublishJob(job, request),
+      );
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '发布失败');
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '发布失败';
+      if (acceptedJob) setPublishPollingError(text);
+      message.error(text);
     } finally {
-      if (activeProjectIdRef.current === targetProjectId) setPublishingAction('');
+      if (isPublishRequestCurrent(request)) setPublishingAction('');
     }
   }
 
   async function retryPublishJob() {
     if (!currentPublishJob) return;
     const targetProjectId = currentPublishJob.project_id;
+    const request = beginPublishRequest(targetProjectId);
     setPublishingAction(currentPublishJob.action);
     try {
       const job = await api.retryPublishJob(currentPublishJob.id);
-      if (activeProjectIdRef.current === job.project_id) setPublishJob(job);
-      const completed = await waitForPublishJob(job);
-      if (activeProjectIdRef.current === completed.project_id) setPublishJob(completed);
+      if (!acceptPublishJob(job, request)) return;
+      await waitForPublishJob(
+        job,
+        () => isPublishRequestCurrent(request),
+        (nextJob) => acceptPublishJob(nextJob, request),
+      );
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '重试失败');
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '重试失败';
+      setPublishPollingError(text);
+      message.error(text);
     } finally {
-      if (activeProjectIdRef.current === targetProjectId) setPublishingAction('');
+      if (isPublishRequestCurrent(request)) setPublishingAction('');
     }
   }
 
   async function resumePublishJob() {
     if (!currentPublishJob) return;
     const targetProjectId = currentPublishJob.project_id;
+    const request = beginPublishRequest(targetProjectId);
     setPublishingAction('publish');
     try {
       const job = await api.resumePublishJob(currentPublishJob.id);
-      if (activeProjectIdRef.current === job.project_id) setPublishJob(job);
-      const completed = await waitForPublishJob(job);
-      if (activeProjectIdRef.current === completed.project_id) setPublishJob(completed);
+      if (!acceptPublishJob(job, request)) return;
+      await waitForPublishJob(
+        job,
+        () => isPublishRequestCurrent(request),
+        (nextJob) => acceptPublishJob(nextJob, request),
+      );
     } catch (error) {
-      message.error(error instanceof Error ? error.message : '继续发布失败');
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '继续发布失败';
+      setPublishPollingError(text);
+      message.error(text);
     } finally {
-      if (activeProjectIdRef.current === targetProjectId) setPublishingAction('');
+      if (isPublishRequestCurrent(request)) setPublishingAction('');
     }
+  }
+
+  async function refreshPublishJob() {
+    if (!currentPublishJob) return;
+    const request = beginPublishRequest(currentPublishJob.project_id);
+    setRefreshingPublishJob(true);
+    try {
+      const job = await api.getPublishJob(currentPublishJob.id);
+      if (!acceptPublishJob(job, request)) return;
+      await waitForPublishJob(
+        job,
+        () => isPublishRequestCurrent(request),
+        (nextJob) => acceptPublishJob(nextJob, request),
+      );
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '刷新发布状态失败';
+      setPublishPollingError(text);
+      message.error(text);
+    } finally {
+      if (isPublishRequestCurrent(request)) setRefreshingPublishJob(false);
+    }
+  }
+
+  function closePublishModal() {
+    invalidatePublishRequest();
+    setPublishOpen(false);
   }
 
   return (
@@ -503,7 +602,7 @@ export default function Creator() {
           </Col>
         </Row>
       )}
-      <Modal title="发布配置" open={publishOpen} onCancel={() => setPublishOpen(false)} footer={null}>
+      <Modal title="发布配置" open={publishOpen} onCancel={closePublishModal} footer={null}>
         <Form form={publishForm} layout="vertical">
           <Form.Item label="选择账号" name="account_id" rules={[{ required: true, message: '请选择已授权公众号账号' }]}>
             <Select
@@ -521,6 +620,7 @@ export default function Creator() {
               message={currentPublishJob.status === 'platform_draft' ? '平台草稿已创建' : currentPublishJob.status === 'published' ? '平台发布已完成' : currentPublishJob.status === 'awaiting_confirmation' ? '等待运营人员确认' : currentPublishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
               description={(
                 <Space direction="vertical" size={4}>
+                  <span>发布任务 ID：{currentPublishJob.id}</span>
                   {currentPublishJob.status === 'platform_draft' && <span>平台草稿 ID：{currentPublishJob.platform_draft_id || '-'}</span>}
                   {currentPublishJob.status === 'published' && <span>平台发布 ID：{currentPublishJob.platform_publish_id || '-'}</span>}
                   {currentPublishJob.platform_url && <a href={currentPublishJob.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
@@ -528,6 +628,20 @@ export default function Creator() {
                   {currentPublishJob.status === 'awaiting_confirmation' && <Button type="primary" loading={publishingAction === 'publish'} onClick={resumePublishJob}>继续确认发布</Button>}
                   {currentPublishJob.status === 'failed' && <span>失败阶段：{currentPublishJob.failure_stage || '-'}<br />失败原因：{currentPublishJob.failure_reason || '-'}</span>}
                   {currentPublishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} onClick={retryPublishJob}>重试</Button>}
+                </Space>
+              )}
+            />
+          )}
+          {currentPublishJob && publishPollingError && (
+            <Alert
+              className="block-gap"
+              showIcon
+              type="warning"
+              message="发布状态刷新失败"
+              description={(
+                <Space direction="vertical" size={4}>
+                  <span>{publishPollingError}</span>
+                  <Button loading={refreshingPublishJob} onClick={refreshPublishJob}>刷新发布状态</Button>
                 </Space>
               )}
             />
@@ -549,7 +663,7 @@ export default function Creator() {
               一键发布
             </Button>
             <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={loadPublishAccounts}>刷新账号</Button>
-            <Button onClick={() => setPublishOpen(false)}>取消</Button>
+            <Button onClick={closePublishModal}>取消</Button>
           </Space>
         </Form>
       </Modal>
