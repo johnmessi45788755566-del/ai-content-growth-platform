@@ -19,7 +19,7 @@ from .browser_auth import BrowserAuthManager
 from .database import Database
 from .publishing.coordinator import PublishJobValidationError
 from .publishing.wechat import WeChatDraftPublisher
-from .services import ContentService, NotFoundError
+from .services import ContentService, NotFoundError, TaskConflictError
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -402,6 +402,8 @@ def create_app(
             return service.update_task(task_id, payload.model_dump())
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TaskConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

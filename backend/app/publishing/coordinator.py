@@ -359,45 +359,45 @@ class PublishCoordinator:
         return [value] if isinstance(value, str) else []
 
     def _redact_browser_context(self, job: Mapping[str, Any], value: Any) -> Any:
-        sensitive_keys = {
-            "authorization",
-            "accesstoken",
+        exact_sensitive_keys = {
             "apikey",
+            "authorization",
             "browsercontext",
-            "attempttoken",
             "bearer",
-            "cookie",
-            "cookies",
             "cdp",
             "cdpurl",
-            "credential",
-            "credentials",
-            "debugport",
             "debuggerurl",
             "jobcontext",
-            "password",
             "passwd",
-            "port",
-            "profile",
-            "profilepath",
-            "resume",
-            "resumecontext",
-            "resumehandle",
-            "refreshtoken",
-            "secret",
-            "session",
-            "sessionid",
             "state",
-            "token",
             "code",
             "websocketdebuggerurl",
             "websocketurl",
         }
+        sensitive_fragments = (
+            "auth",
+            "cookie",
+            "credential",
+            "debug",
+            "password",
+            "port",
+            "profile",
+            "resume",
+            "secret",
+            "session",
+            "token",
+        )
         if isinstance(value, Mapping):
             return {
                 key: self._redact_browser_context(job, item)
                 for key, item in value.items()
-                if re.sub(r"[^a-z0-9]", "", str(key).lower()) not in sensitive_keys
+                if (
+                    (normalized_key := re.sub(r"[^a-z0-9]", "", str(key).lower()))
+                    not in exact_sensitive_keys
+                    and not any(
+                        fragment in normalized_key for fragment in sensitive_fragments
+                    )
+                )
             }
         if isinstance(value, list):
             return [self._redact_browser_context(job, item) for item in value]

@@ -270,6 +270,15 @@ class PublisherWithNestedSecretKeys(FakePlatformPublisher):
         "secret-key-secret",
         "profile-path-secret",
         "debug-port-secret",
+        "client-secret-variant",
+        "api-token-variant",
+        "cookie-jar-variant",
+        "profile-dir-variant",
+        "debug-info-variant",
+        "password-hint-variant",
+        "auth-context-variant",
+        "session-cache-variant",
+        "port-binding-variant",
     )
 
     def publish(self, payload, account, action):
@@ -286,6 +295,10 @@ class PublisherWithNestedSecretKeys(FakePlatformPublisher):
                     "delivery_status": "accepted",
                     "request_id": "ordinary-platform-receipt",
                 },
+                "platform_draft_id": "ordinary-platform-draft-id",
+                "publish_id": "ordinary-publish-id",
+                "url": "https://mp.weixin.qq.com/s/ordinary-publish-id",
+                "receipt": {"request_id": "ordinary-receipt-id"},
                 "nested": [
                     {
                         "resume_context": {"handle": self.secret_values[0]},
@@ -306,6 +319,19 @@ class PublisherWithNestedSecretKeys(FakePlatformPublisher):
                         "secret": self.secret_values[11],
                         "profile path": self.secret_values[12],
                         "debug port": self.secret_values[13],
+                    },
+                    {
+                        "client_secret": self.secret_values[14],
+                        "api_token": self.secret_values[15],
+                        "cookie_jar": self.secret_values[16],
+                        "profile_dir": self.secret_values[17],
+                        "debug_info": self.secret_values[18],
+                    },
+                    {
+                        "password_hint": self.secret_values[19],
+                        "auth_context": self.secret_values[20],
+                        "session_cache": self.secret_values[21],
+                        "port_binding": self.secret_values[22],
                     },
                 ],
             },
@@ -615,7 +641,11 @@ def test_public_publish_job_drops_nested_normalized_secret_keys(tmp_path: Path):
             "delivery_status": "accepted",
             "request_id": "ordinary-platform-receipt",
         }
-        assert public_job["response"]["nested"] == [{}, {}, {}]
+        assert public_job["response"]["platform_draft_id"] == "ordinary-platform-draft-id"
+        assert public_job["response"]["publish_id"] == "ordinary-publish-id"
+        assert public_job["response"]["url"] == "https://mp.weixin.qq.com/s/ordinary-publish-id"
+        assert public_job["response"]["receipt"] == {"request_id": "ordinary-receipt-id"}
+        assert public_job["response"]["nested"] == [{}, {}, {}, {}, {}]
         for secret in publisher.secret_values:
             assert secret not in response.text
 
@@ -1713,7 +1743,11 @@ def test_task_list_and_detail_drop_nested_publish_job_secrets(tmp_path: Path):
             "delivery_status": "accepted",
             "request_id": "ordinary-platform-receipt",
         }
-        assert public_job["response"]["nested"] == [{}, {}, {}]
+        assert public_job["response"]["platform_draft_id"] == "ordinary-platform-draft-id"
+        assert public_job["response"]["publish_id"] == "ordinary-publish-id"
+        assert public_job["response"]["url"] == "https://mp.weixin.qq.com/s/ordinary-publish-id"
+        assert public_job["response"]["receipt"] == {"request_id": "ordinary-receipt-id"}
+        assert public_job["response"]["nested"] == [{}, {}, {}, {}, {}]
         for secret in publisher.secret_values:
             assert secret not in response.text
 
@@ -1795,7 +1829,7 @@ def test_initial_task_execution_links_pending_local_records_before_platform_retu
     assert final["publish_package"]["status"] == "published"
 
 
-def test_initial_task_finalization_rollback_stays_recoverable_with_same_job(tmp_path: Path):
+def test_initial_task_finalization_rollback_stays_active_until_local_recovery(tmp_path: Path):
     publisher = FakePlatformPublisher()
     app = create_app(
         database_path=tmp_path / "content.db",
@@ -1827,22 +1861,73 @@ def test_initial_task_finalization_rollback_stays_recoverable_with_same_job(tmp_
         """
     )
 
-    failed = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    pending_recovery = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
 
-    assert failed["status"] == "失败"
-    assert failed["publish_job"]["status"] == "published"
-    assert failed["runs"][0]["status"] == "失败"
-    assert failed["publish_package"]["status"] == "pending_publish"
-    original_job_id = failed["publish_job_id"]
+    assert pending_recovery["status"] == "执行中"
+    assert pending_recovery["publish_job"]["status"] == "published"
+    assert pending_recovery["runs"][0]["status"] == "执行中"
+    assert pending_recovery["publish_package"]["status"] == "pending_publish"
+    assert pending_recovery["failure_stage"] == ""
+    assert pending_recovery["failure_reason"] == ""
+    original_job_id = pending_recovery["publish_job_id"]
 
     service.db.execute("DROP TRIGGER fail_initial_task_run_finalization")
-    retried = service.retry_failed_tasks([task["id"]])
+    scan = service.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
     recovered = service.get_task(task["id"])
 
-    assert retried["updated"] == 1
+    assert scan["executed"] == 0
     assert recovered["status"] == "已发布"
     assert recovered["publish_job_id"] == original_job_id
     assert recovered["publish_package"]["status"] == "published"
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert len(publisher.calls) == 1
+
+
+def test_repeated_local_finalization_failures_remain_pending_without_republishing(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "连续最终化失败账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "连续最终化失败账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "连续本地事务失败不得重发",
+        }
+    )
+    service.db.execute(
+        """
+        CREATE TRIGGER keep_failing_task_run_finalization
+        BEFORE UPDATE ON task_runs
+        WHEN NEW.status = '已发布'
+        BEGIN
+          SELECT RAISE(ABORT, 'persistent local finalization failure');
+        END
+        """
+    )
+
+    first = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    first_scan = service.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
+    second_scan = service.execute_due_tasks(datetime(2026, 7, 14, 9, 32))
+    still_pending = service.get_task(task["id"])
+
+    assert first["status"] == "执行中"
+    assert first_scan["executed"] == second_scan["executed"] == 0
+    assert still_pending["status"] == "执行中"
+    assert still_pending["runs"][0]["status"] == "执行中"
+    assert still_pending["publish_job"]["status"] == "published"
+    assert still_pending["publish_package"]["status"] == "pending_publish"
+    assert still_pending["failure_stage"] == ""
+    assert still_pending["failure_reason"] == ""
     assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
     assert len(publisher.calls) == 1
 
@@ -2372,6 +2457,120 @@ def test_repeating_tasks_reschedule_daily_and_weekly(tmp_path: Path):
     assert daily_detail["next_run_at"] == "2026-07-09 09:30"
     assert weekly_detail["status"] == "待执行"
     assert weekly_detail["next_run_at"] == "2026-07-15 13:00"
+
+
+def test_patch_task_is_rejected_while_publish_is_running_without_duplicate_job(tmp_path: Path):
+    class BlockingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def publish(self, payload, account, action):
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+            return super().publish(payload, account, action)
+
+    publisher = BlockingPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "并发编辑账号")
+    task = client.post(
+        "/api/tasks",
+        json={
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "并发编辑账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "原始发布主题",
+            "execution_mode": "repeat",
+            "repeat_rule": "daily",
+        },
+    ).json()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(service.execute_task, task["id"], datetime(2026, 7, 14, 9, 30))
+        assert publisher.entered.wait(timeout=5)
+        response = client.patch(
+            f"/api/tasks/{task['id']}",
+            json={
+                "platform": "微信公众号",
+                "account_id": account_id,
+                "account_name": "并发编辑账号",
+                "execute_time": "2026-07-15 10:00",
+                "task_type": "微信公众号图文生成",
+                "topic": "不应覆盖的编辑主题",
+                "execution_mode": "repeat",
+                "repeat_rule": "daily",
+            },
+        )
+        during_publish = service.get_task(task["id"])
+        publisher.release.set()
+        final = future.result(timeout=5)
+
+    assert response.status_code == 409
+    assert "正在发布或等待确认" in response.json()["detail"]
+    assert during_publish["topic"] == "原始发布主题"
+    assert during_publish["publish_job_id"]
+    assert during_publish["publish_package_id"]
+    assert final["status"] == "待执行"
+    assert final["publish_job_id"] == during_publish["publish_job_id"]
+    assert final["publish_package_id"] == during_publish["publish_package_id"]
+    assert len(publisher.calls) == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
+def test_patch_task_is_rejected_while_waiting_or_linked_job_is_active(tmp_path: Path):
+    publisher = ConfirmationPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "待确认编辑账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "待确认编辑账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "待确认原始主题",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    payload = {
+        "platform": "微信公众号",
+        "account_id": account_id,
+        "account_name": "待确认编辑账号",
+        "execute_time": "2026-07-15 10:00",
+        "task_type": "微信公众号图文生成",
+        "topic": "不应覆盖的待确认主题",
+    }
+
+    waiting_response = client.patch(f"/api/tasks/{task['id']}", json=payload)
+    service.db.execute("UPDATE scheduled_tasks SET status = '失败' WHERE id = ?", (task["id"],))
+    active_job_response = client.patch(f"/api/tasks/{task['id']}", json=payload)
+    unchanged = service.get_task(task["id"])
+
+    assert waiting_response.status_code == 409
+    assert active_job_response.status_code == 409
+    assert unchanged["topic"] == "待确认原始主题"
+    assert unchanged["publish_job_id"] == waiting["publish_job_id"]
+    assert unchanged["publish_package_id"] == waiting["publish_package_id"]
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
 
 
 def test_api_task_edit_delete_detail_and_selected_retry(tmp_path: Path):

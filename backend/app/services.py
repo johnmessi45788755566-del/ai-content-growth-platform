@@ -57,6 +57,10 @@ class NotFoundError(RuntimeError):
     pass
 
 
+class TaskConflictError(RuntimeError):
+    pass
+
+
 class ContentService:
     def __init__(
         self,
@@ -736,34 +740,47 @@ class ContentService:
     def update_task(self, task_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         self.get_task(task_id)
         normalized = self._normalize_task_payload(payload, force_pending=True)
-        self.db.execute(
-            """
-            UPDATE scheduled_tasks
-            SET platform = ?, account_id = ?, account_name = ?, execute_time = ?, task_type = ?, topic = ?, article_requirements = ?,
-                selected_title = ?, title_direction = ?, status = '待执行',
-                publish_action = ?, execution_mode = ?, repeat_rule = ?, weekly_day = ?,
-                next_run_at = ?, failure_stage = '', failure_reason = '', publish_result = '', manual_takeover_url = '',
-                content_project_id = NULL, publish_package_id = NULL, publish_job_id = NULL, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-            """,
-            (
-                normalized["platform"],
-                normalized["account_id"],
-                normalized["account_name"],
-                normalized["execute_time"],
-                normalized["task_type"],
-                normalized["topic"],
-                normalized["article_requirements"],
-                normalized["selected_title"],
-                normalized["title_direction"],
-                normalized["publish_action"],
-                normalized["execution_mode"],
-                normalized["repeat_rule"],
-                normalized["weekly_day"],
-                normalized["next_run_at"],
-                task_id,
-            ),
-        )
+        with self.db.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET platform = ?, account_id = ?, account_name = ?, execute_time = ?, task_type = ?, topic = ?, article_requirements = ?,
+                    selected_title = ?, title_direction = ?, status = '待执行',
+                    publish_action = ?, execution_mode = ?, repeat_rule = ?, weekly_day = ?,
+                    next_run_at = ?, failure_stage = '', failure_reason = '', publish_result = '', manual_takeover_url = '',
+                    content_project_id = NULL, publish_package_id = NULL, publish_job_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status NOT IN ('执行中', '待人工确认')
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM publish_jobs
+                    WHERE publish_jobs.id = scheduled_tasks.publish_job_id
+                      AND publish_jobs.status IN (
+                        'pending', 'checking_login', 'uploading_assets', 'filling_content',
+                        'publishing', 'awaiting_confirmation'
+                      )
+                  )
+                """,
+                (
+                    normalized["platform"],
+                    normalized["account_id"],
+                    normalized["account_name"],
+                    normalized["execute_time"],
+                    normalized["task_type"],
+                    normalized["topic"],
+                    normalized["article_requirements"],
+                    normalized["selected_title"],
+                    normalized["title_direction"],
+                    normalized["publish_action"],
+                    normalized["execution_mode"],
+                    normalized["repeat_rule"],
+                    normalized["weekly_day"],
+                    normalized["next_run_at"],
+                    task_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError("任务正在发布或等待确认，暂不可编辑")
         return self.get_task(task_id)
 
     def delete_task(self, task_id: int) -> dict[str, Any]:
@@ -812,7 +829,11 @@ class ContentService:
             """
         )
         for task in recoverable_tasks:
-            self._recover_task_from_publish_job(int(task["id"]), current)
+            try:
+                self._recover_task_from_publish_job(int(task["id"]), current)
+            except Exception:
+                # A terminal platform job stays recoverable; a later scan retries only this transaction.
+                continue
         due_tasks = self.db.fetch_all(
             """
             SELECT id
@@ -879,6 +900,7 @@ class ContentService:
         project_id: int | None = None
         failed_package_id: int | None = None
         failed_job_id: int | None = None
+        finalization_started = False
         try:
             if task.get("publish_job_id"):
                 failed_job_id = int(task["publish_job_id"])
@@ -896,6 +918,7 @@ class ContentService:
                 elif job["status"] == "pending":
                     job = self.execute_publish_job(failed_job_id)
                 project_id = int(task.get("content_project_id") or job["project_id"])
+                finalization_started = True
                 self._finish_task_from_publish_job(
                     task,
                     run_id,
@@ -966,6 +989,7 @@ class ContentService:
             )
             job = self.execute_publish_job(failed_job_id)
             self._postprocess_publish_package(project, account, job)
+            finalization_started = True
             self._finish_task_from_publish_job(task, run_id, project["id"], package["id"], job, current)
         except Exception as exc:
             if failed_job_id is not None:
@@ -977,25 +1001,18 @@ class ContentService:
                     )
                     failed_package_id = int(package["id"]) if package else None
                 if job["status"] in {"platform_draft", "awaiting_confirmation", "published", "failed"}:
-                    try:
-                        self._finish_task_from_publish_job(
-                            task,
-                            run_id,
-                            int(project_id or job["project_id"]),
-                            failed_package_id,
-                            job,
-                            current,
-                        )
-                    except Exception as sync_exc:
-                        self._finish_task_failure(
-                            task_id,
-                            run_id,
-                            "同步发布结果",
-                            str(sync_exc),
-                            current,
-                            failed_package_id,
-                            failed_job_id,
-                        )
+                    if not finalization_started:
+                        try:
+                            self._finish_task_from_publish_job(
+                                task,
+                                run_id,
+                                int(project_id or job["project_id"]),
+                                failed_package_id,
+                                job,
+                                current,
+                            )
+                        except Exception:
+                            pass
                 else:
                     self._finish_task_failure(
                         task_id,

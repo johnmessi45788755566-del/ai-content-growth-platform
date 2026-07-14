@@ -80,8 +80,8 @@ python -m compileall -q app tests
 
 ## 范围与安全
 
-- 修改仅限 `backend/app/database.py`、`backend/app/services.py`、`backend/app/main.py`、`backend/tests/test_api.py`、`backend/tests/test_content_flow.py` 和本报告。
-- 未修改 frontend、`backend/app/publishing/*` 或浏览器发布适配器文件。
+- 修改仅限 `backend/app/database.py`、`backend/app/publishing/coordinator.py`、`backend/app/services.py`、`backend/app/main.py`、`backend/tests/test_api.py`、`backend/tests/test_content_flow.py` 和本报告。
+- 未修改 frontend 或浏览器发布适配器文件；后续审查按允许范围修改了 `backend/app/publishing/coordinator.py`。
 - 所有任务发布测试均使用 fake publisher；未执行任何真实平台写入。
 - 工作区中其他协作者的既有脏改动未回退。
 
@@ -264,3 +264,47 @@ git diff --check
 
 - 平台 job 终态仍先于本地 task/run/package 事务提交，这是外部系统与 SQLite 无法组成分布式事务的固有限制；当前通过预建 pending 本地记录、终态 package 不提前暴露、同 job 幂等恢复和 CAS 防陈旧覆盖控制风险。
 - 本轮所有发布路径测试使用 fake publisher 或故障注入，未执行任何真实平台写入。
+
+## 最终后端复审修复
+
+### 修复内容
+
+- `PATCH /api/tasks/{id}` 现在以单条条件更新同时检查 task 状态和关联 publish job 状态；`执行中`、`待人工确认` 或关联 pending/checking/uploading/filling/publishing/awaiting job 的任务返回 `409`，不会清空 project/package/job 关联。
+- publish job 公开资源在键规范化后匹配敏感语义片段，覆盖 client secret、API token、cookie jar、profile dir、debug info 以及 resume、credential、secret、token、cookie、profile、debug、password、auth、session、port 变体；普通 platform draft ID、publish ID、URL 和 receipt 保持可见。
+- 平台 job 已终态后，task/run/package 最终化失败不再调用 `_finish_task_failure`。task/run 保持 `执行中`、package 保持 `pending_publish`，恢复扫描仅重试本地事务；连续本地失败被隔离，不会重新调用 publisher。
+
+### RED: 最终复审故障复现
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py::test_patch_task_is_rejected_while_publish_is_running_without_duplicate_job backend/tests/test_api.py::test_patch_task_is_rejected_while_waiting_or_linked_job_is_active backend/tests/test_api.py::test_public_publish_job_drops_nested_normalized_secret_keys backend/tests/test_api.py::test_task_list_and_detail_drop_nested_publish_job_secrets backend/tests/test_api.py::test_initial_task_finalization_rollback_stays_active_until_local_recovery backend/tests/test_api.py::test_repeated_local_finalization_failures_remain_pending_without_republishing -q
+```
+
+结果：退出码 `1`，`6 failed, 1 warning in 0.96s`。分别复现活动任务 PATCH 成功清空关联、敏感语义键变体泄漏，以及终态 job 本地最终化失败后 task/run 被错误标记失败。
+
+### GREEN: 最终复审聚焦回归
+
+```bash
+PYTHONPATH=backend pytest backend/tests/test_api.py backend/tests/test_content_flow.py -q
+```
+
+结果：退出码 `0`，`81 passed, 1 warning in 4.41s`。并发阻塞发布测试确认 PATCH 返回 `409`、publisher 调用和 job 数均为 `1`；待确认与异常状态但仍关联活动 job 的任务同样不可编辑。故障注入还确认一次最终化失败可由扫描恢复，连续失败保持 pending 且不重发。
+
+### 最终指定验证
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+结果：退出码 `0`，`148 passed, 1 warning in 4.62s`。
+
+```bash
+python3 -m compileall -q backend/app
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有平台发布测试均使用 fake publisher，未执行真实平台写入。
