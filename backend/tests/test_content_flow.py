@@ -395,6 +395,102 @@ def test_late_stale_attempt_cannot_overwrite_new_attempt_evidence(
     assert final_private == new_private
 
 
+@pytest.mark.parametrize("late_outcome", ["success", "failure"])
+def test_late_stale_resume_cannot_overwrite_retry_evidence(tmp_path, late_outcome):
+    class BlockingResumePublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.publish_calls = 0
+            self.resume_calls = 0
+            self.resume_started = threading.Event()
+            self.release_resume = threading.Event()
+
+        def publish(self, payload, account, action):
+            self.publish_calls += 1
+            if self.publish_calls == 1:
+                return PublishResult(
+                    status="awaiting_confirmation",
+                    response={
+                        "source": "wechat_platform",
+                        "event": "operator_confirmation_required",
+                        "job_context": {"resume_handle": "late-resume-handle"},
+                    },
+                    requires_confirmation=True,
+                )
+            return PublishResult(
+                status="published",
+                platform_publish_id="new-retry-publish",
+                platform_url="https://mp.weixin.qq.com/s/new-retry-publish",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "new-retry-publish",
+                    "corroboration": "publish_success",
+                },
+            )
+
+        def resume(self, account, job_context):
+            self.resume_calls += 1
+            self.resume_started.set()
+            assert self.release_resume.wait(timeout=5)
+            if late_outcome == "failure":
+                raise RuntimeError("旧 resume 晚到失败")
+            return PublishResult(
+                status="published",
+                platform_publish_id="old-resume-publish",
+                platform_url="https://mp.weixin.qq.com/s/old-resume-publish",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "old-resume-publish",
+                    "corroboration": "publish_success",
+                },
+            )
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "晚到 resume ownership")
+    publisher = BlockingResumePublisher()
+    service.publish_coordinator.publisher = publisher
+    awaiting = service.create_publish_job(project["id"], account_id, "publish")
+    assert awaiting["status"] == "awaiting_confirmation"
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        old_resume = executor.submit(service.resume_publish_job, awaiting["id"])
+        assert publisher.resume_started.wait(timeout=5)
+        service.db.execute(
+            "UPDATE publish_jobs SET updated_at = '2026-07-14 01:00:00' WHERE id = ?",
+            (awaiting["id"],),
+        )
+
+        timed_out = service.publish_coordinator.fail_stale_in_progress_job(
+            awaiting["id"], "2026-07-14 01:15:00"
+        )
+        assert timed_out["status"] == "failed"
+
+        retried = service.retry_publish_job(awaiting["id"])
+        new_private = service.db.fetch_one(
+            "SELECT response_json FROM publish_jobs WHERE id = ?", (awaiting["id"],)
+        )["response_json"]
+        assert retried["status"] == "published"
+        assert retried["platform_publish_id"] == "new-retry-publish"
+        assert retried["response"]["receipt_id"] == "new-retry-publish"
+
+        publisher.release_resume.set()
+        old_resume.result(timeout=5)
+
+    final = service.get_publish_job(awaiting["id"])
+    final_private = service.db.fetch_one(
+        "SELECT response_json FROM publish_jobs WHERE id = ?", (awaiting["id"],)
+    )["response_json"]
+    assert publisher.publish_calls == 2
+    assert publisher.resume_calls == 1
+    assert final["status"] == "published"
+    assert final["platform_publish_id"] == "new-retry-publish"
+    assert final["response"]["receipt_id"] == "new-retry-publish"
+    assert final["failure_stage"] == ""
+    assert final["failure_reason"] == ""
+    assert final_private == new_private
+
+
 def test_recent_active_attempt_is_not_timed_out(tmp_path):
     class BlockingPublisher(FakePlatformPublisher):
         def __init__(self):

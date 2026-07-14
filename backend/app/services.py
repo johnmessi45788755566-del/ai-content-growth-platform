@@ -870,12 +870,22 @@ class ContentService:
         current = now or datetime.now()
         due_at = _format_task_time(current)
         recoverable_tasks = self.db.fetch_all(
-            """
+            f"""
             SELECT id
-            FROM scheduled_tasks
-            WHERE status = '执行中'
+            FROM scheduled_tasks AS tasks
+            WHERE tasks.status = '执行中'
+               OR (
+                    tasks.status = '待人工确认'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM publish_jobs AS jobs
+                        WHERE jobs.id = tasks.publish_job_id
+                          AND jobs.status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+                    )
+               )
             ORDER BY id ASC
-            """
+            """,
+            UNCERTAIN_IN_PROGRESS_STATUSES,
         )
         for task in recoverable_tasks:
             try:
@@ -914,11 +924,17 @@ class ContentService:
     def _recover_task_from_publish_job(self, task_id: int, current: datetime) -> bool:
         with self.db.transaction() as conn:
             task, run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
-            if (
-                task["status"] != "执行中"
-                or run is None
-                or run["status"] != "执行中"
+            if run is None:
+                return False
+            status_pair = (str(task["status"]), str(run["status"]))
+            if status_pair == ("执行中", "执行中"):
+                expected_task_status, expected_run_status = status_pair
+            elif (
+                status_pair == ("待人工确认", "待人工确认")
+                and publish_job_id is not None
             ):
+                expected_task_status, expected_run_status = status_pair
+            else:
                 return False
         if publish_job_id is None:
             if not self._adopt_orphan_pending_publish_job(task, run):
@@ -928,6 +944,11 @@ class ContentService:
                 if publish_job_id is None or run is None:
                     return False
         job = self.get_publish_job(publish_job_id)
+        if (
+            expected_task_status == "待人工确认"
+            and job["status"] not in UNCERTAIN_IN_PROGRESS_STATUSES
+        ):
+            return False
         if job["status"] == "pending":
             job = self.execute_publish_job(publish_job_id)
         elif job["status"] in UNCERTAIN_IN_PROGRESS_STATUSES:
@@ -969,6 +990,8 @@ class ContentService:
             int(package["id"]) if package else None,
             job,
             current,
+            expected_task_status=expected_task_status,
+            expected_run_status=expected_run_status,
         )
 
     def _adopt_orphan_pending_publish_job(

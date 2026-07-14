@@ -545,6 +545,53 @@ class ConfirmationPublisher(FakePlatformPublisher):
         )
 
 
+def prepare_task_interrupted_during_resume(tmp_path: Path, name: str):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    class InterruptedResumePublisher(ConfirmationPublisher):
+        def resume(self, account, job_context):
+            self.resume_calls += 1
+            raise SimulatedProcessExit
+
+    database_path = tmp_path / f"interrupted-resume-{name}.db"
+    upload_dir = tmp_path / f"interrupted-resume-uploads-{name}"
+    publisher = InterruptedResumePublisher()
+    app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, f"恢复中断-{name}")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": f"恢复中断-{name}",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": f"人工确认恢复中断-{name}",
+        }
+    )
+    waiting = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    assert waiting["status"] == "待人工确认"
+    assert waiting["runs"][0]["status"] == "待人工确认"
+
+    with pytest.raises(SimulatedProcessExit):
+        service.resume_publish_job(waiting["publish_job_id"])
+
+    interrupted = service.get_task(task["id"])
+    assert interrupted["status"] == "待人工确认"
+    assert interrupted["runs"][0]["status"] == "待人工确认"
+    assert interrupted["publish_package"]["status"] == "awaiting_confirmation"
+    assert interrupted["publish_job"]["status"] == "checking_login"
+    assert publisher.resume_calls == 1
+    return database_path, upload_dir, task, interrupted
+
+
 class TaskRetryPublisher(FakePlatformPublisher):
     def __init__(self, retry_outcome: str):
         super().__init__()
@@ -1851,6 +1898,14 @@ def test_repeat_task_waits_for_confirmation_before_scheduling_next_run(tmp_path:
     for private_field in ("resume_context", "token", "credentials", "job_context"):
         assert private_field not in public_job_text
 
+    scan = app.state.content_service.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
+    still_waiting = client.get(f"/api/tasks/{task['id']}").json()
+
+    assert scan["executed"] == 0
+    assert still_waiting["status"] == "待人工确认"
+    assert still_waiting["publish_job"]["status"] == "awaiting_confirmation"
+    assert publisher.resume_calls == 0
+
     resumed = client.post(f"/api/publish-jobs/{waiting['publish_job_id']}/resume")
     final_task = client.get(f"/api/tasks/{task['id']}").json()
 
@@ -2285,6 +2340,159 @@ def test_restart_adopts_pending_job_when_process_exits_before_task_link(tmp_path
     assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
     assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
     assert len(publisher.calls) == 1
+
+
+def test_restart_rebuilds_package_after_exit_between_prepare_and_package(tmp_path: Path):
+    class SimulatedProcessExit(BaseException):
+        pass
+
+    database_path = tmp_path / "prepare-before-package-exit.db"
+    upload_dir = tmp_path / "prepare-before-package-uploads"
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "prepare 后 package 前中断账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "prepare 后 package 前中断账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "prepare 后 package 前中断恢复",
+        }
+    )
+
+    def exit_before_package(*args, **kwargs):
+        raise SimulatedProcessExit
+
+    service._persist_publish_package = exit_before_package
+    with pytest.raises(SimulatedProcessExit):
+        service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+
+    orphan = service.db.fetch_one(
+        "SELECT id, status FROM publish_jobs ORDER BY id DESC LIMIT 1"
+    )
+    interrupted = service.get_task(task["id"])
+    assert orphan is not None
+    assert orphan["status"] == "pending"
+    assert interrupted["status"] == "执行中"
+    assert interrupted["publish_job_id"] is None
+    assert interrupted["publish_package_id"] is None
+    assert interrupted["runs"][0]["publish_job_id"] is None
+    assert interrupted["runs"][0]["publish_package_id"] is None
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 0
+    assert publisher.calls == []
+
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+    scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
+    recovered = restarted.get_task(task["id"])
+
+    assert scan["executed"] == 0
+    assert recovered["status"] == "已发布"
+    assert recovered["publish_job_id"] == orphan["id"]
+    assert recovered["runs"][0]["publish_job_id"] == orphan["id"]
+    assert recovered["publish_package"]["publish_job_id"] == orphan["id"]
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    assert len(publisher.calls) == 1
+
+
+def test_scheduler_fails_stale_claimed_resume_and_retry_reuses_job(tmp_path: Path):
+    database_path, upload_dir, task, interrupted = prepare_task_interrupted_during_resume(
+        tmp_path, "stale"
+    )
+    job_id = interrupted["publish_job_id"]
+    db = Database(database_path)
+    db.execute(
+        "UPDATE publish_jobs SET updated_at = '2026-07-14 01:00:00' WHERE id = ?",
+        (job_id,),
+    )
+    retry_publisher = FakePlatformPublisher()
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=retry_publisher,
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+
+    scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+    failed = restarted.get_task(task["id"])
+
+    assert scan["executed"] == 0
+    assert failed["status"] == "失败"
+    assert failed["runs"][0]["status"] == "失败"
+    assert failed["publish_package"]["status"] == "failed"
+    assert failed["publish_job"]["status"] == "failed"
+    assert failed["publish_job_id"] == job_id
+    assert failed["failure_stage"] == "发布中断"
+    assert "人工核对平台" in failed["failure_reason"]
+    assert retry_publisher.calls == []
+
+    retry = restarted.retry_failed_tasks([task["id"]])
+    recovered = restarted.get_task(task["id"])
+
+    assert retry["updated"] == 1
+    assert recovered["status"] == "已发布"
+    assert recovered["publish_job_id"] == job_id
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
+    assert len(retry_publisher.calls) == 1
+
+
+def test_scheduler_recognizes_recent_claimed_resume_without_timing_it_out(tmp_path: Path):
+    database_path, upload_dir, task, interrupted = prepare_task_interrupted_during_resume(
+        tmp_path, "recent"
+    )
+    job_id = interrupted["publish_job_id"]
+    db = Database(database_path)
+    db.execute(
+        "UPDATE publish_jobs SET updated_at = '2026-07-14 01:55:00' WHERE id = ?",
+        (job_id,),
+    )
+    restarted_app = create_app(
+        database_path=database_path,
+        upload_dir=upload_dir,
+        ai_client=FakeAIClient(),
+        platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    restarted = restarted_app.state.content_service
+    stale_checks = []
+    original_fail_stale = restarted.publish_coordinator.fail_stale_in_progress_job
+
+    def record_stale_check(requested_job_id, stale_before):
+        stale_checks.append((requested_job_id, stale_before))
+        return original_fail_stale(requested_job_id, stale_before)
+
+    restarted.publish_coordinator.fail_stale_in_progress_job = record_stale_check
+    scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 10, 0))
+    unchanged = restarted.get_task(task["id"])
+
+    assert scan["executed"] == 0
+    assert stale_checks == [(job_id, "2026-07-14 01:45:00")]
+    assert unchanged["status"] == "待人工确认"
+    assert unchanged["runs"][0]["status"] == "待人工确认"
+    assert unchanged["publish_package"]["status"] == "awaiting_confirmation"
+    assert unchanged["publish_job"]["status"] == "checking_login"
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_packages")["count"] == 1
 
 
 def test_stale_checking_login_job_moves_to_manual_interruption_failure(tmp_path: Path):

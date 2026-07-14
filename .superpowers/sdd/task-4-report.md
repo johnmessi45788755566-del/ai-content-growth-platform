@@ -574,3 +574,65 @@ git diff --check
 
 - orphan adoption 只处理当前代执行中 task/run 对应的唯一未关联 pending job；候选不唯一时刻意不猜测，任务保持可人工检查状态。
 - stale timeout 仍无法确认微信公众号后台是否已完成旧 attempt；系统只阻止旧回调覆盖新 attempt，是否发起显式 retry 仍需操作人员先核对平台。
+
+## 最新独立审查修复：人工确认恢复中断与 prepare/package 窗口
+
+### 修复内容
+
+- 调度恢复扫描除既有“执行中”任务外，只额外选择 task 为“待人工确认”且当前 linked job 处于 `checking_login`、`uploading_assets`、`filling_content` 或 `publishing` 的精确组合。普通 `awaiting_confirmation` job 扫描后仍保持等待且 `resume_calls=0`，不会被自动 resume 或重复发布。
+- 恢复函数要求 task/run 状态严格成对：既有“执行中/执行中”，或新增“待人工确认/待人工确认 + uncertain linked job”。stale job 超过 15 分钟后仍由协调器按 attempt token CAS 为 `failed`，task/run/package 最终化使用原“待人工确认”状态作为 CAS 条件；近期 job 只执行 stale 检查并保持不变。
+- 新增 prepare job 已提交、package 尚未写入时抛出 `BaseException` 的真实故障注入。重启扫描补建唯一 package、接回同一 pending job，最终 `publisher_calls=1`、`job_count=1`、`package_count=1`。
+- 新增 resume 专用 attempt ownership 回归：旧 resume 成功或失败回调在 stale timeout 和 retry 后晚到，均不能覆盖新 attempt 的平台 ID、公开 evidence、失败字段或私有 `response_json`。
+
+### TDD 证据
+
+RED：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_api.py::test_restart_rebuilds_package_after_exit_between_prepare_and_package backend/tests/test_api.py::test_scheduler_fails_stale_claimed_resume_and_retry_reuses_job backend/tests/test_api.py::test_scheduler_recognizes_recent_claimed_resume_without_timing_it_out backend/tests/test_content_flow.py::test_late_stale_resume_cannot_overwrite_retry_evidence
+```
+
+结果：退出码 `1`，`2 failed, 3 passed, 1 warning in 0.75s`。stale 的等待确认任务仍停留在“待人工确认”，近期 resume attempt 也未进入 stale 检查；prepare/package 中断恢复和 late resume attempt ownership 在旧实现已通过，作为缺失的故障注入与行为锁定。
+
+### GREEN 与最终验证
+
+聚焦发布恢复与 attempt ownership：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests/test_api.py::test_repeat_task_waits_for_confirmation_before_scheduling_next_run backend/tests/test_api.py::test_interrupted_pending_publish_job_executes_same_job backend/tests/test_api.py::test_restart_adopts_pending_job_when_process_exits_before_task_link backend/tests/test_api.py::test_restart_rebuilds_package_after_exit_between_prepare_and_package backend/tests/test_api.py::test_stale_checking_login_job_moves_to_manual_interruption_failure backend/tests/test_api.py::test_recent_checking_login_job_is_not_changed_by_recovery_scan backend/tests/test_api.py::test_scheduler_fails_stale_claimed_resume_and_retry_reuses_job backend/tests/test_api.py::test_scheduler_recognizes_recent_claimed_resume_without_timing_it_out backend/tests/test_content_flow.py::test_resume_publish_job_claim_allows_only_one_publisher_call backend/tests/test_content_flow.py::test_late_stale_attempt_cannot_overwrite_new_attempt_evidence backend/tests/test_content_flow.py::test_late_stale_resume_cannot_overwrite_retry_evidence backend/tests/test_content_flow.py::test_recent_active_attempt_is_not_timed_out
+```
+
+结果：退出码 `0`，`15 passed, 1 warning in 1.24s`。
+
+Task4：
+
+```bash
+cd backend && python -m pytest -q tests/test_api.py tests/test_content_flow.py::test_existing_scheduled_tasks_reject_invalid_publish_action_after_migration tests/test_content_flow.py::test_concurrent_task_execution_claims_generation_once tests/test_content_flow.py::test_concurrent_failed_task_retries_claim_once -k task
+```
+
+结果：退出码 `0`，`42 passed, 38 deselected, 1 warning in 3.08s`。
+
+完整 backend：
+
+```bash
+PYTHONPATH=backend pytest -q backend/tests
+```
+
+结果：退出码 `0`，`179 passed, 1 warning in 8.34s`。
+
+```bash
+python3 -m compileall -q backend/app backend/tests
+```
+
+结果：无输出，退出码 `0`。
+
+```bash
+git diff --check
+```
+
+结果：无输出，退出码 `0`。唯一 warning 仍为既有 FastAPI TestClient 的 Starlette/httpx 弃用提示；所有发布测试使用 fake publisher，未执行真实平台写入。
+
+### Concern
+
+- uncertain resume attempt 超时后仍无法自动确认微信公众号后台的真实结果，继续采用 fail-closed 并要求人工核对后显式 retry。
+- prepare/package 恢复只接回当前代唯一、未被 task/run 占用的 pending job；候选不唯一时保持原有 fail closed，不猜测归属。
