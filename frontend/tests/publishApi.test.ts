@@ -37,4 +37,16 @@ describe('publish job API', () => {
     expect(fetch).toHaveBeenNthCalledWith(2, `${API_BASE}/api/publish-jobs/8/retry`, expect.objectContaining({ method: 'POST' }));
     expect(fetch).toHaveBeenNthCalledWith(3, `${API_BASE}/api/publish-jobs/8/resume`, expect.objectContaining({ method: 'POST' }));
   });
+
+  it('loads the current publish job for one project, account, and action', async () => {
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({ job: { id: 8, status: 'platform_draft' } }));
+    vi.stubGlobal('fetch', fetch);
+
+    await api.currentPublishJob(3, 5, 'draft');
+
+    expect(fetch).toHaveBeenCalledWith(
+      `${API_BASE}/api/publish-jobs/current?project_id=3&account_id=5&action=draft`,
+      expect.any(Object),
+    );
+  });
 });

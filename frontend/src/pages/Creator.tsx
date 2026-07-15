@@ -315,10 +315,43 @@ export default function Creator() {
       if (!current && accounts.length) {
         publishForm.setFieldValue('account_id', accounts[0].id);
       }
+      return accounts;
     } catch (error) {
       message.error(error instanceof Error ? error.message : '加载授权账号失败');
+      return [];
     } finally {
       setPublishAccountsLoading(false);
+    }
+  }
+
+  async function restorePublishJob(targetProjectId: number, accountId: number) {
+    const request = beginPublishRequest(targetProjectId);
+    try {
+      const resources = await Promise.all(
+        (['draft', 'publish'] as PublishAction[]).map((action) => (
+          api.currentPublishJob(targetProjectId, accountId, action)
+        )),
+      );
+      if (!isPublishRequestCurrent(request)) return;
+      const existing = resources
+        .map((resource) => resource.job)
+        .filter((job): job is PublishJob => Boolean(job))
+        .sort((left, right) => right.id - left.id)[0];
+      if (!existing) {
+        setPublishJob(null);
+        return;
+      }
+      if (!acceptPublishJob(existing, request)) return;
+      await waitForPublishJob(
+        existing,
+        () => isPublishRequestCurrent(request),
+        (job) => acceptPublishJob(job, request),
+      );
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '恢复发布状态失败';
+      setPublishPollingError(text);
+      message.error(text);
     }
   }
 
@@ -333,7 +366,11 @@ export default function Creator() {
         setPublishPollingError('');
       }
       setPublishOpen(true);
-      await loadPublishAccounts();
+      const accounts = await loadPublishAccounts();
+      const accountId = Number(publishForm.getFieldValue('account_id'));
+      if (currentProjectId && accountId && accounts.some((account) => account.id === accountId)) {
+        await restorePublishJob(currentProjectId, accountId);
+      }
     } catch (error) {
       message.error(error instanceof Error ? error.message : '保存排版失败');
     }
@@ -612,6 +649,9 @@ export default function Creator() {
               loading={publishAccountsLoading}
               placeholder={publishAccounts.length ? '请选择已授权公众号账号' : '暂无已授权公众号账号，请先到账号矩阵登录'}
               options={publishAccounts.map((account) => ({ value: account.id, label: account.name }))}
+              onChange={(accountId) => {
+                if (projectId) restorePublishJob(projectId, accountId);
+              }}
             />
           </Form.Item>
           {currentPublishJob && (

@@ -158,6 +158,15 @@ class Database:
                   CHECK(status <> 'awaiting_confirmation' OR requires_confirmation = 1)
                 );
 
+                CREATE TABLE IF NOT EXISTS publish_job_idempotency (
+                  project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE RESTRICT,
+                  account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE RESTRICT,
+                  action TEXT NOT NULL CHECK(action IN ('draft', 'publish')),
+                  publish_job_id INTEGER NOT NULL UNIQUE REFERENCES publish_jobs(id) ON DELETE RESTRICT,
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  PRIMARY KEY (project_id, account_id, action)
+                );
+
                 CREATE TABLE IF NOT EXISTS account_metric_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
@@ -302,6 +311,16 @@ class Database:
                       )
                     """
                 )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO publish_job_idempotency (
+                  project_id, account_id, action, publish_job_id
+                )
+                SELECT project_id, account_id, action, MAX(id)
+                FROM publish_jobs
+                GROUP BY project_id, account_id, action
+                """
+            )
             for backfill_sql in [
                 """
                 UPDATE task_runs
@@ -405,6 +424,18 @@ class Database:
                 DROP TRIGGER IF EXISTS publish_jobs_account_update;
                 DROP TRIGGER IF EXISTS publish_jobs_result_insert;
                 DROP TRIGGER IF EXISTS publish_jobs_result_update;
+                DROP TRIGGER IF EXISTS platform_accounts_referenced_delete;
+
+                CREATE TRIGGER platform_accounts_referenced_delete
+                BEFORE DELETE ON platform_accounts
+                WHEN EXISTS (
+                  SELECT 1 FROM publish_jobs WHERE account_id = OLD.id
+                ) OR EXISTS (
+                  SELECT 1 FROM scheduled_tasks WHERE account_id = OLD.id
+                )
+                BEGIN
+                  SELECT RAISE(ABORT, 'referenced platform account cannot be deleted');
+                END;
 
                 CREATE TRIGGER publish_jobs_platform_insert
                 BEFORE INSERT ON publish_jobs

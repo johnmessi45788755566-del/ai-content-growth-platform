@@ -84,6 +84,7 @@ class PendingConfirmation:
     title: str
     baseline: dict[str, Any]
     timer: Any
+    expiry_callback: Any | None = None
 
 
 class ChromeCDPBrowserGateway:
@@ -211,11 +212,21 @@ class ChromeCDPBrowserGateway:
         pending.timer.cancel()
         self.close(pending.session)
 
+    def bind_confirmation_expiry(self, resume_handle: str, callback: Any) -> None:
+        with self._lock:
+            pending = self._pending.get(resume_handle)
+            if pending:
+                pending.expiry_callback = callback
+        if not pending:
+            callback()
+
     def _expire_pending(self, resume_handle: str) -> None:
         with self._lock:
             pending = self._pending.pop(resume_handle, None)
         if pending:
             self.close(pending.session)
+            if pending.expiry_callback:
+                pending.expiry_callback()
 
     def navigate(self, session: BrowserSession, url: str) -> None:
         self._cdp_call(session, "Page.navigate", {"url": url})
@@ -340,6 +351,62 @@ class ChromeCDPBrowserGateway:
             time.sleep(0.5)
         raise WeChatPublishingError(f"微信公众号登录态失效，请重新扫码（当前页面：{last_url or '未知'}）")
 
+    def require_account_identity(
+        self, session: BrowserSession, account: Mapping[str, Any]
+    ) -> None:
+        cookies = self._cdp_call(session, "Network.getAllCookies").get("cookies") or []
+        live_external_id = next(
+            (
+                str(cookie.get("value") or "").strip()
+                for cookie in cookies
+                if cookie.get("name") == "bizuin" and self._valid_auth_cookie(cookie)
+            ),
+            "",
+        )
+        expected_external_id = str(account.get("external_id") or "").strip()
+        if expected_external_id and live_external_id:
+            if expected_external_id != live_external_id:
+                raise WeChatPublishingError("当前登录公众号与所选账号不一致，已终止发布")
+            return
+
+        expected_name = self._normalize_account_name(account.get("name"))
+        live_name = self._normalize_account_name(
+            self.evaluate(session, self._account_name_expression())
+        )
+        if not expected_name or not live_name:
+            raise WeChatPublishingError("无法验证当前登录公众号身份，请重新授权所选账号")
+        if expected_name != live_name:
+            raise WeChatPublishingError("当前登录公众号与所选账号不一致，已终止发布")
+
+    @staticmethod
+    def _normalize_account_name(value: Any) -> str:
+        return unicodedata.normalize("NFKC", str(value or "")).strip()
+
+    @staticmethod
+    def _account_name_expression() -> str:
+        return """
+        (() => {
+          const selectors = [
+            '.weui-desktop-account__nickname',
+            '.weui-desktop-account__name',
+            '.account_meta_info .nickname',
+            '.account_info .nickname'
+          ];
+          for (const selector of selectors) {
+            const text = document.querySelector(selector)?.textContent?.trim();
+            if (text && text.length <= 80) return text;
+          }
+          const roots = [window.wx?.cgiData, window.cgiData];
+          for (const root of roots) {
+            const text = root?.nickname || root?.nick_name || root?.account_name;
+            if (typeof text === 'string' && text.trim() && text.trim().length <= 80) {
+              return text.trim();
+            }
+          }
+          return '';
+        })()
+        """
+
     @staticmethod
     def _valid_auth_cookie(cookie: Mapping[str, Any]) -> bool:
         name = str(cookie.get("name") or "")
@@ -393,6 +460,12 @@ class ChromeCDPBrowserGateway:
         self._wait_for_document(session)
 
     def fill_article(self, session: BrowserSession, payload: Mapping[str, Any]) -> None:
+        self.fill_article_content(session, payload)
+        self.upload_article_assets(session, payload)
+
+    def fill_article_content(
+        self, session: BrowserSession, payload: Mapping[str, Any]
+    ) -> None:
         self._set_value(session, TITLE_SELECTORS, str(payload.get("title") or ""), "标题")
         author = str(payload.get("author") or "").strip()
         if author:
@@ -407,6 +480,10 @@ class ChromeCDPBrowserGateway:
             if content:
                 sections.append(f"<p>{html.escape(content).replace(chr(10), '<br>')}</p>")
         self._set_editor_html(session, "".join(sections))
+
+    def upload_article_assets(
+        self, session: BrowserSession, payload: Mapping[str, Any]
+    ) -> None:
         self.set_file_input(
             session,
             COVER_FILE_SELECTORS,

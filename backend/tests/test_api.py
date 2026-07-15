@@ -1,4 +1,5 @@
 import json
+import inspect
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+import app.services as services_module
 from app.ai import GeneratedImage, TopicRecommendation
 from app.database import Database
 from app.main import create_app
@@ -38,6 +40,13 @@ class FakeAIClient:
 class FailingImageAIClient(FakeAIClient):
     def generate_image(self, prompt: str, image_type: str):
         raise RuntimeError("图片模型账户欠费")
+
+
+class FixedServiceDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = cls(2026, 7, 14, 9, 31)
+        return value.replace(tzinfo=tz) if tz else value
 
 
 class FakeBrowserAuthManager:
@@ -970,6 +979,49 @@ def test_failed_publish_job_can_retry_as_same_resource(tmp_path: Path):
     assert retried.json()["status"] == "platform_draft"
 
 
+def test_create_publish_job_and_refresh_current_resource_are_idempotent(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+    payload = {
+        "project_id": project["id"],
+        "account_id": account_id,
+        "action": "draft",
+    }
+
+    first = client.post("/api/publish-jobs", json=payload)
+    replayed = client.post("/api/publish-jobs", json=payload)
+    refreshed = client.get(
+        "/api/publish-jobs/current",
+        params=payload,
+    )
+
+    assert first.status_code == replayed.status_code == refreshed.status_code == 200
+    assert replayed.json()["id"] == first.json()["id"]
+    assert refreshed.json()["job"]["id"] == first.json()["id"]
+    assert refreshed.json()["job"]["status"] == "platform_draft"
+    assert len(publisher.calls) == 1
+    assert "response_json" not in refreshed.text
+    assert "profile_path" not in refreshed.text
+
+
+def test_current_publish_job_returns_null_for_an_action_not_started(tmp_path: Path):
+    client, project, account_id = prepare_publish_job_api(
+        tmp_path, FakePlatformPublisher()
+    )
+
+    response = client.get(
+        "/api/publish-jobs/current",
+        params={
+            "project_id": project["id"],
+            "account_id": account_id,
+            "action": "publish",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"job": None}
+
+
 @pytest.mark.parametrize(
     (
         "retry_outcome",
@@ -994,6 +1046,7 @@ def test_failed_publish_job_can_retry_as_same_resource(tmp_path: Path):
 )
 def test_task_linked_publish_job_retry_api_synchronizes_local_state(
     tmp_path: Path,
+    monkeypatch,
     retry_outcome: str,
     expected_task_status: str,
     expected_run_status: str,
@@ -1001,6 +1054,7 @@ def test_task_linked_publish_job_retry_api_synchronizes_local_state(
     expected_next_run: str,
     expected_failure: str,
 ):
+    monkeypatch.setattr(services_module, "datetime", FixedServiceDatetime)
     publisher = TaskRetryPublisher(retry_outcome)
     app = create_app(
         database_path=tmp_path / f"retry-{retry_outcome}.db",
@@ -1497,6 +1551,330 @@ def test_accounts_auth_sync_and_analytics_flow(tmp_path: Path):
     assert works[0]["reads"] == 144
 
 
+def test_account_auth_api_returns_waiting_then_poll_success_and_timeout(tmp_path: Path):
+    class SequencedBrowserAuthManager:
+        def __init__(self):
+            self.sessions = {}
+            self.on_success = None
+            self.counter = 0
+
+        def start(self, platform, account_name, on_success):
+            self.counter += 1
+            session_id = f"session-{self.counter}"
+            self.on_success = on_success
+            self.sessions[session_id] = {
+                "session_id": session_id,
+                "platform": platform,
+                "status": "waiting",
+                "message": "等待扫码登录",
+                "login_url": "https://mp.weixin.qq.com/",
+                "account": None,
+                "error": "",
+            }
+            return dict(self.sessions[session_id])
+
+        def succeed(self, session_id):
+            account = self.on_success(
+                {
+                    "platform": "微信公众号",
+                    "account_name": "轮询成功账号",
+                    "external_id": "poll-success-bizuin",
+                    "profile_path": "/tmp/poll-success-profile",
+                    "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=private",
+                }
+            )
+            self.sessions[session_id].update(
+                status="success", message="登录成功", account=account
+            )
+
+        def timeout(self, session_id):
+            self.sessions[session_id].update(
+                status="failed",
+                message="登录超时，请重新发起登录",
+                error="登录超时，请重新发起登录",
+            )
+
+        def get_status(self, session_id):
+            return dict(self.sessions[session_id])
+
+        def cancel(self, session_id):
+            self.sessions[session_id]["status"] = "cancelled"
+            return dict(self.sessions[session_id])
+
+        def close_all(self):
+            return None
+
+    browser_auth = SequencedBrowserAuthManager()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=browser_auth,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+
+    waiting = client.post(
+        "/api/accounts/auth/start", json={"platform": "微信公众号"}
+    )
+    assert waiting.status_code == 200
+    assert waiting.json()["status"] == "waiting"
+    assert waiting.json()["account"] is None
+
+    browser_auth.succeed(waiting.json()["session_id"])
+    succeeded = client.get(f"/api/accounts/auth/{waiting.json()['session_id']}")
+    assert succeeded.status_code == 200
+    assert succeeded.json()["status"] == "success"
+    assert succeeded.json()["account"]["name"] == "轮询成功账号"
+    assert "profile_path" not in succeeded.text
+    assert "token=private" not in succeeded.text
+
+    second = client.post(
+        "/api/accounts/auth/start", json={"platform": "微信公众号"}
+    ).json()
+    browser_auth.timeout(second["session_id"])
+    timed_out = client.get(f"/api/accounts/auth/{second['session_id']}")
+    assert timed_out.status_code == 200
+    assert timed_out.json()["status"] == "failed"
+    assert "登录超时" in timed_out.json()["error"]
+
+
+def test_account_reauthorization_updates_profile_and_stable_identity_fields(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    first = service._complete_account_auth(
+        {
+            "platform": "微信公众号",
+            "account_name": "旧账号名",
+            "external_id": "stable-bizuin",
+            "profile_path": "/tmp/old-profile",
+            "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=old",
+        }
+    )
+
+    second = service._complete_account_auth(
+        {
+            "platform": "微信公众号",
+            "account_name": "真实账号名",
+            "external_id": "stable-bizuin",
+            "profile_path": "/tmp/new-profile",
+            "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=new",
+        }
+    )
+
+    private_account = service.get_account(first["id"])
+    assert second["id"] == first["id"]
+    assert second["name"] == "真实账号名"
+    assert second["external_id"] == "stable-bizuin"
+    assert private_account["profile_path"] == "/tmp/new-profile"
+    assert "token=new" in private_account["login_url"]
+
+
+def test_account_auth_does_not_merge_different_stable_ids_with_same_name(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    first = service._complete_account_auth(
+        {
+            "platform": "微信公众号",
+            "account_name": "同名公众号",
+            "external_id": "first-bizuin",
+            "profile_path": "/tmp/first-profile",
+            "login_url": "https://mp.weixin.qq.com/",
+        }
+    )
+
+    second = service._complete_account_auth(
+        {
+            "platform": "微信公众号",
+            "account_name": "同名公众号",
+            "external_id": "second-bizuin",
+            "profile_path": "/tmp/second-profile",
+            "login_url": "https://mp.weixin.qq.com/",
+        }
+    )
+
+    assert second["id"] != first["id"]
+    assert service.get_account(first["id"])["external_id"] == "first-bizuin"
+    assert service.get_account(second["id"])["external_id"] == "second-bizuin"
+
+
+def test_account_management_update_cannot_overwrite_authenticated_identity(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account = client.post(
+        "/api/accounts/auth/start",
+        json={"platform": "微信公众号", "account_name": "真实身份账号"},
+    ).json()["account"]
+
+    updated = client.patch(
+        f"/api/accounts/{account['id']}",
+        json={
+            "name": "伪造账号名",
+            "external_id": "forged-bizuin",
+            "owner": "新运营人",
+            "tag": "新标签",
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "真实身份账号"
+    assert updated.json()["external_id"] == "real-platform-id"
+    assert updated.json()["owner"] == "新运营人"
+    assert updated.json()["tag"] == "新标签"
+
+
+def test_account_sync_rejects_wrong_stable_identity_before_writing_metrics(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    account_id = db.execute(
+        """
+        INSERT INTO platform_accounts (platform, name, external_id, auth_status)
+        VALUES ('微信公众号', '所选公众号', 'selected-bizuin', '已授权')
+        """
+    )
+
+    with pytest.raises(RuntimeError, match="账号身份与所选账号不一致"):
+        service._persist_account_sync(
+            account_id,
+            {
+                "source": "browser",
+                "account_name": "所选公众号",
+                "external_id": "wrong-bizuin",
+                "metrics": {"fans": 999},
+                "works": [],
+            },
+        )
+
+    account = service.get_account(account_id)
+    assert account["external_id"] == "selected-bizuin"
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS count FROM account_metric_snapshots WHERE account_id = ?",
+        (account_id,),
+    )["count"] == 0
+
+
+def test_api_write_rejects_untrusted_origin_but_allows_trusted_and_originless_calls(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    payload = {"title": "Origin 防护", "platform": "微信公众号"}
+
+    malicious = client.post(
+        "/api/content-projects",
+        json=payload,
+        headers={"Origin": "https://evil.example"},
+    )
+    trusted = client.post(
+        "/api/content-projects",
+        json=payload,
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+    internal = client.post("/api/content-projects", json=payload)
+
+    assert malicious.status_code == 403
+    assert malicious.json()["detail"] == "请求来源不受信任"
+    assert trusted.status_code == 200
+    assert trusted.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+    assert internal.status_code == 200
+
+
+def test_app_rejects_wildcard_trusted_origin_configuration(tmp_path: Path):
+    with pytest.raises(RuntimeError, match="明确的可信 Origin"):
+        create_app(
+            database_path=tmp_path / "content.db",
+            upload_dir=tmp_path / "uploads",
+            ai_client=FakeAIClient(),
+            scheduler_enabled=False,
+            trusted_origins=["*"],
+        )
+
+
+def test_scheduler_dispatches_blocking_maintenance_to_worker_thread():
+    source = inspect.getsource(create_app)
+    scheduler_source = source[
+        source.index("async def task_scheduler_loop") : source.index("@asynccontextmanager")
+    ]
+
+    assert "await asyncio.to_thread" in scheduler_source
+    assert "service.sync_due_accounts()" not in scheduler_source
+    assert "service.execute_due_tasks()" not in scheduler_source
+
+
+def test_referenced_accounts_cannot_be_deleted_but_unreferenced_account_can(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    task_account_id = add_authorized_account(service, "任务引用账号")
+    job_account_id = add_authorized_account(service, "发布引用账号")
+    free_account_id = add_authorized_account(service, "无引用账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": task_account_id,
+            "account_name": "任务引用账号",
+            "execute_time": "2026-07-16 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "账号删除引用保护",
+        }
+    )
+    project = service.create_project("发布历史引用保护", platform="微信公众号")
+    job_id = service.db.execute(
+        """
+        INSERT INTO publish_jobs (project_id, account_id, platform, action, status)
+        VALUES (?, ?, '微信公众号', 'draft', 'pending')
+        """,
+        (project["id"], job_account_id),
+    )
+
+    task_conflict = client.delete(f"/api/accounts/{task_account_id}")
+    job_conflict = client.delete(f"/api/accounts/{job_account_id}")
+    deleted = client.delete(f"/api/accounts/{free_account_id}")
+
+    assert task_conflict.status_code == 409
+    assert job_conflict.status_code == 409
+    assert "引用" in task_conflict.json()["detail"]
+    assert "引用" in job_conflict.json()["detail"]
+    assert service.get_task(task["id"])["account_id"] == task_account_id
+    assert service.get_publish_job(job_id)["account_id"] == job_account_id
+    assert service.get_public_account(task_account_id)["name"] == "任务引用账号"
+    assert service.get_public_account(job_account_id)["name"] == "发布引用账号"
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True, "id": free_account_id}
+
+
 def test_public_account_endpoints_use_safe_whitelist_but_sync_receives_private_record(tmp_path: Path):
     class CapturingBrowserAuthManager(FakeBrowserAuthManager):
         def __init__(self):
@@ -1865,7 +2243,8 @@ def test_draft_task_remains_distinct_from_direct_publish(tmp_path: Path):
     assert detail["runs"][0]["status"] == "已生成平台草稿"
 
 
-def test_repeat_task_waits_for_confirmation_before_scheduling_next_run(tmp_path: Path):
+def test_repeat_task_waits_for_confirmation_before_scheduling_next_run(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(services_module, "datetime", FixedServiceDatetime)
     publisher = ConfirmationPublisher()
     app = create_app(
         database_path=tmp_path / "content.db",

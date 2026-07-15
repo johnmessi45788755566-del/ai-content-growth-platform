@@ -1,16 +1,18 @@
-import { Button, Card, Drawer, Form, Input, message, Modal, Popconfirm, Select, Space, Table } from 'antd';
+import { Alert, Button, Card, Drawer, Form, Input, message, Modal, Popconfirm, Select, Space, Spin, Table } from 'antd';
 import { useEffect, useMemo, useState } from 'react';
 import { Detail, MetricCards, Platform, SmallTag, Status } from '@/components/Common';
 import { api } from '@/services/api';
-import type { PlatformAccount } from '@/types';
+import type { AccountAuthSession, PlatformAccount } from '@/types';
 
 const platformOptions = ['微信公众号', '视频号', '小红书', '抖音'];
 
 export default function Accounts() {
-  const [form] = Form.useForm();
+  const [editForm] = Form.useForm();
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [active, setActive] = useState<PlatformAccount | null>(null);
-  const [authResult, setAuthResult] = useState<{ qr_url: string; account: PlatformAccount } | null>(null);
+  const [editing, setEditing] = useState<PlatformAccount | null>(null);
+  const [authSession, setAuthSession] = useState<AccountAuthSession | null>(null);
+  const [authLoading, setAuthLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [platform, setPlatform] = useState('');
@@ -37,15 +39,54 @@ export default function Accounts() {
     loadAccounts();
   }, [platform, authStatus]);
 
-  async function submitAuth(values: { platform: string; account_name?: string }) {
+  async function startPlatformLogin(selectedPlatform: string) {
+    setAuthLoading(true);
     try {
-      const data = await api.startAccountAuth(values);
-      setAuthResult(data);
-      await loadAccounts();
-      message.success('账号已授权并同步近 30 天数据');
+      const data = await api.startAccountAuth({ platform: selectedPlatform });
+      setAuthSession(data);
     } catch (error) {
       message.error(error instanceof Error ? error.message : '添加账号失败');
+    } finally {
+      setAuthLoading(false);
     }
+  }
+
+  useEffect(() => {
+    if (!authSession || authSession.status !== 'waiting') return;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await api.accountAuthStatus(authSession.session_id);
+        setAuthSession(data);
+        if (data.status === 'success') {
+          window.clearInterval(timer);
+          await loadAccounts();
+          message.success('真实登录成功，账号已加入工作台');
+        }
+        if (data.status === 'failed' || data.status === 'cancelled') {
+          window.clearInterval(timer);
+        }
+      } catch (error) {
+        window.clearInterval(timer);
+        const text = error instanceof Error ? error.message : '登录状态检测失败';
+        setAuthSession((current) => current?.session_id === authSession.session_id
+          ? { ...current, status: 'failed', message: text, error: text }
+          : current);
+        message.error(text);
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [authSession?.session_id, authSession?.status]);
+
+  async function closeAuthModal() {
+    if (authSession?.status === 'waiting') {
+      try {
+        await api.cancelAccountAuth(authSession.session_id);
+      } catch {
+        // 登录窗口可能已由用户关闭。
+      }
+    }
+    setAuthOpen(false);
+    setAuthSession(null);
   }
 
   async function syncAccount(account: PlatformAccount) {
@@ -64,6 +105,31 @@ export default function Accounts() {
       await loadAccounts();
     } catch (error) {
       message.error(error instanceof Error ? error.message : '删除失败');
+    }
+  }
+
+  function openEdit(account: PlatformAccount) {
+    setEditing(account);
+    editForm.setFieldsValue({
+      name: account.name,
+      external_id: account.external_id,
+      tag: account.tag,
+      owner: account.owner,
+    });
+  }
+
+  async function saveAccount(values: Partial<PlatformAccount>) {
+    if (!editing) return;
+    try {
+      await api.updateAccount(editing.id, {
+        ...editing,
+        ...values,
+      });
+      setEditing(null);
+      await loadAccounts();
+      message.success('账号管理信息已更新');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '账号信息更新失败');
     }
   }
 
@@ -108,7 +174,7 @@ export default function Accounts() {
           <Space>
             <Button onClick={loadAccounts}>授权检测</Button>
             <Button onClick={() => Promise.all(accounts.map((item) => syncAccount(item))).then(loadAccounts)}>更新账号信息</Button>
-            <Button type="primary" onClick={() => { form.resetFields(); setAuthResult(null); setAuthOpen(true); }}>添加账号</Button>
+            <Button type="primary" onClick={() => { setAuthSession(null); setAuthOpen(true); }}>添加账号</Button>
           </Space>
         </div>
         <Table
@@ -119,8 +185,8 @@ export default function Accounts() {
           columns={[
             { title: '账号', render: (_, row) => <><strong>{row.name}</strong><br /><span className="muted">{row.role}</span></> },
             { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
-            { title: '标签', render: (_, row) => <SmallTag value={row.tag} /> },
-            { title: '运营人', dataIndex: 'owner' },
+            { title: '标签', render: (_, row) => <SmallTag value={row.tag || '未设置'} /> },
+            { title: '运营人', render: (_, row) => row.owner || '未分配' },
             { title: '授权状态', render: (_, row) => <Status value={row.auth_status} /> },
             { title: '监测状态', render: (_, row) => <Status value={row.monitor_status} /> },
             { title: '最近同步', render: (_, row) => row.last_sync_at || '-' },
@@ -129,6 +195,7 @@ export default function Accounts() {
               render: (_, row) => (
                 <Space>
                   <Button type="link" onClick={() => setActive(row)}>详情</Button>
+                  <Button type="link" onClick={() => openEdit(row)}>编辑</Button>
                   <Button type="link" onClick={() => syncAccount(row)}>同步</Button>
                   <Popconfirm title={`确定删除账号「${row.name}」吗？`} onConfirm={() => deleteAccount(row)}>
                     <Button type="link" danger>删除</Button>
@@ -140,29 +207,62 @@ export default function Accounts() {
         />
       </Card>
 
-      <Modal centered title="添加账号" open={authOpen} onCancel={() => setAuthOpen(false)} footer={null}>
-        <Form form={form} layout="vertical" onFinish={submitAuth} initialValues={{ platform: '微信公众号' }}>
-          <Form.Item label="平台" name="platform" rules={[{ required: true }]}>
-            <Select options={platformOptions.map((value) => ({ value }))} />
-          </Form.Item>
-          <Form.Item label="账号名称" name="account_name">
-            <Input placeholder="可先填写账号名称，后续真实接入时扫码后自动回填" />
-          </Form.Item>
-          <p className="muted">点击后模拟弹出平台扫码授权二维码；授权成功后自动同步近 30 天账号和作品数据。</p>
-          <Space>
-            <Button type="primary" htmlType="submit">生成扫码授权</Button>
-            <Button onClick={() => setAuthOpen(false)}>取消</Button>
-          </Space>
-        </Form>
-        {authResult && (
-          <div className="notice block-gap">
-            <strong>扫码授权已完成</strong>
-            <br />
-            授权账号：{authResult.account.name}
-            <br />
-            授权入口：{authResult.qr_url}
-          </div>
+      <Modal centered title="添加账号" open={authOpen} onCancel={closeAuthModal} footer={null} width={680}>
+        {!authSession ? (
+          <>
+            <p className="muted">选择平台后将自动打开独立的真实 Chrome 登录窗口，请使用对应平台 App 扫码。</p>
+            <div className="platform-login-grid">
+              {platformOptions.map((value) => (
+                <Button key={value} className="platform-login-option" loading={authLoading} onClick={() => startPlatformLogin(value)}>
+                  <strong>{value}</strong>
+                  <span>真实网页登录</span>
+                </Button>
+              ))}
+            </div>
+          </>
+        ) : (
+          <Spin spinning={authSession.status === 'waiting'}>
+            <Alert
+              showIcon
+              type={authSession.status === 'success' ? 'success' : authSession.status === 'waiting' ? 'info' : 'error'}
+              message={authSession.status === 'waiting' ? `等待${authSession.platform}扫码登录` : authSession.message}
+              description={authSession.status === 'waiting'
+                ? '登录页已在独立 Chrome 窗口打开。扫码并完成平台确认后，工作台会自动识别登录结果。'
+                : authSession.account ? `已登录账号：${authSession.account.name}` : authSession.error}
+            />
+            <Space className="block-gap">
+              {authSession.status === 'success' && <Button type="primary" onClick={closeAuthModal}>完成</Button>}
+              {authSession.status !== 'success' && <Button onClick={closeAuthModal}>取消</Button>}
+              {(authSession.status === 'failed' || authSession.status === 'cancelled') && (
+                <Button type="primary" onClick={() => setAuthSession(null)}>重新选择平台</Button>
+              )}
+            </Space>
+          </Spin>
         )}
+      </Modal>
+
+      <Modal
+        centered
+        title="编辑账号信息"
+        open={Boolean(editing)}
+        onCancel={() => setEditing(null)}
+        onOk={() => editForm.submit()}
+        okText="保存"
+      >
+        <Form form={editForm} layout="vertical" onFinish={saveAccount}>
+          <Form.Item label="账号名称" name="name" rules={[{ required: true, message: '请输入账号名称' }]}>
+            <Input disabled />
+          </Form.Item>
+          <Form.Item label="平台账号 ID" name="external_id">
+            <Input disabled />
+          </Form.Item>
+          <Form.Item label="账号标签" name="tag">
+            <Input placeholder="例如：财税科普、企业服务" />
+          </Form.Item>
+          <Form.Item label="运营人" name="owner">
+            <Input placeholder="请输入实际负责该账号的人员" />
+          </Form.Item>
+        </Form>
       </Modal>
 
       <Drawer title={active?.name} open={Boolean(active)} onClose={() => setActive(null)} width={560}>
@@ -170,6 +270,7 @@ export default function Accounts() {
           <div className="detail-grid">
             <Detail label="平台" value={active.platform} />
             <Detail label="账号名称" value={active.name} />
+            <Detail label="平台账号 ID" value={active.external_id || '-'} />
             <Detail label="运营人" value={active.owner} />
             <Detail label="账号标签" value={active.tag} />
             <Detail label="授权状态" value={active.auth_status} />

@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ TASK_TYPE_WECHAT_LEGACY = "公众号文章创作"
 TASK_TYPE_XIAOHONGSHU_RESERVED = "小红书图文生成（预留）"
 TASK_TIME_FORMAT = "%Y-%m-%d %H:%M"
 PUBLISH_INTERRUPTION_TIMEOUT = timedelta(minutes=15)
+CONFIRMATION_HANDLE_TIMEOUT = timedelta(minutes=5)
 TERMINAL_PUBLISH_JOB_STATUSES = ("platform_draft", "published", "failed")
 WAITING_TASK_RECOVERY_JOB_STATUSES = (
     *UNCERTAIN_IN_PROGRESS_STATUSES,
@@ -71,6 +73,10 @@ class TaskConflictError(RuntimeError):
     pass
 
 
+class AccountConflictError(RuntimeError):
+    pass
+
+
 class ContentService:
     def __init__(
         self,
@@ -92,7 +98,42 @@ class ContentService:
             project_loader=self.get_project,
             account_loader=self.get_account,
             payload_builder=self._build_wechat_publish_payload,
+            confirmation_expired_callback=self._synchronize_linked_waiting_tasks,
         )
+        self._fail_unrecoverable_confirmations_after_restart()
+
+    def _fail_unrecoverable_confirmations_after_restart(self) -> None:
+        jobs = self.db.fetch_all(
+            "SELECT id FROM publish_jobs WHERE status = 'awaiting_confirmation'"
+        )
+        for job in jobs:
+            self.publish_coordinator.fail_awaiting_confirmation(
+                int(job["id"]),
+                reason="服务重启后原运营者确认窗口已失效，请重试发布任务",
+            )
+
+    def recover_stale_awaiting_confirmations(
+        self, now: datetime | None = None
+    ) -> dict[str, int]:
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is not None:
+            current = current.astimezone(timezone.utc).replace(tzinfo=None)
+        stale_before = (current - CONFIRMATION_HANDLE_TIMEOUT).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        jobs = self.db.fetch_all(
+            """
+            SELECT id FROM publish_jobs
+            WHERE status = 'awaiting_confirmation' AND updated_at <= ?
+            ORDER BY id
+            """,
+            (stale_before,),
+        )
+        failed = 0
+        for job in jobs:
+            result = self.publish_coordinator.fail_awaiting_confirmation(int(job["id"]))
+            failed += int(result["status"] == "failed")
+        return {"failed": failed}
 
     def recommend_topics(self, user_prompt: str) -> list[TopicRecommendation]:
         return self.ai_client.recommend_topics(user_prompt)
@@ -414,12 +455,12 @@ class ContentService:
                 "SELECT id FROM platform_accounts WHERE platform = ? AND external_id = ?",
                 (normalized_platform, external_id),
             )
-        if not existing and profile_path:
+        if not external_id and profile_path:
             existing = self.db.fetch_one(
                 "SELECT id FROM platform_accounts WHERE profile_path = ?",
                 (profile_path,),
             )
-        if not existing and "信息待完善" not in name:
+        if not external_id and not existing and "信息待完善" not in name:
             existing = self.db.fetch_one(
                 "SELECT id FROM platform_accounts WHERE platform = ? AND name = ?",
                 (normalized_platform, name),
@@ -430,10 +471,10 @@ class ContentService:
                 UPDATE platform_accounts
                 SET name = ?, external_id = ?, auth_status = '已授权', monitor_status = '监测中', sync_status = '待同步',
                     sync_error = '',
-                    auth_method = '真实浏览器扫码', login_url = ?, updated_at = CURRENT_TIMESTAMP
+                    auth_method = '真实浏览器扫码', profile_path = ?, login_url = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (name, external_id, login_url, existing["id"]),
+                (name, external_id, profile_path, login_url, existing["id"]),
             )
             account_id = int(existing["id"])
         else:
@@ -573,13 +614,11 @@ class ContentService:
         self.db.execute(
             """
             UPDATE platform_accounts
-            SET name = ?, external_id = ?, owner = ?, tag = ?, monitor_status = ?, role = ?, audience = ?, style = ?, taboo = ?,
+            SET owner = ?, tag = ?, monitor_status = ?, role = ?, audience = ?, style = ?, taboo = ?,
                 preference = ?, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (
-                str(payload.get("name") or account["name"]),
-                str(payload.get("external_id") or account["external_id"]),
                 str(payload.get("owner", "未分配")),
                 str(payload.get("tag", "")),
                 str(payload.get("monitor_status", "监测中")),
@@ -595,7 +634,20 @@ class ContentService:
 
     def delete_account(self, account_id: int) -> dict[str, Any]:
         self.get_account(account_id)
-        self.db.execute("DELETE FROM platform_accounts WHERE id = ?", (account_id,))
+        with self.db.transaction() as conn:
+            referenced = conn.execute(
+                """
+                SELECT 1
+                WHERE EXISTS (SELECT 1 FROM publish_jobs WHERE account_id = ?)
+                   OR EXISTS (SELECT 1 FROM scheduled_tasks WHERE account_id = ?)
+                """,
+                (account_id, account_id),
+            ).fetchone()
+            if referenced:
+                raise AccountConflictError(
+                    "账号已被发布任务或定时任务引用，不能删除"
+                )
+            conn.execute("DELETE FROM platform_accounts WHERE id = ?", (account_id,))
         return {"deleted": True, "id": account_id}
 
     def analytics_accounts(self, platform: str = "", q: str = "") -> list[dict[str, Any]]:
@@ -894,7 +946,9 @@ class ContentService:
         )
         for task in recoverable_tasks:
             try:
-                self._recover_task_from_publish_job(int(task["id"]), current)
+                recovered = self._recover_task_from_publish_job(int(task["id"]), current)
+                if not recovered:
+                    self._fail_stale_pre_publish_task(int(task["id"]), current)
             except Exception:
                 # A terminal platform job stays recoverable; a later scan retries only this transaction.
                 continue
@@ -918,6 +972,59 @@ class ContentService:
             )
             executed += int(claimed)
         return {"executed": executed}
+
+    def _fail_stale_pre_publish_task(self, task_id: int, current: datetime) -> bool:
+        comparable_current = current
+        if comparable_current.tzinfo is not None:
+            comparable_current = comparable_current.astimezone().replace(tzinfo=None)
+        with self.db.transaction() as conn:
+            task, run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
+            if (
+                task["status"] != "执行中"
+                or run is None
+                or run["status"] != "执行中"
+                or publish_job_id is not None
+            ):
+                return False
+            try:
+                started_at = datetime.strptime(
+                    str(run["started_at"]), TASK_TIME_FORMAT
+                )
+            except ValueError:
+                return False
+            if comparable_current - started_at < PUBLISH_INTERRUPTION_TIMEOUT:
+                return False
+            reason = "内容生成阶段长时间无进展，已安全结束本次执行，可重试任务"
+            task_cursor = conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = '失败', failure_stage = '内容生成中断', failure_reason = ?,
+                    manual_takeover_url = 'manual-takeover://task/' || id,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = '执行中' AND generation = ?
+                  AND publish_job_id IS NULL
+                """,
+                (reason, task_id, task["generation"]),
+            )
+            run_cursor = conn.execute(
+                """
+                UPDATE task_runs
+                SET status = '失败', finished_at = ?, failure_stage = '内容生成中断',
+                    failure_reason = ?
+                WHERE id = ? AND task_id = ? AND status = '执行中'
+                  AND generation = ? AND publish_job_id IS NULL
+                """,
+                (
+                    _format_task_time(current),
+                    reason,
+                    run["id"],
+                    task_id,
+                    task["generation"],
+                ),
+            )
+            if task_cursor.rowcount != 1 or run_cursor.rowcount != 1:
+                raise TaskConflictError("任务代次已变化，请刷新后重试")
+            return True
 
     def execute_task(self, task_id: int, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now()
@@ -1843,6 +1950,13 @@ class ContentService:
         except LookupError as exc:
             raise NotFoundError(str(exc)) from exc
 
+    def get_current_publish_job(
+        self, project_id: int, account_id: int, action: str
+    ) -> dict[str, Any] | None:
+        return self.publish_coordinator.get_current_publish_job(
+            project_id, account_id, action
+        )
+
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
             try:
@@ -2052,6 +2166,25 @@ class ContentService:
         if data.get("source") != "browser":
             raise RuntimeError("同步数据来源不是已登录平台")
         account = self.get_account(account_id)
+        observed_name = str(data.get("account_name") or "").strip()
+        observed_external_id = str(data.get("external_id") or "").strip()
+        expected_external_id = str(account.get("external_id") or "").strip()
+        stable_id_matches = bool(
+            expected_external_id
+            and observed_external_id
+            and expected_external_id == observed_external_id
+        )
+        if expected_external_id and observed_external_id and not stable_id_matches:
+            raise RuntimeError("同步页面账号身份与所选账号不一致")
+        if not stable_id_matches:
+            expected_name = unicodedata.normalize(
+                "NFKC", str(account.get("name") or "")
+            ).strip()
+            live_name = unicodedata.normalize("NFKC", observed_name).strip()
+            if not expected_name or not live_name or expected_name != live_name:
+                raise RuntimeError("同步页面账号身份与所选账号不一致")
+        account_name = observed_name or str(account["name"])
+        external_id = observed_external_id or expected_external_id
         now = datetime.now()
         today = datetime.now().date().isoformat()
         metrics = data.get("metrics") or {}
@@ -2082,8 +2215,6 @@ class ContentService:
                 metric_values["favorites"],
             ),
         )
-        account_name = str(data.get("account_name") or account["name"]).strip()
-        external_id = str(data.get("external_id") or account["external_id"]).strip()
         for work in data.get("works") or []:
             title = str(work.get("title") or "").strip()
             if not title:

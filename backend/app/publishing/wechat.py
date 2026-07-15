@@ -1,6 +1,6 @@
 import urllib.parse
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from .browser_gateway import (
     ChromeCDPBrowserGateway,
@@ -48,6 +48,24 @@ class WeChatBrowserPublisher:
         account: Mapping[str, Any],
         action: PublishAction,
     ) -> PublishingResult:
+        return self._publish(payload, account, action)
+
+    def publish_with_progress(
+        self,
+        payload: dict[str, Any],
+        account: Mapping[str, Any],
+        action: PublishAction,
+        report_progress: Callable[[str], None],
+    ) -> PublishingResult:
+        return self._publish(payload, account, action, report_progress)
+
+    def _publish(
+        self,
+        payload: dict[str, Any],
+        account: Mapping[str, Any],
+        action: PublishAction,
+        report_progress: Callable[[str], None] | None = None,
+    ) -> PublishingResult:
         self._validate_action(action)
         profile_path = self._profile_path(account)
         self._validate_payload(payload)
@@ -57,13 +75,22 @@ class WeChatBrowserPublisher:
         try:
             session = self.gateway.open_profile(profile_path, WECHAT_HOME_URL)
             self.gateway.require_authenticated(session)
+            self.gateway.require_account_identity(session, account)
             self.gateway.open_article_editor(session)
-            self.gateway.fill_article(session, payload)
+            if report_progress:
+                report_progress("filling_content")
+                self.gateway.fill_article_content(session, payload)
+                report_progress("uploading_assets")
+                self.gateway.upload_article_assets(session, payload)
+            else:
+                self.gateway.fill_article(session, payload)
             baseline = self.gateway.capture_baseline(session, payload["title"], action)
             if not isinstance(baseline, Mapping) or baseline.get("baseline_complete") is not True:
                 raise WeChatPublishingError(
                     "微信操作前基线采集不完整，已中止发布，请刷新页面后重试"
                 )
+            if report_progress:
+                report_progress("publishing")
             if action == "draft":
                 self.gateway.click_save_draft(session)
                 outcome = self.gateway.verify_draft(session, payload["title"], baseline)
@@ -96,6 +123,7 @@ class WeChatBrowserPublisher:
                 profile_path, resume_handle, account_key
             )
             self.gateway.require_authenticated(session)
+            self.gateway.require_account_identity(session, account)
             outcome = self.gateway.verify_publish_or_confirmation(session, title, baseline)
             result = self._result(
                 outcome, "publish", session, title, baseline, account_key
@@ -114,6 +142,13 @@ class WeChatBrowserPublisher:
         self._profile_path(account)
         self.gateway.cancel_pending(
             self._resume_handle(job_context), self._account_key(account)
+        )
+
+    def bind_confirmation_expiry(
+        self, job_context: Mapping[str, Any], callback: Any
+    ) -> None:
+        self.gateway.bind_confirmation_expiry(
+            self._resume_handle(job_context), callback
         )
 
     def _result(

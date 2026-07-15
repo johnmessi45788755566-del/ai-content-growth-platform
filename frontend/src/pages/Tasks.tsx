@@ -1,6 +1,6 @@
 import { Alert, Button, DatePicker, Drawer, Form, Input, message, Modal, Popconfirm, Select, Space, Table, TimePicker } from 'antd';
 import dayjs from 'dayjs';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Detail, Platform, Status } from '@/components/Common';
 import { api } from '@/services/api';
 import type { PlatformAccount, PublishJobStatus, ScheduledTask } from '@/types';
@@ -78,24 +78,35 @@ export default function Tasks() {
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [resumingJobId, setResumingJobId] = useState<number | null>(null);
   const [retryingJobId, setRetryingJobId] = useState<number | null>(null);
+  const taskFiltersRef = useRef({ status, platform, search });
+  const taskLoadGenerationRef = useRef(0);
+  const tasksMountedRef = useRef(true);
+  taskFiltersRef.current = { status, platform, search };
   const editingUnsupportedTask = Boolean(editingTask && !isWechatV1Task(editingTask));
 
   async function loadTasks(silent = false) {
+    const generation = taskLoadGenerationRef.current + 1;
+    taskLoadGenerationRef.current = generation;
+    const filters = taskFiltersRef.current;
     if (!silent) setLoading(true);
     try {
       const params = new URLSearchParams();
-      if (status) params.set('status', status);
-      if (platform) params.set('platform', platform);
-      if (search) params.set('q', search);
+      if (filters.status) params.set('status', filters.status);
+      if (filters.platform) params.set('platform', filters.platform);
+      if (filters.search) params.set('q', filters.search);
       const data = await api.tasks(params);
+      if (!tasksMountedRef.current || generation !== taskLoadGenerationRef.current) return;
       setTasks(data.tasks || []);
       setLoadError('');
     } catch (error) {
+      if (!tasksMountedRef.current || generation !== taskLoadGenerationRef.current) return;
       const text = error instanceof Error ? error.message : '读取任务失败';
       setLoadError(text);
       message.error(text);
     } finally {
-      if (!silent) setLoading(false);
+      if (tasksMountedRef.current && generation === taskLoadGenerationRef.current) {
+        setLoading(false);
+      }
     }
   }
 
@@ -116,7 +127,12 @@ export default function Tasks() {
   }
 
   useEffect(() => {
+    tasksMountedRef.current = true;
     loadAccounts();
+    return () => {
+      tasksMountedRef.current = false;
+      taskLoadGenerationRef.current += 1;
+    };
   }, []);
 
   useEffect(() => {

@@ -118,6 +118,14 @@ export const api = {
   getPublishJob(id: number) {
     return request<PublishJob>(`/api/publish-jobs/${id}`);
   },
+  currentPublishJob(projectId: number, accountId: number, action: PublishAction) {
+    const params = new URLSearchParams({
+      project_id: String(projectId),
+      account_id: String(accountId),
+      action,
+    });
+    return request<{ job: PublishJob | null }>(`/api/publish-jobs/current?${params.toString()}`);
+  },
   retryPublishJob(id: number) {
     return request<PublishJob>(`/api/publish-jobs/${id}/retry`, { method: 'POST' });
   },

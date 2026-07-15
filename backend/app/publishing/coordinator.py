@@ -96,6 +96,8 @@ INTERRUPTED_FAILURE_REASON = (
     "发布流程长时间无进展，无法确认平台是否已完成操作；"
     "请人工核对平台状态后再决定是否重试"
 )
+CONFIRMATION_FAILURE_STAGE = "人工确认已失效"
+CONFIRMATION_EXPIRED_REASON = "运营者确认窗口已过期，平台操作未完成，请重试发布任务"
 
 
 class PublishCoordinator:
@@ -106,36 +108,82 @@ class PublishCoordinator:
         project_loader: Callable[[int], dict[str, Any]],
         account_loader: Callable[[int], dict[str, Any]],
         payload_builder: Callable[[dict[str, Any], str], dict[str, Any]],
+        confirmation_expired_callback: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.db = db
         self.publisher = publisher
         self.project_loader = project_loader
         self.account_loader = account_loader
         self.payload_builder = payload_builder
+        self.confirmation_expired_callback = confirmation_expired_callback
 
     def create_publish_job(
         self, project_id: int, account_id: int, action: PublishAction
     ) -> dict[str, Any]:
         job = self.prepare_publish_job(project_id, account_id, action)
+        if job["status"] != "pending":
+            return job
         return self.execute_publish_job(int(job["id"]))
 
     def prepare_publish_job(
         self, project_id: int, account_id: int, action: PublishAction
     ) -> dict[str, Any]:
+        if action not in {"draft", "publish"}:
+            raise PublishJobValidationError("发布动作必须是 draft 或 publish")
+        existing = self.get_current_publish_job(project_id, account_id, action)
+        if existing:
+            return existing
         project, account, _ = self._load_inputs(project_id, account_id, action)
-        self._require_project_account(project_id, account_id)
-        try:
-            job_id = self.db.execute(
+        with self.db.transaction() as conn:
+            mapped = conn.execute(
                 """
-                INSERT INTO publish_jobs (project_id, account_id, platform, action, status)
-                VALUES (?, ?, '微信公众号', ?, 'pending')
+                SELECT jobs.id
+                FROM publish_job_idempotency AS keys
+                JOIN publish_jobs AS jobs ON jobs.id = keys.publish_job_id
+                WHERE keys.project_id = ? AND keys.account_id = ? AND keys.action = ?
                 """,
-                (project["id"], account["id"], action),
-            )
-        except sqlite3.IntegrityError as exc:
-            if "one account_id" in str(exc):
-                raise PublishJobValidationError("内容项目已绑定其他平台账号") from exc
-            raise
+                (project_id, account_id, action),
+            ).fetchone()
+            if mapped:
+                job_id = int(mapped["id"])
+            else:
+                self._require_project_account(project_id, account_id, conn)
+                legacy = conn.execute(
+                    """
+                    SELECT id FROM publish_jobs
+                    WHERE project_id = ? AND account_id = ? AND action = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (project_id, account_id, action),
+                ).fetchone()
+                if legacy:
+                    job_id = int(legacy["id"])
+                else:
+                    try:
+                        job_id = int(
+                            conn.execute(
+                                """
+                                INSERT INTO publish_jobs (
+                                  project_id, account_id, platform, action, status
+                                ) VALUES (?, ?, '微信公众号', ?, 'pending')
+                                """,
+                                (project["id"], account["id"], action),
+                            ).lastrowid
+                        )
+                    except sqlite3.IntegrityError as exc:
+                        if "one account_id" in str(exc):
+                            raise PublishJobValidationError(
+                                "内容项目已绑定其他平台账号"
+                            ) from exc
+                        raise
+                conn.execute(
+                    """
+                    INSERT INTO publish_job_idempotency (
+                      project_id, account_id, action, publish_job_id
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (project_id, account_id, action, job_id),
+                )
         return self.get_publish_job(job_id)
 
     def execute_publish_job(self, job_id: int) -> dict[str, Any]:
@@ -153,6 +201,31 @@ class PublishCoordinator:
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         return self._public_job(self._get_row(job_id))
+
+    def get_current_publish_job(
+        self, project_id: int, account_id: int, action: PublishAction
+    ) -> dict[str, Any] | None:
+        if action not in {"draft", "publish"}:
+            raise PublishJobValidationError("发布动作必须是 draft 或 publish")
+        job = self.db.fetch_one(
+            """
+            SELECT jobs.*
+            FROM publish_job_idempotency AS keys
+            JOIN publish_jobs AS jobs ON jobs.id = keys.publish_job_id
+            WHERE keys.project_id = ? AND keys.account_id = ? AND keys.action = ?
+            """,
+            (project_id, account_id, action),
+        )
+        if not job:
+            job = self.db.fetch_one(
+                """
+                SELECT * FROM publish_jobs
+                WHERE project_id = ? AND account_id = ? AND action = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (project_id, account_id, action),
+            )
+        return self._public_job(job) if job else None
 
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
@@ -204,6 +277,42 @@ class PublishCoordinator:
             conn.commit()
         return self.get_publish_job(job_id)
 
+    def fail_awaiting_confirmation(
+        self,
+        job_id: int,
+        reason: str = CONFIRMATION_EXPIRED_REASON,
+        expected_attempt_token: str | None = None,
+    ) -> dict[str, Any]:
+        job = self._get_row(job_id)
+        if job["status"] != "awaiting_confirmation":
+            return self._public_job(job)
+        attempt_token = self._attempt_token(job)
+        if expected_attempt_token is not None and attempt_token != expected_attempt_token:
+            return self._public_job(job)
+        replacement_response = self._attempt_response_json(attempt_token)
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE publish_jobs
+                SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
+                    platform_url = '', response_json = ?, requires_confirmation = 0,
+                    failure_stage = ?, failure_reason = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'awaiting_confirmation' AND response_json = ?
+                """,
+                (
+                    replacement_response,
+                    CONFIRMATION_FAILURE_STAGE,
+                    reason,
+                    job_id,
+                    job["response_json"],
+                ),
+            )
+            conn.commit()
+        result = self.get_publish_job(job_id)
+        if cursor.rowcount == 1 and self.confirmation_expired_callback:
+            self.confirmation_expired_callback(result)
+        return result
+
     def resume_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
         if job["status"] != "awaiting_confirmation":
@@ -236,12 +345,51 @@ class PublishCoordinator:
         if attempt_token is None:
             return self.get_publish_job(job_id)
         try:
-            result = self.publisher.publish(payload, account, str(job["action"]))
+            publish_with_progress = getattr(
+                self.publisher, "publish_with_progress", None
+            )
+            if callable(publish_with_progress):
+                result = publish_with_progress(
+                    payload,
+                    account,
+                    str(job["action"]),
+                    lambda status: self._persist_progress(
+                        job_id, status, attempt_token
+                    ),
+                )
+            else:
+                result = self.publisher.publish(payload, account, str(job["action"]))
             self._persist_result(job_id, str(job["action"]), result, attempt_token)
         except Exception as exc:
             stage = "提交平台草稿" if job["action"] == "draft" else "发布文章"
             self._persist_failure(job_id, stage, exc, attempt_token)
         return self.get_publish_job(job_id)
+
+    def _persist_progress(
+        self, job_id: int, status: str, attempt_token: str
+    ) -> None:
+        if status not in {"filling_content", "uploading_assets", "publishing"}:
+            raise PublishJobValidationError("发布进度状态无效")
+        response_json = self._attempt_response_json(attempt_token)
+        with self.db.connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE publish_jobs
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+                  AND response_json = ?
+                """,
+                (
+                    status,
+                    job_id,
+                    *UNCERTAIN_IN_PROGRESS_STATUSES,
+                    response_json,
+                ),
+            )
+            conn.commit()
+        if cursor.rowcount != 1:
+            raise PublishJobValidationError("发布任务已失去执行权，已中止平台操作")
 
     def _load_inputs(
         self, project_id: int, account_id: int, action: str
@@ -257,11 +405,13 @@ class PublishCoordinator:
         payload = self.payload_builder(project, account["name"])
         return project, account, payload
 
-    def _require_project_account(self, project_id: int, account_id: int) -> None:
-        existing = self.db.fetch_one(
+    def _require_project_account(
+        self, project_id: int, account_id: int, conn: Any
+    ) -> None:
+        existing = conn.execute(
             "SELECT account_id FROM publish_jobs WHERE project_id = ? ORDER BY id LIMIT 1",
             (project_id,),
-        )
+        ).fetchone()
         if existing and int(existing["account_id"]) != account_id:
             raise PublishJobValidationError("内容项目已绑定其他平台账号")
 
@@ -317,7 +467,7 @@ class PublishCoordinator:
         private_response[ATTEMPT_TOKEN_KEY] = attempt_token
         response_json = json.dumps(private_response, ensure_ascii=False)
         with self.db.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE publish_jobs
                 SET status = ?, platform_draft_id = ?, platform_publish_id = ?,
@@ -340,6 +490,30 @@ class PublishCoordinator:
                 ),
             )
             conn.commit()
+        if cursor.rowcount == 1 and result.status == "awaiting_confirmation":
+            self._bind_confirmation_expiry(
+                job_id, self._require_job_context(response), attempt_token
+            )
+
+    def _bind_confirmation_expiry(
+        self, job_id: int, job_context: Mapping[str, Any], attempt_token: str
+    ) -> None:
+        binder = getattr(self.publisher, "bind_confirmation_expiry", None)
+        if not callable(binder):
+            return
+        try:
+            binder(
+                job_context,
+                lambda: self.fail_awaiting_confirmation(
+                    job_id, expected_attempt_token=attempt_token
+                ),
+            )
+        except Exception:
+            self.fail_awaiting_confirmation(
+                job_id,
+                reason="运营者确认窗口无法继续跟踪，请重试发布任务",
+                expected_attempt_token=attempt_token,
+            )
 
     def _persist_failure(
         self, job_id: int, stage: str, exc: Exception, attempt_token: str

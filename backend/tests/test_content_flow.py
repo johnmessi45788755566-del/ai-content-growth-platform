@@ -181,6 +181,356 @@ def test_publish_coordinator_persists_transition_before_external_publish(tmp_pat
     }
 
 
+def test_publish_coordinator_persists_real_browser_progress(tmp_path):
+    class ProgressPublisher(FakePlatformPublisher):
+        def __init__(self, db):
+            self.db = db
+            self.persisted_statuses = []
+
+        def publish_with_progress(self, payload, account, action, report_progress):
+            for status in ("filling_content", "uploading_assets", "publishing"):
+                report_progress(status)
+                row = self.db.fetch_one(
+                    "SELECT status FROM publish_jobs ORDER BY id DESC LIMIT 1"
+                )
+                self.persisted_statuses.append(row["status"])
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "真实发布进度")
+    publisher = ProgressPublisher(service.db)
+    service.publish_coordinator.publisher = publisher
+
+    job = service.create_publish_job(project["id"], account_id, "draft")
+
+    assert publisher.persisted_statuses == [
+        "filling_content",
+        "uploading_assets",
+        "publishing",
+    ]
+    assert job["status"] == "platform_draft"
+
+
+def test_concurrent_create_publish_job_is_idempotent_and_calls_publisher_once(tmp_path):
+    class BlockingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.lock = threading.Lock()
+
+        def publish(self, payload, account, action):
+            with self.lock:
+                self.calls += 1
+            self.started.set()
+            assert self.release.wait(timeout=5)
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "并发创建幂等")
+    publisher = BlockingPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(
+            service.create_publish_job, project["id"], account_id, "draft"
+        )
+        assert publisher.started.wait(timeout=5)
+        second = executor.submit(
+            service.create_publish_job, project["id"], account_id, "draft"
+        )
+        time.sleep(0.1)
+        publisher.release.set()
+        results = [first.result(timeout=5), second.result(timeout=5)]
+
+    assert publisher.calls == 1
+    assert {result["id"] for result in results} == {results[0]["id"]}
+    assert service.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM publish_jobs WHERE project_id = ? AND account_id = ? AND action = 'draft'",
+        (project["id"], account_id),
+    )["count"] == 1
+
+
+def test_terminal_and_failed_create_requests_return_existing_job_without_retry(tmp_path):
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "终态创建幂等")
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    terminal = service.create_publish_job(project["id"], account_id, "draft")
+    service.db.execute(
+        "UPDATE platform_accounts SET auth_status = '未授权' WHERE id = ?",
+        (account_id,),
+    )
+    repeated_terminal = service.create_publish_job(project["id"], account_id, "draft")
+
+    assert repeated_terminal["id"] == terminal["id"]
+    assert repeated_terminal["status"] == "platform_draft"
+    assert publisher.calls == 1
+
+    service.db.execute(
+        "UPDATE publish_jobs SET status = 'failed', platform_draft_id = '', platform_url = '', response_json = '{}', failure_stage = '测试', failure_reason = '失败' WHERE id = ?",
+        (terminal["id"],),
+    )
+    repeated_failed = service.create_publish_job(project["id"], account_id, "draft")
+
+    assert repeated_failed["id"] == terminal["id"]
+    assert repeated_failed["status"] == "failed"
+    assert publisher.calls == 1
+
+
+def test_draft_and_publish_actions_have_independent_idempotent_jobs(tmp_path):
+    class ActionPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = []
+
+        def publish(self, payload, account, action):
+            self.calls.append(action)
+            if action == "publish":
+                return PublishResult(
+                    status="published",
+                    platform_publish_id="publish-action-id",
+                    platform_url="https://mp.weixin.qq.com/s/publish-action-id",
+                    response={
+                        "source": "wechat_platform",
+                        "event": "article_published",
+                        "receipt_id": "publish-action-id",
+                        "corroboration": "publish_success",
+                    },
+                )
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "动作独立幂等")
+    publisher = ActionPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    draft = service.create_publish_job(project["id"], account_id, "draft")
+    published = service.create_publish_job(project["id"], account_id, "publish")
+
+    assert draft["id"] != published["id"]
+    assert draft["status"] == "platform_draft"
+    assert published["status"] == "published"
+    assert publisher.calls == ["draft", "publish"]
+
+
+def test_confirmation_expiry_fails_same_job_and_allows_retry(tmp_path):
+    class ExpiringPublisher:
+        def __init__(self):
+            self.calls = 0
+            self.expire_callback = None
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            if self.calls == 1:
+                return PublishResult(
+                    status="awaiting_confirmation",
+                    response={
+                        "source": "wechat_platform",
+                        "event": "operator_confirmation_required",
+                        "job_context": {"resume_handle": "private-expiring-handle"},
+                    },
+                    requires_confirmation=True,
+                )
+            return PublishResult(
+                status="published",
+                platform_publish_id="retry-after-expiry",
+                platform_url="https://mp.weixin.qq.com/s/retry-after-expiry",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "retry-after-expiry",
+                    "corroboration": "publish_success",
+                },
+            )
+
+        def bind_confirmation_expiry(self, job_context, callback):
+            assert job_context == {"resume_handle": "private-expiring-handle"}
+            self.expire_callback = callback
+
+        def resume(self, account, job_context):
+            raise AssertionError("expired confirmation must use retry")
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "确认过期重试")
+    publisher = ExpiringPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    waiting = service.create_publish_job(project["id"], account_id, "publish")
+    assert waiting["status"] == "awaiting_confirmation"
+    assert publisher.expire_callback is not None
+
+    publisher.expire_callback()
+    failed = service.get_publish_job(waiting["id"])
+    assert failed["status"] == "failed"
+    assert "过期" in failed["failure_reason"]
+    assert "private-expiring-handle" not in str(failed)
+
+    retried = service.retry_publish_job(waiting["id"])
+    assert retried["id"] == waiting["id"]
+    assert retried["status"] == "published"
+    assert publisher.calls == 2
+
+
+def test_restart_fails_unrecoverable_confirmation_and_late_callback_cannot_overwrite_retry(tmp_path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    first_service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads-first",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    project, account_id = prepare_publish_project(first_service, "重启确认恢复")
+
+    class FirstPublisher:
+        def __init__(self):
+            self.expire_callback = None
+
+        def publish(self, payload, account, action):
+            return PublishResult(
+                status="awaiting_confirmation",
+                response={
+                    "source": "wechat_platform",
+                    "event": "operator_confirmation_required",
+                    "job_context": {"resume_handle": "restart-private-handle"},
+                },
+                requires_confirmation=True,
+            )
+
+        def bind_confirmation_expiry(self, job_context, callback):
+            self.expire_callback = callback
+
+    first_publisher = FirstPublisher()
+    first_service.publish_coordinator.publisher = first_publisher
+    waiting = first_service.create_publish_job(project["id"], account_id, "publish")
+
+    class RestartPublisher(FakePlatformPublisher):
+        def publish(self, payload, account, action):
+            return PublishResult(
+                status="published",
+                platform_publish_id="restart-retry-id",
+                platform_url="https://mp.weixin.qq.com/s/restart-retry-id",
+                response={
+                    "source": "wechat_platform",
+                    "event": "article_published",
+                    "receipt_id": "restart-retry-id",
+                    "corroboration": "publish_success",
+                },
+            )
+
+    restarted = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads-restarted",
+        platform_publisher=RestartPublisher(),
+    )
+    failed = restarted.get_publish_job(waiting["id"])
+    assert failed["status"] == "failed"
+    assert "服务重启" in failed["failure_reason"]
+
+    retried = restarted.retry_publish_job(waiting["id"])
+    assert retried["status"] == "published"
+    first_publisher.expire_callback()
+    assert restarted.get_publish_job(waiting["id"])["status"] == "published"
+
+
+def test_stale_confirmation_scan_does_not_fail_recent_handle(tmp_path):
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "确认扫描时间")
+
+    class WaitingPublisher:
+        def publish(self, payload, account, action):
+            return PublishResult(
+                status="awaiting_confirmation",
+                response={
+                    "source": "wechat_platform",
+                    "event": "operator_confirmation_required",
+                    "job_context": {"resume_handle": "scan-private-handle"},
+                },
+                requires_confirmation=True,
+            )
+
+    service.publish_coordinator.publisher = WaitingPublisher()
+    waiting = service.create_publish_job(project["id"], account_id, "publish")
+    service.db.execute(
+        "UPDATE publish_jobs SET updated_at = '2026-07-15 01:00:00' WHERE id = ?",
+        (waiting["id"],),
+    )
+
+    service.recover_stale_awaiting_confirmations(datetime(2026, 7, 15, 1, 4))
+    assert service.get_publish_job(waiting["id"])["status"] == "awaiting_confirmation"
+
+    service.recover_stale_awaiting_confirmations(datetime(2026, 7, 15, 1, 6))
+    assert service.get_publish_job(waiting["id"])["status"] == "failed"
+
+
+def test_stale_pre_publish_task_fails_and_retries_without_touching_recent_execution(tmp_path):
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '生成中断账号', '已授权')"
+    )
+
+    def create_claimed_task(topic, started_at):
+        task = service.create_task(
+            {
+                "platform": "微信公众号",
+                "account_id": account_id,
+                "account_name": "生成中断账号",
+                "execute_time": "2026-07-15 01:00",
+                "task_type": "微信公众号图文生成",
+                "topic": topic,
+                "publish_action": "draft",
+            }
+        )
+        run_id = service._claim_task_execution(task["id"], started_at)
+        assert run_id is not None
+        return task, run_id
+
+    stale, stale_run_id = create_claimed_task("陈旧生成任务", "2026-07-15 01:00")
+    recent, recent_run_id = create_claimed_task("活跃生成任务", "2026-07-15 01:10")
+
+    service.execute_due_tasks(datetime(2026, 7, 15, 1, 16))
+
+    stale_detail = service.get_task(stale["id"])
+    recent_detail = service.get_task(recent["id"])
+    assert stale_detail["status"] == "失败"
+    assert stale_detail["publish_job_id"] is None
+    assert stale_detail["failure_stage"] == "内容生成中断"
+    assert stale_detail["runs"][0]["id"] == stale_run_id
+    assert stale_detail["runs"][0]["status"] == "失败"
+    assert recent_detail["status"] == "执行中"
+    assert recent_detail["runs"][0]["id"] == recent_run_id
+    assert recent_detail["runs"][0]["status"] == "执行中"
+    assert publisher.calls == 0
+
+    retried = service.retry_failed_tasks([stale["id"]])
+    retried_detail = service.get_task(stale["id"])
+    assert retried == {"updated": 1}
+    assert retried_detail["status"] == "已生成平台草稿"
+    assert retried_detail["publish_job"]["status"] == "platform_draft"
+    assert retried_detail["retry_count"] == 1
+    assert publisher.calls == 1
+
+
 def test_retry_publish_job_claim_allows_only_one_publisher_call(tmp_path):
     class MissingEvidencePublisher(FakePlatformPublisher):
         def publish(self, payload, account, action):
@@ -1049,7 +1399,7 @@ def test_publish_package_backfill_ignores_deleted_or_non_integer_job_ids(tmp_pat
         """,
         (project_id, account_id, json.dumps({"publish_job_id": str(job_id)})),
     )
-    db.execute("DELETE FROM platform_accounts WHERE id = ?", (account_id,))
+    db.execute("DELETE FROM publish_jobs WHERE id = ?", (job_id,))
 
     db.init_schema()
 

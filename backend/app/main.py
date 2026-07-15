@@ -1,4 +1,5 @@
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from pathlib import Path
@@ -8,6 +9,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 try:
     from dotenv import load_dotenv
@@ -19,10 +22,26 @@ from .browser_auth import BrowserAuthManager
 from .database import Database
 from .publishing.coordinator import PublishJobValidationError
 from .publishing.wechat import WeChatDraftPublisher
-from .services import ContentService, NotFoundError, TaskConflictError
+from .services import AccountConflictError, ContentService, NotFoundError, TaskConflictError
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TRUSTED_FRONTEND_ORIGINS = (
+    "http://127.0.0.1:5173",
+    "http://localhost:5173",
+)
+
+
+def trusted_frontend_origins() -> list[str]:
+    configured = os.getenv("TRUSTED_FRONTEND_ORIGINS", "").strip()
+    origins = (
+        [value.strip().rstrip("/") for value in configured.split(",") if value.strip()]
+        if configured
+        else list(DEFAULT_TRUSTED_FRONTEND_ORIGINS)
+    )
+    if not origins or "*" in origins:
+        raise RuntimeError("TRUSTED_FRONTEND_ORIGINS 必须配置明确的可信 Origin")
+    return list(dict.fromkeys(origins))
 
 
 class TopicRecommendationRequest(BaseModel):
@@ -150,6 +169,7 @@ def create_app(
     browser_auth_manager: Any | None = None,
     platform_publisher: Any | None = None,
     scheduler_enabled: bool = True,
+    trusted_origins: list[str] | None = None,
 ) -> FastAPI:
     if load_dotenv:
         load_dotenv(BACKEND_ROOT / ".env")
@@ -166,11 +186,15 @@ def create_app(
         platform_publisher=platform_publisher or WeChatDraftPublisher(),
     )
 
+    def run_scheduler_maintenance() -> None:
+        service.recover_stale_awaiting_confirmations()
+        service.sync_due_accounts()
+        service.execute_due_tasks()
+
     async def task_scheduler_loop() -> None:
         while True:
             try:
-                service.sync_due_accounts()
-                service.execute_due_tasks()
+                await asyncio.to_thread(run_scheduler_maintenance)
             except Exception:
                 pass
             await asyncio.sleep(30)
@@ -187,16 +211,41 @@ def create_app(
                 await task
         browser_auth.close_all()
 
+    allowed_origins = (
+        trusted_frontend_origins()
+        if trusted_origins is None
+        else list(
+            dict.fromkeys(
+                origin.strip().rstrip("/")
+                for origin in trusted_origins
+                if origin.strip()
+            )
+        )
+    )
+    if not allowed_origins or "*" in allowed_origins:
+        raise RuntimeError("TRUSTED_FRONTEND_ORIGINS 必须配置明确的可信 Origin")
     app = FastAPI(title="AI 内容创作后端", version="0.1.0", lifespan=lifespan)
     app.state.content_service = service
     app.state.task_scheduler = None
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allowed_origins,
         allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Content-Type"],
     )
+
+    @app.middleware("http")
+    async def enforce_trusted_write_origin(request: Request, call_next: Any):
+        origin = request.headers.get("origin", "").rstrip("/")
+        if (
+            request.url.path.startswith("/api/")
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and origin
+            and origin not in allowed_origins
+        ):
+            return JSONResponse(status_code=403, content={"detail": "请求来源不受信任"})
+        return await call_next(request)
     uploads.mkdir(parents=True, exist_ok=True)
     app.mount("/uploads", StaticFiles(directory=uploads), name="uploads")
 
@@ -361,6 +410,8 @@ def create_app(
             return service.delete_account(account_id)
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AccountConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/analytics/accounts")
     def analytics_accounts(platform: str = "", q: str = "", range: str = "30d") -> dict[str, Any]:
@@ -425,6 +476,19 @@ def create_app(
         except NotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except (PublishJobValidationError, RuntimeError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/publish-jobs/current")
+    def get_current_publish_job(
+        project_id: int, account_id: int, action: Literal["draft", "publish"]
+    ) -> dict[str, Any]:
+        try:
+            return {
+                "job": service.get_current_publish_job(
+                    project_id, account_id, action
+                )
+            }
+        except PublishJobValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/publish-jobs/{job_id}")

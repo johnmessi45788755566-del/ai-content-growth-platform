@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { StrictMode } from 'react';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import Creator from '../src/pages/Creator';
 import Drafts from '../src/pages/Drafts';
@@ -11,6 +12,7 @@ const api = vi.hoisted(() => ({
   accounts: vi.fn(),
   createProject: vi.fn(),
   createPublishJob: vi.fn(),
+  currentPublishJob: vi.fn(),
   createTask: vi.fn(),
   deleteDraft: vi.fn(),
   deleteTask: vi.fn(),
@@ -158,14 +160,55 @@ beforeEach(() => {
   api.accounts.mockResolvedValue({ accounts: [authorizedAccount, ...unavailableAccounts] });
   api.deleteDraft.mockResolvedValue({});
   api.deleteTask.mockResolvedValue({});
+  api.currentPublishJob.mockResolvedValue({ job: null });
   api.retryTasks.mockResolvedValue({});
 });
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
 });
 
 describe('Creator publishing', () => {
+  it('loads and resumes an existing publish job when the publish area is reopened', async () => {
+    const restoredProject = project(1, '恢复发布项目');
+    const waiting = publishJob({
+      id: 80,
+      project_id: 1,
+      action: 'publish',
+      status: 'awaiting_confirmation',
+      platform_draft_id: '',
+      requires_confirmation: true,
+    });
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(restoredProject);
+    api.saveLayout.mockResolvedValue({ project: restoredProject, layout_blocks: [] });
+    api.currentPublishJob.mockImplementation((projectId, accountId, action) => Promise.resolve({
+      job: action === 'publish' ? waiting : null,
+    }));
+    api.resumePublishJob.mockResolvedValue(publishJob({
+      id: 80,
+      project_id: 1,
+      action: 'publish',
+      status: 'published',
+      platform_draft_id: '',
+      platform_publish_id: 'publish-80',
+    }));
+
+    render(<Creator />);
+
+    await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
+    clickButton('发布');
+    await screen.findByText('等待运营人员确认');
+    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'draft');
+    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'publish');
+
+    clickButton('继续确认发布');
+    await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(80));
+    expect(api.createPublishJob).not.toHaveBeenCalled();
+    await screen.findByText('平台发布已完成');
+  });
+
   it('maps the two publish buttons to draft and publish for an authorized WeChat account only', async () => {
     const firstProject = project(1, '项目一');
     window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
@@ -276,6 +319,37 @@ describe('Creator publishing', () => {
 });
 
 describe('Draft publishing', () => {
+  it('loads an existing failed job for a restored draft and retries that resource', async () => {
+    const restoredDraft = { id: 10, project_id: 1, title: '跨刷新草稿', stage: '排版已完成，待发布', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-15 09:00' };
+    const failed = publishJob({
+      id: 79,
+      project_id: 1,
+      action: 'draft',
+      status: 'failed',
+      platform_draft_id: '',
+      failure_stage: '提交平台草稿',
+      failure_reason: '平台暂时不可用',
+    });
+    api.drafts.mockResolvedValue({ drafts: [restoredDraft] });
+    api.currentPublishJob.mockImplementation((projectId, accountId, action) => Promise.resolve({
+      job: action === 'draft' ? failed : null,
+    }));
+    api.retryPublishJob.mockResolvedValue(publishJob({ id: 79, project_id: 1 }));
+
+    render(<Drafts />);
+
+    await screen.findByText(restoredDraft.title);
+    clickButton('发布');
+    await screen.findByText('平台发布失败');
+    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'draft');
+    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'publish');
+
+    clickButton('重试');
+    await waitFor(() => expect(api.retryPublishJob).toHaveBeenCalledWith(79));
+    expect(api.createPublishJob).not.toHaveBeenCalled();
+    await screen.findByText('平台草稿已创建');
+  });
+
   it('only offers publishing after layout and supports failed retry through confirmation resume', async () => {
     api.drafts.mockResolvedValue({
       drafts: [
@@ -410,6 +484,49 @@ describe('Draft publishing', () => {
 });
 
 describe('Task publishing results', () => {
+  it('keeps task loading active across the StrictMode effect remount', async () => {
+    api.tasks.mockResolvedValue({
+      tasks: [scheduledTask(3, { topic: '严格模式任务', status: '待执行' })],
+    });
+
+    render(<StrictMode><Tasks /></StrictMode>);
+
+    await screen.findByText('严格模式任务');
+  });
+
+  it('polls with the latest search and ignores an older response generation', async () => {
+    const oldResponse = deferred<{ tasks: ScheduledTask[] }>();
+    const freshResponse = deferred<{ tasks: ScheduledTask[] }>();
+    let poll: (() => Promise<void>) | null = null;
+    vi.spyOn(window, 'setInterval').mockImplementation(((callback: () => Promise<void>, delay?: number) => {
+      if (delay === 10_000) poll = callback;
+      return 1;
+    }) as typeof window.setInterval);
+    vi.spyOn(window, 'clearInterval').mockImplementation(() => {});
+    api.tasks
+      .mockReturnValueOnce(oldResponse.promise)
+      .mockReturnValueOnce(freshResponse.promise);
+
+    render(<Tasks />);
+    await waitFor(() => expect(api.tasks).toHaveBeenCalledTimes(1));
+    fireEvent.change(screen.getByPlaceholderText('搜索主题或账号'), { target: { value: '最新筛选' } });
+    expect(poll).not.toBeNull();
+    let pollingPromise: Promise<void> | undefined;
+    act(() => { pollingPromise = poll?.(); });
+    await waitFor(() => expect(api.tasks).toHaveBeenCalledTimes(2));
+
+    const pollingParams = api.tasks.mock.calls[1][0] as URLSearchParams;
+    expect(pollingParams.get('q')).toBe('最新筛选');
+    freshResponse.resolve({ tasks: [scheduledTask(2, { topic: '最新筛选任务', status: '待执行' })] });
+    await act(async () => { await pollingPromise; });
+    await screen.findByText('最新筛选任务');
+
+    oldResponse.resolve({ tasks: [scheduledTask(1, { topic: '旧响应任务', status: '待执行' })] });
+    await act(async () => { await oldResponse.promise; });
+    expect(screen.queryByText('旧响应任务')).toBeNull();
+    expect(screen.getByText('最新筛选任务')).not.toBeNull();
+  });
+
   it('renders hydrated publish jobs and refreshes the task row after resume', async () => {
     const published = scheduledTask(1, {
       topic: '已发布任务',

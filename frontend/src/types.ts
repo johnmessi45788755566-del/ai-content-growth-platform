@@ -153,13 +153,24 @@ export interface PlatformAccount {
   updated_at?: string;
 }
 
+export interface AccountAuthAccount {
+  id: number;
+  platform: string;
+  name: string;
+  account_name?: string;
+  auth_status: string;
+  monitor_status?: string;
+  sync_status?: string;
+  last_sync_at?: string;
+}
+
 export interface AccountAuthSession {
   session_id: string;
   platform: string;
   status: 'waiting' | 'success' | 'failed' | 'cancelled';
   message: string;
   login_url: string;
-  account?: PlatformAccount | null;
+  account?: AccountAuthAccount | null;
   error?: string;
 }
 

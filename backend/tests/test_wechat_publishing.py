@@ -2,6 +2,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -40,11 +41,22 @@ class FakeWeChatGateway:
     def require_authenticated(self, session):
         self.actions.append("require_authenticated")
 
+    def require_account_identity(self, session, account):
+        self.actions.append(("require_account_identity", account.get("external_id"), account.get("name")))
+
     def open_article_editor(self, session):
         self.actions.append("open_article_editor")
 
     def fill_article(self, session, payload):
         self.actions.append("fill_article")
+        self.filled_payload = payload
+
+    def fill_article_content(self, session, payload):
+        self.actions.append("fill_article_content")
+        self.filled_payload = payload
+
+    def upload_article_assets(self, session, payload):
+        self.actions.append("upload_article_assets")
         self.filled_payload = payload
 
     def capture_baseline(self, session, title, action):
@@ -156,6 +168,8 @@ def browser_account(tmp_path: Path):
     return {
         "id": 4,
         "platform": "微信公众号",
+        "name": "理想说AI",
+        "external_id": "wechat-bizuin-4",
         "auth_status": "已授权",
         "profile_path": str(profile_path),
     }
@@ -215,6 +229,49 @@ def test_wechat_browser_publisher_upload_payload_reaches_gateway(tmp_path: Path)
 
     assert gateway.filled_payload["cover_path"] == payload["cover_path"]
     assert gateway.filled_payload["blocks"][1]["image_path"] == payload["blocks"][1]["image_path"]
+
+
+def test_wechat_browser_publisher_reports_progress_at_real_browser_steps(tmp_path: Path):
+    gateway = FakeWeChatGateway(draft_outcome())
+    statuses = []
+
+    result = WeChatBrowserPublisher(gateway=gateway).publish_with_progress(
+        article_payload(tmp_path),
+        browser_account(tmp_path),
+        action="draft",
+        report_progress=statuses.append,
+    )
+
+    assert statuses == ["filling_content", "uploading_assets", "publishing"]
+    assert gateway.actions.index("fill_article_content") < gateway.actions.index(
+        "upload_article_assets"
+    )
+    assert gateway.actions.index("upload_article_assets") < gateway.actions.index(
+        "capture_baseline"
+    )
+    assert gateway.actions.index("capture_baseline") < gateway.actions.index(
+        "click_save_draft"
+    )
+    assert result.status == "platform_draft"
+
+
+def test_wechat_browser_publisher_verifies_selected_account_before_platform_changes(tmp_path: Path):
+    class WrongAccountGateway(FakeWeChatGateway):
+        def require_account_identity(self, session, account):
+            super().require_account_identity(session, account)
+            raise WeChatPublishingError("当前登录公众号与所选账号不一致")
+
+    gateway = WrongAccountGateway(draft_outcome())
+
+    with pytest.raises(WeChatPublishingError, match="当前登录公众号与所选账号不一致"):
+        WeChatBrowserPublisher(gateway=gateway).publish(
+            article_payload(tmp_path), browser_account(tmp_path), action="draft"
+        )
+
+    assert ("require_account_identity", "wechat-bizuin-4", "理想说AI") in gateway.actions
+    assert "open_article_editor" not in gateway.actions
+    assert "click_save_draft" not in gateway.actions
+    assert len(gateway.closed_sessions) == 1
 
 
 def test_wechat_browser_publisher_returns_verified_publish_receipt(tmp_path: Path):
@@ -525,6 +582,20 @@ def auth_cookie(name, *, value="valid", domain=".mp.weixin.qq.com", expires=None
     }
 
 
+class IdentityGateway(ChromeCDPBrowserGateway):
+    def __init__(self, cookies, account_name):
+        super().__init__()
+        self.cookies = cookies
+        self.account_name = account_name
+
+    def _cdp_call(self, session, method, params=None):
+        assert method == "Network.getAllCookies"
+        return {"cookies": self.cookies}
+
+    def evaluate(self, session, expression):
+        return self.account_name
+
+
 def browser_session(tmp_path: Path, url="https://mp.weixin.qq.com/"):
     return BrowserSession(
         session_id="session-1",
@@ -584,6 +655,34 @@ def test_browser_gateway_accepts_authenticated_dashboard_token(tmp_path: Path):
     )
 
     gateway.require_authenticated(browser_session(tmp_path))
+
+
+def test_browser_gateway_rejects_wrong_bizuin_even_when_account_name_matches(tmp_path: Path):
+    gateway = IdentityGateway(
+        [auth_cookie("bizuin", value="logged-in-bizuin")],
+        "理想说AI",
+    )
+
+    with pytest.raises(WeChatPublishingError, match="当前登录公众号与所选账号不一致"):
+        gateway.require_account_identity(
+            browser_session(tmp_path),
+            {"external_id": "selected-bizuin", "name": "理想说AI"},
+        )
+
+
+def test_browser_gateway_falls_back_to_strict_account_name_when_bizuin_is_unavailable(tmp_path: Path):
+    gateway = IdentityGateway([], "理想说AI")
+
+    gateway.require_account_identity(
+        browser_session(tmp_path),
+        {"external_id": "", "name": "理想说AI"},
+    )
+
+    with pytest.raises(WeChatPublishingError, match="当前登录公众号与所选账号不一致"):
+        gateway.require_account_identity(
+            browser_session(tmp_path),
+            {"external_id": "", "name": "理想说 AI"},
+        )
 
 
 def test_browser_gateway_rejects_unverified_dashboard_token(tmp_path: Path):
@@ -1127,6 +1226,22 @@ def test_pending_confirmation_uses_opaque_handle_and_expires_with_cleanup(tmp_pa
     assert all(value not in handle for value in ("9222", "page-1", "profile"))
     assert timers[0].started is True
     timers[0].fire()
+    assert gateway.closed == [session]
+
+
+def test_pending_confirmation_expiry_notifies_persisted_job_owner(tmp_path: Path):
+    timers = []
+    gateway = PendingGateway(timers)
+    session = browser_session(tmp_path, "https://mp.weixin.qq.com/cgi-bin/masssendpage")
+    callback = Mock()
+    handle = gateway.retain_confirmation(
+        session, "4", "浏览器发布测试", {"baseline_id": "baseline-1"}
+    )
+
+    gateway.bind_confirmation_expiry(handle, callback)
+    timers[0].fire()
+
+    callback.assert_called_once_with()
     assert gateway.closed == [session]
 
 
