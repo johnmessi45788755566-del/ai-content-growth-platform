@@ -187,10 +187,22 @@ def create_app(
     )
 
     def run_scheduler_maintenance() -> None:
-        service.recover_stale_awaiting_confirmations()
-        service.recover_publish_jobs()
-        service.sync_due_accounts()
-        service.execute_due_tasks()
+        try:
+            service.recover_stale_awaiting_confirmations()
+        except Exception:
+            pass
+        try:
+            service.recover_publish_jobs()
+        except Exception:
+            pass
+        try:
+            service.sync_due_accounts()
+        except Exception:
+            pass
+        try:
+            service.execute_due_tasks()
+        except Exception:
+            pass
 
     async def task_scheduler_loop() -> None:
         while True:

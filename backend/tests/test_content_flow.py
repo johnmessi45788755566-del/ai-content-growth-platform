@@ -532,6 +532,54 @@ def test_direct_pending_publish_job_recovers_after_restart_without_scheduled_tas
     assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM scheduled_tasks")["count"] == 0
 
 
+def test_publish_recovery_isolates_bad_pending_job_and_continues_maintenance(
+    tmp_path: Path,
+):
+    service = make_service(tmp_path)
+    bad_project, bad_account_id = prepare_publish_project(service, "损坏发布输入")
+    valid_project, valid_account_id = prepare_publish_project(service, "有效待发布")
+    active_project, active_account_id = prepare_publish_project(service, "陈旧执行中")
+    bad = service.prepare_publish_job(bad_project["id"], bad_account_id, "draft")
+    valid = service.prepare_publish_job(valid_project["id"], valid_account_id, "draft")
+    active = service.prepare_publish_job(active_project["id"], active_account_id, "draft")
+    service.db.execute(
+        "UPDATE platform_accounts SET auth_status = '未授权' WHERE id = ?",
+        (bad_account_id,),
+    )
+    service.db.execute(
+        """
+        UPDATE publish_jobs
+        SET status = 'checking_login', response_json = ?, updated_at = '2026-07-15 01:00:00'
+        WHERE id = ?
+        """,
+        (json.dumps({"_attempt_token": "stale-maintenance-attempt"}), active["id"]),
+    )
+
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+
+    result = service.recover_publish_jobs(
+        datetime(2026, 7, 15, 1, 30, tzinfo=timezone.utc)
+    )
+
+    failed = service.get_publish_job(bad["id"])
+    assert failed["status"] == "failed"
+    assert failed["failure_stage"] == "加载发布输入"
+    assert failed["failure_reason"]
+    assert service.get_publish_job(valid["id"])["status"] == "platform_draft"
+    assert service.get_publish_job(active["id"])["status"] == "failed"
+    assert result == {"recovered": 2, "failed": 1}
+    assert publisher.calls == 1
+
+
 def test_direct_active_publish_recovery_fails_only_stale_job_and_retries_same_job(
     tmp_path: Path,
 ):

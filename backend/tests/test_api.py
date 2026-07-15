@@ -1972,6 +1972,39 @@ def test_scheduler_dispatches_blocking_maintenance_to_worker_thread():
     assert "service.execute_due_tasks()" not in scheduler_source
 
 
+def test_scheduler_maintenance_continues_after_publish_recovery_step_fails(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        scheduler_enabled=True,
+    )
+    service = app.state.content_service
+    calls = []
+    due_tasks_called = threading.Event()
+
+    service.recover_stale_awaiting_confirmations = lambda: calls.append("confirmations")
+
+    def fail_publish_recovery():
+        calls.append("publish_jobs")
+        raise RuntimeError("broken pending job")
+
+    service.recover_publish_jobs = fail_publish_recovery
+    service.sync_due_accounts = lambda: calls.append("accounts")
+
+    def execute_due_tasks():
+        calls.append("due_tasks")
+        due_tasks_called.set()
+
+    service.execute_due_tasks = execute_due_tasks
+
+    with TestClient(app):
+        assert due_tasks_called.wait(timeout=2)
+
+    assert calls[:4] == ["confirmations", "publish_jobs", "accounts", "due_tasks"]
+
+
 def test_referenced_accounts_cannot_be_deleted_but_unreferenced_account_can(tmp_path: Path):
     app = create_app(
         database_path=tmp_path / "content.db",
@@ -2801,7 +2834,13 @@ def test_interrupted_pending_publish_job_executes_same_job(
     assert len(publisher.calls) == 1
 
 
-def test_restart_adopts_pending_job_when_process_exits_before_task_link(tmp_path: Path):
+@pytest.mark.parametrize(
+    "pre_adoption",
+    ["global_maintenance", "job_already_published"],
+)
+def test_restart_adopts_job_when_process_exits_before_task_link(
+    tmp_path: Path, pre_adoption: str
+):
     class SimulatedProcessExit(BaseException):
         pass
 
@@ -2856,6 +2895,13 @@ def test_restart_adopts_pending_job_when_process_exits_before_task_link(tmp_path
         scheduler_enabled=False,
     )
     restarted = restarted_app.state.content_service
+    if pre_adoption == "global_maintenance":
+        maintenance = restarted.recover_publish_jobs(datetime(2026, 7, 14, 9, 31))
+        assert maintenance["recovered"] == 0
+        assert restarted.get_publish_job(orphan["id"])["status"] == "pending"
+    else:
+        changed = restarted.execute_publish_job(orphan["id"])
+        assert changed["status"] == "published"
     scan = restarted.execute_due_tasks(datetime(2026, 7, 14, 9, 31))
     recovered = restarted.get_task(task["id"])
 

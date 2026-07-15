@@ -139,12 +139,34 @@ class ContentService:
         self, now: datetime | None = None
     ) -> dict[str, int]:
         pending_jobs = self.db.fetch_all(
-            "SELECT id FROM publish_jobs WHERE status = 'pending' ORDER BY id"
+            """
+            SELECT jobs.id
+            FROM publish_jobs AS jobs
+            WHERE jobs.status = 'pending'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM scheduled_tasks AS tasks
+                  JOIN task_runs AS runs
+                    ON runs.task_id = tasks.id
+                   AND runs.generation = tasks.generation
+                  WHERE tasks.status = '执行中'
+                    AND runs.status = '执行中'
+                    AND tasks.content_project_id = jobs.project_id
+                    AND tasks.account_id = jobs.account_id
+                    AND tasks.publish_action = jobs.action
+                    AND tasks.publish_job_id IS NULL
+                    AND runs.publish_job_id IS NULL
+              )
+            ORDER BY jobs.id
+            """
         )
         recovered = 0
         for job in pending_jobs:
-            result = self.execute_publish_job(int(job["id"]))
-            recovered += int(result["status"] != "pending")
+            try:
+                result = self.execute_publish_job(int(job["id"]))
+                recovered += int(result["status"] != "pending")
+            except Exception:
+                continue
         current = now or datetime.now(timezone.utc)
         if current.tzinfo is None:
             current = current.astimezone()
@@ -161,10 +183,13 @@ class ContentService:
         )
         failed = 0
         for job in active_jobs:
-            result = self.publish_coordinator.fail_stale_in_progress_job(
-                int(job["id"]), stale_before
-            )
-            failed += int(result["status"] == "failed")
+            try:
+                result = self.publish_coordinator.fail_stale_in_progress_job(
+                    int(job["id"]), stale_before
+                )
+                failed += int(result["status"] == "failed")
+            except Exception:
+                continue
         return {"recovered": recovered, "failed": failed}
 
     def recommend_topics(self, user_prompt: str) -> list[TopicRecommendation]:
@@ -1083,7 +1108,7 @@ class ContentService:
             else:
                 return False
         if publish_job_id is None:
-            if not self._adopt_orphan_pending_publish_job(task, run):
+            if not self._adopt_orphan_publish_job(task, run):
                 return False
             with self.db.transaction() as conn:
                 task, run, publish_job_id = self._resolve_task_publish_job(conn, task_id)
@@ -1140,7 +1165,7 @@ class ContentService:
             expected_run_status=expected_run_status,
         )
 
-    def _adopt_orphan_pending_publish_job(
+    def _adopt_orphan_publish_job(
         self, observed_task: dict[str, Any], observed_run: dict[str, Any]
     ) -> bool:
         project_id = observed_task.get("content_project_id")
@@ -1168,7 +1193,7 @@ class ContentService:
                 SELECT jobs.id
                 FROM publish_jobs AS jobs
                 WHERE jobs.project_id = ? AND jobs.account_id = ?
-                  AND jobs.action = ? AND jobs.status = 'pending'
+                  AND jobs.action = ?
                   AND NOT EXISTS (
                     SELECT 1 FROM scheduled_tasks
                     WHERE scheduled_tasks.publish_job_id = jobs.id

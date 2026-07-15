@@ -294,6 +294,61 @@ describe('Creator publishing', () => {
     expect(document.body.textContent).toContain('平台发布 ID：publish-82');
   });
 
+  it('keeps deferred account and restored-job responses owned by the active project', async () => {
+    const firstProject = project(1, '账号竞态项目 A');
+    const secondProject = project(2, '账号竞态项目 B');
+    const firstAccounts = deferred<{ accounts: Array<typeof boundAccount> }>();
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(firstProject);
+    api.saveLayout.mockImplementation(async (id) => ({ project: id === 1 ? firstProject : secondProject, layout_blocks: [] }));
+    api.updateStage.mockResolvedValue({ project: secondProject, article_blocks: secondProject.article_blocks, media_assets: [], layout_blocks: [] });
+    api.projectPublishJob.mockImplementation(async (projectId) => ({
+      job: projectId === 1
+        ? publishJob({ id: 91, project_id: 1, account_id: boundAccount.id })
+        : null,
+    }));
+    api.accounts
+      .mockImplementationOnce(() => firstAccounts.promise)
+      .mockResolvedValueOnce({ accounts: [authorizedAccount] });
+    api.createPublishJob.mockResolvedValue(publishJob({
+      id: 92,
+      project_id: 2,
+      account_id: authorizedAccount.id,
+      action: 'publish',
+      status: 'published',
+      platform_draft_id: '',
+      platform_publish_id: 'publish-project-B',
+    }));
+
+    render(<Creator />);
+
+    await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
+    clickButton('发布');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(1));
+    clickButton('取消');
+
+    clickStep('标题确认');
+    await waitFor(() => expect(api.updateStage).toHaveBeenCalledWith(1, 'title'));
+    clickStep('文章排版');
+    await waitFor(() => expect(api.updateStage).toHaveBeenCalledWith(2, 'layout'));
+    clickButton('发布');
+    await waitFor(() => expect(screen.queryAllByText(authorizedAccount.name).length).toBeGreaterThan(0));
+
+    await act(async () => {
+      firstAccounts.resolve({ accounts: [boundAccount] });
+      await firstAccounts.promise;
+    });
+
+    expect(screen.queryByText('发布任务 ID：91')).toBeNull();
+    clickButton('一键发布');
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledWith({
+      project_id: 2,
+      account_id: authorizedAccount.id,
+      action: 'publish',
+    }));
+    await screen.findByText('平台发布已完成');
+  });
+
   it('releases refresh loading when a newer retry fails before the old refresh finishes', async () => {
     const firstProject = project(1, '竞态项目');
     const staleRefresh = deferred<PublishJob>();
@@ -428,6 +483,57 @@ describe('Draft publishing', () => {
 
     expect(document.body.textContent).toContain('平台发布 ID：publish-B');
     expect(screen.queryByText('草稿 A 失败')).toBeNull();
+  });
+
+  it('keeps deferred account and restored-job responses owned by the selected draft', async () => {
+    const firstAccounts = deferred<{ accounts: Array<typeof boundAccount> }>();
+    api.drafts.mockResolvedValue({
+      drafts: [
+        { id: 1, project_id: 1, title: '账号竞态草稿 A', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+        { id: 2, project_id: 2, title: '账号竞态草稿 B', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+      ],
+    });
+    api.projectPublishJob.mockImplementation(async (projectId) => ({
+      job: projectId === 1
+        ? publishJob({ id: 93, project_id: 1, account_id: boundAccount.id })
+        : null,
+    }));
+    api.accounts
+      .mockImplementationOnce(() => firstAccounts.promise)
+      .mockResolvedValueOnce({ accounts: [authorizedAccount] });
+    api.createPublishJob.mockResolvedValue(publishJob({
+      id: 94,
+      project_id: 2,
+      account_id: authorizedAccount.id,
+      action: 'publish',
+      status: 'published',
+      platform_draft_id: '',
+      platform_publish_id: 'publish-draft-B',
+    }));
+
+    render(<Drafts />);
+
+    await screen.findByText('账号竞态草稿 A');
+    fireEvent.click(buttonsWithText('发布')[0]);
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(1));
+    clickButton('取消');
+
+    fireEvent.click(buttonsWithText('发布')[1]);
+    await waitFor(() => expect(screen.queryAllByText(authorizedAccount.name).length).toBeGreaterThan(0));
+
+    await act(async () => {
+      firstAccounts.resolve({ accounts: [boundAccount] });
+      await firstAccounts.promise;
+    });
+
+    expect(screen.queryByText('发布任务 ID：93')).toBeNull();
+    clickButton('一键发布');
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledWith({
+      project_id: 2,
+      account_id: authorizedAccount.id,
+      action: 'publish',
+    }));
+    await screen.findByText('平台发布已完成');
   });
 
   it('retains a polling job and recovers awaiting confirmation through status refresh', async () => {

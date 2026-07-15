@@ -68,6 +68,7 @@ export default function Creator() {
   const [imageLoadingType, setImageLoadingType] = useState('');
   const activeProjectIdRef = useRef<number | null>(null);
   const publishModalProjectIdRef = useRef<number | null>(null);
+  const publishAccountsProjectIdRef = useRef<number | null>(null);
   const publishRequestGenerationRef = useRef(0);
   const currentPublishJob = publishJob?.project_id === projectId ? publishJob : null;
 
@@ -104,7 +105,10 @@ export default function Creator() {
     if (activeProjectIdRef.current !== project.id) {
       activeProjectIdRef.current = project.id;
       publishModalProjectIdRef.current = null;
+      publishAccountsProjectIdRef.current = null;
       invalidatePublishRequest();
+      setPublishAccounts([]);
+      setPublishAccountsLoading(false);
       setPublishJob(null);
       setPublishPollingError('');
     }
@@ -304,35 +308,31 @@ export default function Creator() {
     setLayoutBlocks(data.layout_blocks || []);
   }
 
-  async function loadPublishAccounts(
+  function commitPublishAccounts(
+    targetProjectId: number,
+    accounts: PlatformAccount[],
     preferredAccountId?: number,
     fallbackToFirst = false,
   ) {
-    setPublishAccountsLoading(true);
-    try {
-      const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
-      const accounts = (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
-      setPublishAccounts(accounts);
-      if (preferredAccountId !== undefined) {
-        publishForm.setFieldValue('account_id', preferredAccountId);
-        return accounts;
-      }
-      if (fallbackToFirst) {
-        publishForm.setFieldValue('account_id', accounts[0]?.id);
-        return accounts;
-      }
-      const currentId = publishForm.getFieldValue('account_id');
-      const current = accounts.find((account) => account.id === currentId);
-      if (!current && accounts.length) {
-        publishForm.setFieldValue('account_id', accounts[0].id);
-      }
-      return accounts;
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '加载授权账号失败');
-      return [];
-    } finally {
-      setPublishAccountsLoading(false);
+    const currentId = publishForm.getFieldValue('account_id');
+    let nextAccountId = accounts.some((account) => account.id === currentId)
+      ? currentId
+      : accounts[0]?.id;
+    if (preferredAccountId !== undefined) {
+      nextAccountId = accounts.some((account) => account.id === preferredAccountId)
+        ? preferredAccountId
+        : undefined;
+    } else if (fallbackToFirst) {
+      nextAccountId = accounts[0]?.id;
     }
+    publishAccountsProjectIdRef.current = targetProjectId;
+    setPublishAccounts(accounts);
+    publishForm.setFieldValue('account_id', nextAccountId);
+  }
+
+  async function loadPublishAccounts() {
+    const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
+    return (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
   }
 
   async function restorePublishJob(targetProjectId: number) {
@@ -340,11 +340,16 @@ export default function Creator() {
     try {
       const resource = await api.projectPublishJob(targetProjectId);
       if (!isPublishRequestCurrent(request)) return;
-      await loadPublishAccounts(
+      setPublishAccountsLoading(true);
+      const accounts = await loadPublishAccounts();
+      if (!isPublishRequestCurrent(request)) return;
+      commitPublishAccounts(
+        targetProjectId,
+        accounts,
         resource.job?.account_id,
         resource.job === null,
       );
-      if (!isPublishRequestCurrent(request)) return;
+      setPublishAccountsLoading(false);
       const existing = resource.job;
       if (!existing) {
         setPublishJob(null);
@@ -361,6 +366,25 @@ export default function Creator() {
       const text = error instanceof Error ? error.message : '恢复发布状态失败';
       setPublishPollingError(text);
       message.error(text);
+    } finally {
+      if (isPublishRequestCurrent(request)) setPublishAccountsLoading(false);
+    }
+  }
+
+  async function refreshPublishAccounts() {
+    const targetProjectId = publishModalProjectIdRef.current;
+    if (!targetProjectId) return;
+    const request = beginPublishRequest(targetProjectId);
+    setPublishAccountsLoading(true);
+    try {
+      const accounts = await loadPublishAccounts();
+      if (!isPublishRequestCurrent(request)) return;
+      commitPublishAccounts(targetProjectId, accounts);
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      message.error(error instanceof Error ? error.message : '加载授权账号失败');
+    } finally {
+      if (isPublishRequestCurrent(request)) setPublishAccountsLoading(false);
     }
   }
 
@@ -370,9 +394,13 @@ export default function Creator() {
       const currentProjectId = activeProjectIdRef.current;
       if (publishModalProjectIdRef.current !== currentProjectId) {
         publishModalProjectIdRef.current = currentProjectId;
+        publishAccountsProjectIdRef.current = null;
         invalidatePublishRequest();
+        setPublishAccounts([]);
+        setPublishAccountsLoading(false);
         setPublishJob(null);
         setPublishPollingError('');
+        publishForm.resetFields();
       }
       setPublishOpen(true);
       if (currentProjectId) await restorePublishJob(currentProjectId);
@@ -386,12 +414,16 @@ export default function Creator() {
     const targetProjectId = projectId;
     const request = beginPublishRequest(targetProjectId);
     const values = await publishForm.validateFields() as { account_id: number };
+    if (!isPublishRequestCurrent(request)) return;
+    if (publishAccountsProjectIdRef.current !== targetProjectId) {
+      message.error('所选账号不属于当前项目，请刷新账号');
+      return;
+    }
     const account = publishAccounts.find((item) => item.id === values.account_id);
     if (!account) {
       message.error('所选账号不存在或授权状态已变化，请刷新账号');
       return;
     }
-    if (!isPublishRequestCurrent(request)) return;
     setPublishingAction(action);
     let acceptedJob = false;
     try {
@@ -487,6 +519,11 @@ export default function Creator() {
 
   function closePublishModal() {
     invalidatePublishRequest();
+    publishModalProjectIdRef.current = null;
+    publishAccountsProjectIdRef.current = null;
+    setPublishAccounts([]);
+    setPublishAccountsLoading(false);
+    publishForm.resetFields();
     setPublishOpen(false);
   }
 
@@ -706,7 +743,7 @@ export default function Creator() {
             >
               一键发布
             </Button>
-            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={() => loadPublishAccounts()}>刷新账号</Button>
+            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={refreshPublishAccounts}>刷新账号</Button>
             <Button onClick={closePublishModal}>取消</Button>
           </Space>
         </Form>

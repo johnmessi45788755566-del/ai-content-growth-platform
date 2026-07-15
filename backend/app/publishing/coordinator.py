@@ -188,16 +188,17 @@ class PublishCoordinator:
 
     def execute_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
-        _, account, payload = self._load_inputs(
-            int(job["project_id"]), int(job["account_id"]), str(job["action"])
-        )
-        return self._execute(
-            job_id,
-            account,
-            payload,
-            expected_status="pending",
-            observed_job=job,
-        )
+        attempt_token = self._claim_execution(job, "pending")
+        if attempt_token is None:
+            return self.get_publish_job(job_id)
+        try:
+            _, account, payload = self._load_inputs(
+                int(job["project_id"]), int(job["account_id"]), str(job["action"])
+            )
+        except Exception as exc:
+            self._persist_failure(job_id, "加载发布输入", exc, attempt_token)
+            return self.get_publish_job(job_id)
+        return self._execute_claimed(job, account, payload, attempt_token)
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         return self._public_job(self._get_row(job_id))
@@ -356,6 +357,16 @@ class PublishCoordinator:
         )
         if attempt_token is None:
             return self.get_publish_job(job_id)
+        return self._execute_claimed(job, account, payload, attempt_token)
+
+    def _execute_claimed(
+        self,
+        job: Mapping[str, Any],
+        account: dict[str, Any],
+        payload: dict[str, Any],
+        attempt_token: str,
+    ) -> dict[str, Any]:
+        job_id = int(job["id"])
         try:
             publish_with_progress = getattr(
                 self.publisher, "publish_with_progress", None

@@ -54,6 +54,7 @@ export default function Drafts() {
   const [publishPollingError, setPublishPollingError] = useState('');
   const [refreshingPublishJob, setRefreshingPublishJob] = useState(false);
   const publishDraftRef = useRef<Draft | null>(null);
+  const publishAccountsProjectIdRef = useRef<number | null>(null);
   const publishRequestGenerationRef = useRef(0);
   const currentPublishJob = publishJob?.project_id === publishDraft?.project_id ? publishJob : null;
 
@@ -111,32 +112,31 @@ export default function Drafts() {
     }
   }
 
-  async function loadPublishAccounts(
+  function commitPublishAccounts(
+    targetProjectId: number,
+    accounts: PlatformAccount[],
     preferredAccountId?: number,
     fallbackToFirst = false,
   ) {
-    setPublishAccountsLoading(true);
-    try {
-      const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
-      const accounts = (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
-      setPublishAccounts(accounts);
-      if (preferredAccountId !== undefined) {
-        publishForm.setFieldValue('account_id', preferredAccountId);
-      } else if (fallbackToFirst) {
-        publishForm.setFieldValue('account_id', accounts[0]?.id);
-      } else {
-        const currentId = publishForm.getFieldValue('account_id');
-        if (!accounts.some((account) => account.id === currentId)) {
-          publishForm.setFieldValue('account_id', accounts[0]?.id);
-        }
-      }
-      return accounts;
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '加载授权账号失败');
-      return [];
-    } finally {
-      setPublishAccountsLoading(false);
+    const currentId = publishForm.getFieldValue('account_id');
+    let nextAccountId = accounts.some((account) => account.id === currentId)
+      ? currentId
+      : accounts[0]?.id;
+    if (preferredAccountId !== undefined) {
+      nextAccountId = accounts.some((account) => account.id === preferredAccountId)
+        ? preferredAccountId
+        : undefined;
+    } else if (fallbackToFirst) {
+      nextAccountId = accounts[0]?.id;
     }
+    publishAccountsProjectIdRef.current = targetProjectId;
+    setPublishAccounts(accounts);
+    publishForm.setFieldValue('account_id', nextAccountId);
+  }
+
+  async function loadPublishAccounts() {
+    const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
+    return (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
   }
 
   async function restorePublishJob(targetProjectId: number) {
@@ -144,11 +144,16 @@ export default function Drafts() {
     try {
       const resource = await api.projectPublishJob(targetProjectId);
       if (!isPublishRequestCurrent(request)) return;
-      await loadPublishAccounts(
+      setPublishAccountsLoading(true);
+      const accounts = await loadPublishAccounts();
+      if (!isPublishRequestCurrent(request)) return;
+      commitPublishAccounts(
+        targetProjectId,
+        accounts,
         resource.job?.account_id,
         resource.job === null,
       );
-      if (!isPublishRequestCurrent(request)) return;
+      setPublishAccountsLoading(false);
       const existing = resource.job;
       if (!existing) {
         setPublishJob(null);
@@ -165,13 +170,35 @@ export default function Drafts() {
       const text = error instanceof Error ? error.message : '恢复发布状态失败';
       setPublishPollingError(text);
       message.error(text);
+    } finally {
+      if (isPublishRequestCurrent(request)) setPublishAccountsLoading(false);
+    }
+  }
+
+  async function refreshPublishAccounts() {
+    const targetProjectId = publishDraftRef.current?.project_id;
+    if (!targetProjectId) return;
+    const request = beginPublishRequest(targetProjectId);
+    setPublishAccountsLoading(true);
+    try {
+      const accounts = await loadPublishAccounts();
+      if (!isPublishRequestCurrent(request)) return;
+      commitPublishAccounts(targetProjectId, accounts);
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      message.error(error instanceof Error ? error.message : '加载授权账号失败');
+    } finally {
+      if (isPublishRequestCurrent(request)) setPublishAccountsLoading(false);
     }
   }
 
   async function openPublishModal(draft: Draft) {
     invalidatePublishRequest();
     publishDraftRef.current = draft;
+    publishAccountsProjectIdRef.current = null;
     setPublishDraft(draft);
+    setPublishAccounts([]);
+    setPublishAccountsLoading(false);
     setPublishJob(null);
     setPublishPollingError('');
     publishForm.resetFields();
@@ -181,9 +208,13 @@ export default function Drafts() {
   function closePublishModal() {
     invalidatePublishRequest();
     publishDraftRef.current = null;
+    publishAccountsProjectIdRef.current = null;
     setPublishDraft(null);
+    setPublishAccounts([]);
+    setPublishAccountsLoading(false);
     setPublishJob(null);
     setPublishPollingError('');
+    publishForm.resetFields();
   }
 
   async function runPublishAction(action: PublishAction) {
@@ -191,12 +222,16 @@ export default function Drafts() {
     const targetProjectId = publishDraft.project_id;
     const request = beginPublishRequest(targetProjectId);
     const values = await publishForm.validateFields() as { account_id: number };
+    if (!isPublishRequestCurrent(request)) return;
+    if (publishAccountsProjectIdRef.current !== targetProjectId) {
+      message.error('所选账号不属于当前草稿，请刷新账号');
+      return;
+    }
     const account = publishAccounts.find((item) => item.id === values.account_id);
     if (!account) {
       message.error('所选账号不存在或授权状态已变化，请刷新账号');
       return;
     }
-    if (!isPublishRequestCurrent(request)) return;
     setPublishingAction(action);
     let acceptedJob = false;
     try {
@@ -400,7 +435,7 @@ export default function Drafts() {
             >
               一键发布
             </Button>
-            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={() => loadPublishAccounts()}>刷新账号</Button>
+            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={refreshPublishAccounts}>刷新账号</Button>
             <Button onClick={closePublishModal}>取消</Button>
           </Space>
         </Form>
