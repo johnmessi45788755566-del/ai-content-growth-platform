@@ -49,4 +49,16 @@ describe('publish job API', () => {
       expect.any(Object),
     );
   });
+
+  it('loads the latest bound publish job without requiring account or action', async () => {
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({ job: { id: 8, status: 'platform_draft' } }));
+    vi.stubGlobal('fetch', fetch);
+
+    await api.projectPublishJob(3);
+
+    expect(fetch).toHaveBeenCalledWith(
+      `${API_BASE}/api/publish-jobs/project?project_id=3`,
+      expect.any(Object),
+    );
+  });
 });

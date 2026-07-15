@@ -3,7 +3,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -251,6 +251,30 @@ def test_concurrent_create_publish_job_is_idempotent_and_calls_publisher_once(tm
     )["count"] == 1
 
 
+def test_create_publish_job_executes_existing_pending_job_once(tmp_path):
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "待执行创建幂等")
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+    pending = service.prepare_publish_job(project["id"], account_id, "draft")
+
+    created = service.create_publish_job(project["id"], account_id, "draft")
+    replayed = service.create_publish_job(project["id"], account_id, "draft")
+
+    assert created["id"] == replayed["id"] == pending["id"]
+    assert created["status"] == replayed["status"] == "platform_draft"
+    assert publisher.calls == 1
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+
+
 def test_terminal_and_failed_create_requests_return_existing_job_without_retry(tmp_path):
     class CountingPublisher(FakePlatformPublisher):
         def __init__(self):
@@ -471,6 +495,106 @@ def test_stale_confirmation_scan_does_not_fail_recent_handle(tmp_path):
 
     service.recover_stale_awaiting_confirmations(datetime(2026, 7, 15, 1, 6))
     assert service.get_publish_job(waiting["id"])["status"] == "failed"
+
+
+def test_direct_pending_publish_job_recovers_after_restart_without_scheduled_task(
+    tmp_path: Path,
+):
+    database_path = tmp_path / "content.db"
+    first = make_service(tmp_path)
+    project, account_id = prepare_publish_project(first, "独立发布崩溃恢复")
+    pending = first.prepare_publish_job(project["id"], account_id, "draft")
+
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    publisher = CountingPublisher()
+    restarted = ContentService(
+        db=Database(database_path),
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads-restarted",
+        platform_publisher=publisher,
+    )
+
+    restarted.recover_publish_jobs(datetime(2026, 7, 15, 1, 0, tzinfo=timezone.utc))
+    restarted.recover_publish_jobs(datetime(2026, 7, 15, 1, 1, tzinfo=timezone.utc))
+
+    recovered = restarted.get_publish_job(pending["id"])
+    assert recovered["id"] == pending["id"]
+    assert recovered["status"] == "platform_draft"
+    assert publisher.calls == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM scheduled_tasks")["count"] == 0
+
+
+def test_direct_active_publish_recovery_fails_only_stale_job_and_retries_same_job(
+    tmp_path: Path,
+):
+    database_path = tmp_path / "content.db"
+    first = make_service(tmp_path)
+    stale_project, account_id = prepare_publish_project(first, "陈旧独立发布")
+    recent_project, _ = prepare_publish_project(first, "近期独立发布")
+    stale = first.prepare_publish_job(stale_project["id"], account_id, "draft")
+    recent = first.prepare_publish_job(recent_project["id"], account_id, "draft")
+    first.db.execute(
+        """
+        UPDATE publish_jobs
+        SET status = 'publishing', response_json = ?, updated_at = '2026-07-15 01:00:00'
+        WHERE id = ?
+        """,
+        (json.dumps({"_attempt_token": "stale-attempt"}), stale["id"]),
+    )
+    first.db.execute(
+        """
+        UPDATE publish_jobs
+        SET status = 'publishing', response_json = ?, updated_at = '2026-07-15 01:10:00'
+        WHERE id = ?
+        """,
+        (json.dumps({"_attempt_token": "recent-attempt"}), recent["id"]),
+    )
+
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    publisher = CountingPublisher()
+    restarted = ContentService(
+        db=Database(database_path),
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads-restarted",
+        platform_publisher=publisher,
+    )
+
+    restarted.recover_publish_jobs(
+        datetime(2026, 7, 15, 1, 16, tzinfo=timezone.utc)
+    )
+
+    failed = restarted.get_publish_job(stale["id"])
+    assert failed["status"] == "failed"
+    assert failed["failure_stage"] == "发布中断"
+    assert restarted.get_publish_job(recent["id"])["status"] == "publishing"
+    replayed = restarted.create_publish_job(stale_project["id"], account_id, "draft")
+    assert replayed["id"] == stale["id"]
+    assert replayed["status"] == "failed"
+    assert publisher.calls == 0
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 2
+
+    retried = restarted.retry_publish_job(stale["id"])
+
+    assert retried["id"] == stale["id"]
+    assert retried["status"] == "platform_draft"
+    assert publisher.calls == 1
+    assert restarted.get_publish_job(recent["id"])["status"] == "publishing"
+    assert restarted.db.fetch_one("SELECT COUNT(*) AS count FROM scheduled_tasks")["count"] == 0
 
 
 def test_stale_pre_publish_task_fails_and_retries_without_touching_recent_execution(tmp_path):

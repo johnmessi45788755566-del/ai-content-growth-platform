@@ -135,6 +135,38 @@ class ContentService:
             failed += int(result["status"] == "failed")
         return {"failed": failed}
 
+    def recover_publish_jobs(
+        self, now: datetime | None = None
+    ) -> dict[str, int]:
+        pending_jobs = self.db.fetch_all(
+            "SELECT id FROM publish_jobs WHERE status = 'pending' ORDER BY id"
+        )
+        recovered = 0
+        for job in pending_jobs:
+            result = self.execute_publish_job(int(job["id"]))
+            recovered += int(result["status"] != "pending")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.astimezone()
+        stale_before = (
+            current.astimezone(timezone.utc) - PUBLISH_INTERRUPTION_TIMEOUT
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        active_jobs = self.db.fetch_all(
+            f"""
+            SELECT id FROM publish_jobs
+            WHERE status IN ({','.join('?' for _ in UNCERTAIN_IN_PROGRESS_STATUSES)})
+            ORDER BY id
+            """,
+            UNCERTAIN_IN_PROGRESS_STATUSES,
+        )
+        failed = 0
+        for job in active_jobs:
+            result = self.publish_coordinator.fail_stale_in_progress_job(
+                int(job["id"]), stale_before
+            )
+            failed += int(result["status"] == "failed")
+        return {"recovered": recovered, "failed": failed}
+
     def recommend_topics(self, user_prompt: str) -> list[TopicRecommendation]:
         return self.ai_client.recommend_topics(user_prompt)
 
@@ -444,11 +476,13 @@ class ContentService:
     def _complete_account_auth(self, result: dict[str, Any]) -> dict[str, Any]:
         normalized_platform = _normalize_platform(result["platform"])
         name = str(result.get("account_name") or f"{normalized_platform}账号").strip()
-        external_id = str(result.get("external_id") or "")
+        external_id = str(result.get("external_id") or "").strip()
         profile_path = str(result.get("profile_path") or "")
         login_url = str(result.get("login_url") or "")
         sync_data = result.get("sync_data")
         sync_error = str(result.get("sync_error") or "")
+        if normalized_platform == "微信公众号" and not external_id:
+            raise RuntimeError("微信公众号授权缺少稳定账号 ID，请重新扫码")
         existing = None
         if external_id:
             existing = self.db.fetch_one(
@@ -1957,6 +1991,9 @@ class ContentService:
             project_id, account_id, action
         )
 
+    def get_project_publish_job(self, project_id: int) -> dict[str, Any] | None:
+        return self.publish_coordinator.get_project_publish_job(project_id)
+
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
             try:
@@ -2174,6 +2211,8 @@ class ContentService:
             and observed_external_id
             and expected_external_id == observed_external_id
         )
+        if account["platform"] == "微信公众号" and not stable_id_matches:
+            raise RuntimeError("同步页面账号身份与所选账号不一致")
         if expected_external_id and observed_external_id and not stable_id_matches:
             raise RuntimeError("同步页面账号身份与所选账号不一致")
         if not stable_id_matches:

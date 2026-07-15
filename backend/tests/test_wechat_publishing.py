@@ -670,18 +670,23 @@ def test_browser_gateway_rejects_wrong_bizuin_even_when_account_name_matches(tmp
         )
 
 
-def test_browser_gateway_falls_back_to_strict_account_name_when_bizuin_is_unavailable(tmp_path: Path):
-    gateway = IdentityGateway([], "理想说AI")
+@pytest.mark.parametrize(
+    ("cookies", "external_id"),
+    [
+        ([], "selected-bizuin"),
+        ([auth_cookie("bizuin", value="logged-in-bizuin")], ""),
+        ([], ""),
+    ],
+)
+def test_browser_gateway_rejects_missing_stable_identity_even_when_account_name_matches(
+    tmp_path: Path, cookies, external_id
+):
+    gateway = IdentityGateway(cookies, "理想说AI")
 
-    gateway.require_account_identity(
-        browser_session(tmp_path),
-        {"external_id": "", "name": "理想说AI"},
-    )
-
-    with pytest.raises(WeChatPublishingError, match="当前登录公众号与所选账号不一致"):
+    with pytest.raises(WeChatPublishingError, match="无法验证.*稳定身份"):
         gateway.require_account_identity(
             browser_session(tmp_path),
-            {"external_id": "", "name": "理想说 AI"},
+            {"external_id": external_id, "name": "理想说AI"},
         )
 
 

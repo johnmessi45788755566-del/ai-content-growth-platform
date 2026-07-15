@@ -1,5 +1,5 @@
 import { Alert, Button, Card, Drawer, Form, Input, message, Modal, Popconfirm, Select, Space, Spin, Table } from 'antd';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Detail, MetricCards, Platform, SmallTag, Status } from '@/components/Common';
 import { api } from '@/services/api';
 import type { AccountAuthSession, PlatformAccount } from '@/types';
@@ -18,6 +18,8 @@ export default function Accounts() {
   const [platform, setPlatform] = useState('');
   const [authStatus, setAuthStatus] = useState('');
   const [search, setSearch] = useState('');
+  const authGenerationRef = useRef(0);
+  const authSessionIdRef = useRef<string | null>(null);
 
   async function loadAccounts() {
     setLoading(true);
@@ -40,53 +42,94 @@ export default function Accounts() {
   }, [platform, authStatus]);
 
   async function startPlatformLogin(selectedPlatform: string) {
+    const generation = authGenerationRef.current + 1;
+    authGenerationRef.current = generation;
+    authSessionIdRef.current = null;
     setAuthLoading(true);
     try {
       const data = await api.startAccountAuth({ platform: selectedPlatform });
+      if (authGenerationRef.current !== generation) return;
+      authSessionIdRef.current = data.session_id;
       setAuthSession(data);
     } catch (error) {
+      if (authGenerationRef.current !== generation) return;
       message.error(error instanceof Error ? error.message : '添加账号失败');
     } finally {
-      setAuthLoading(false);
+      if (authGenerationRef.current === generation) setAuthLoading(false);
     }
   }
 
   useEffect(() => {
     if (!authSession || authSession.status !== 'waiting') return;
+    const generation = authGenerationRef.current;
+    const sessionId = authSession.session_id;
+    let active = true;
+    let polling = false;
+    const ownsSession = () => active
+      && authGenerationRef.current === generation
+      && authSessionIdRef.current === sessionId;
     const timer = window.setInterval(async () => {
+      if (polling || !ownsSession()) return;
+      polling = true;
       try {
-        const data = await api.accountAuthStatus(authSession.session_id);
+        const data = await api.accountAuthStatus(sessionId);
+        if (!ownsSession() || data.session_id !== sessionId) return;
         setAuthSession(data);
         if (data.status === 'success') {
           window.clearInterval(timer);
           await loadAccounts();
-          message.success('真实登录成功，账号已加入工作台');
+          if (ownsSession()) message.success('真实登录成功，账号已加入工作台');
         }
         if (data.status === 'failed' || data.status === 'cancelled') {
           window.clearInterval(timer);
         }
       } catch (error) {
+        if (!ownsSession()) return;
         window.clearInterval(timer);
         const text = error instanceof Error ? error.message : '登录状态检测失败';
-        setAuthSession((current) => current?.session_id === authSession.session_id
+        setAuthSession((current) => current?.session_id === sessionId
           ? { ...current, status: 'failed', message: text, error: text }
           : current);
         message.error(text);
+      } finally {
+        polling = false;
       }
     }, 2000);
-    return () => window.clearInterval(timer);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, [authSession?.session_id, authSession?.status]);
 
   async function closeAuthModal() {
-    if (authSession?.status === 'waiting') {
+    const session = authSession;
+    authGenerationRef.current += 1;
+    authSessionIdRef.current = null;
+    setAuthOpen(false);
+    setAuthSession(null);
+    setAuthLoading(false);
+    if (session?.status === 'waiting') {
       try {
-        await api.cancelAccountAuth(authSession.session_id);
+        await api.cancelAccountAuth(session.session_id);
       } catch {
         // 登录窗口可能已由用户关闭。
       }
     }
-    setAuthOpen(false);
+  }
+
+  function openAuthModal() {
+    authGenerationRef.current += 1;
+    authSessionIdRef.current = null;
     setAuthSession(null);
+    setAuthLoading(false);
+    setAuthOpen(true);
+  }
+
+  function resetAuthPlatform() {
+    authGenerationRef.current += 1;
+    authSessionIdRef.current = null;
+    setAuthSession(null);
+    setAuthLoading(false);
   }
 
   async function syncAccount(account: PlatformAccount) {
@@ -174,7 +217,7 @@ export default function Accounts() {
           <Space>
             <Button onClick={loadAccounts}>授权检测</Button>
             <Button onClick={() => Promise.all(accounts.map((item) => syncAccount(item))).then(loadAccounts)}>更新账号信息</Button>
-            <Button type="primary" onClick={() => { setAuthSession(null); setAuthOpen(true); }}>添加账号</Button>
+            <Button type="primary" onClick={openAuthModal}>添加账号</Button>
           </Space>
         </div>
         <Table
@@ -234,7 +277,7 @@ export default function Accounts() {
               {authSession.status === 'success' && <Button type="primary" onClick={closeAuthModal}>完成</Button>}
               {authSession.status !== 'success' && <Button onClick={closeAuthModal}>取消</Button>}
               {(authSession.status === 'failed' || authSession.status === 'cancelled') && (
-                <Button type="primary" onClick={() => setAuthSession(null)}>重新选择平台</Button>
+                <Button type="primary" onClick={resetAuthPlatform}>重新选择平台</Button>
               )}
             </Space>
           </Spin>

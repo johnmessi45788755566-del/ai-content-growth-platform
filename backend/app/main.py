@@ -188,6 +188,7 @@ def create_app(
 
     def run_scheduler_maintenance() -> None:
         service.recover_stale_awaiting_confirmations()
+        service.recover_publish_jobs()
         service.sync_due_accounts()
         service.execute_due_tasks()
 
@@ -490,6 +491,10 @@ def create_app(
             }
         except PublishJobValidationError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/publish-jobs/project")
+    def get_project_publish_job(project_id: int) -> dict[str, Any]:
+        return {"job": service.get_project_publish_job(project_id)}
 
     @app.get("/api/publish-jobs/{job_id}")
     def get_publish_job(job_id: int) -> dict[str, Any]:

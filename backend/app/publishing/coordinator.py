@@ -227,6 +227,18 @@ class PublishCoordinator:
             )
         return self._public_job(job) if job else None
 
+    def get_project_publish_job(self, project_id: int) -> dict[str, Any] | None:
+        job = self.db.fetch_one(
+            """
+            SELECT * FROM publish_jobs
+            WHERE project_id = ?
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (project_id,),
+        )
+        return self._public_job(job) if job else None
+
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
         if job["status"] != "failed":

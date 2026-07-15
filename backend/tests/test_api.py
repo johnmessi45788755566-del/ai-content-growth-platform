@@ -1022,6 +1022,61 @@ def test_current_publish_job_returns_null_for_an_action_not_started(tmp_path: Pa
     assert response.json() == {"job": None}
 
 
+def test_project_publish_job_returns_latest_bound_job_with_public_fields_only(
+    tmp_path: Path,
+):
+    client, project, account_id = prepare_publish_job_api(
+        tmp_path, FakePlatformPublisher()
+    )
+    empty = client.get(
+        "/api/publish-jobs/project", params={"project_id": project["id"]}
+    )
+    draft = client.post(
+        "/api/publish-jobs",
+        json={
+            "project_id": project["id"],
+            "account_id": account_id,
+            "action": "draft",
+        },
+    )
+    published = client.post(
+        "/api/publish-jobs",
+        json={
+            "project_id": project["id"],
+            "account_id": account_id,
+            "action": "publish",
+        },
+    )
+
+    response = client.get(
+        "/api/publish-jobs/project", params={"project_id": project["id"]}
+    )
+
+    assert empty.status_code == 200
+    assert empty.json() == {"job": None}
+    assert draft.status_code == published.status_code == response.status_code == 200
+    assert response.json()["job"] == published.json()
+    assert set(response.json()["job"]) == {
+        "id",
+        "project_id",
+        "account_id",
+        "platform",
+        "action",
+        "status",
+        "platform_draft_id",
+        "platform_publish_id",
+        "platform_url",
+        "requires_confirmation",
+        "failure_stage",
+        "failure_reason",
+        "created_at",
+        "updated_at",
+        "response",
+    }
+    assert "response_json" not in response.text
+    assert "profile_path" not in response.text
+
+
 @pytest.mark.parametrize(
     (
         "retry_outcome",
@@ -1710,6 +1765,48 @@ def test_account_auth_does_not_merge_different_stable_ids_with_same_name(tmp_pat
     assert service.get_account(second["id"])["external_id"] == "second-bizuin"
 
 
+@pytest.mark.parametrize("missing_external_id", ["", "   "])
+def test_account_reauthorization_without_stable_id_fails_without_overwriting_existing_account(
+    tmp_path: Path, missing_external_id: str,
+):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    existing = service._complete_account_auth(
+        {
+            "platform": "微信公众号",
+            "account_name": "同名公众号",
+            "external_id": "stable-bizuin",
+            "profile_path": "/tmp/original-profile",
+            "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=original",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="稳定账号 ID.*重新扫码"):
+        service._complete_account_auth(
+            {
+                "platform": "微信公众号",
+                "account_name": "同名公众号",
+                "external_id": missing_external_id,
+                "profile_path": "/tmp/replacement-profile",
+                "login_url": "https://mp.weixin.qq.com/cgi-bin/home?token=replacement",
+            }
+        )
+
+    unchanged = service.get_account(existing["id"])
+    assert unchanged["external_id"] == "stable-bizuin"
+    assert unchanged["profile_path"] == "/tmp/original-profile"
+    assert "token=original" in unchanged["login_url"]
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS count FROM platform_accounts WHERE platform = '微信公众号'"
+    )["count"] == 1
+
+
 def test_account_management_update_cannot_overwrite_authenticated_identity(tmp_path: Path):
     app = create_app(
         database_path=tmp_path / "content.db",
@@ -1777,6 +1874,47 @@ def test_account_sync_rejects_wrong_stable_identity_before_writing_metrics(tmp_p
     )["count"] == 0
 
 
+@pytest.mark.parametrize(
+    ("stored_external_id", "observed_external_id"),
+    [("selected-bizuin", ""), ("", "observed-bizuin"), ("", "")],
+)
+def test_wechat_account_sync_rejects_missing_stable_identity_even_when_name_matches(
+    tmp_path: Path, stored_external_id: str, observed_external_id: str
+):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    account_id = db.execute(
+        """
+        INSERT INTO platform_accounts (platform, name, external_id, auth_status)
+        VALUES ('微信公众号', '所选公众号', ?, '已授权')
+        """,
+        (stored_external_id,),
+    )
+
+    with pytest.raises(RuntimeError, match="账号身份与所选账号不一致"):
+        service._persist_account_sync(
+            account_id,
+            {
+                "source": "browser",
+                "account_name": "所选公众号",
+                "external_id": observed_external_id,
+                "metrics": {"fans": 999},
+                "works": [],
+            },
+        )
+
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS count FROM account_metric_snapshots WHERE account_id = ?",
+        (account_id,),
+    )["count"] == 0
+
+
 def test_api_write_rejects_untrusted_origin_but_allows_trusted_and_originless_calls(tmp_path: Path):
     app = create_app(
         database_path=tmp_path / "content.db",
@@ -1819,10 +1957,16 @@ def test_app_rejects_wildcard_trusted_origin_configuration(tmp_path: Path):
 
 def test_scheduler_dispatches_blocking_maintenance_to_worker_thread():
     source = inspect.getsource(create_app)
+    maintenance_source = source[
+        source.index("def run_scheduler_maintenance") : source.index(
+            "async def task_scheduler_loop"
+        )
+    ]
     scheduler_source = source[
         source.index("async def task_scheduler_loop") : source.index("@asynccontextmanager")
     ]
 
+    assert "service.recover_publish_jobs()" in maintenance_source
     assert "await asyncio.to_thread" in scheduler_source
     assert "service.sync_due_accounts()" not in scheduler_source
     assert "service.execute_due_tasks()" not in scheduler_source

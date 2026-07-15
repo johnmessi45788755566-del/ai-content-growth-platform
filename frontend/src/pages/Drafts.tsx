@@ -111,13 +111,25 @@ export default function Drafts() {
     }
   }
 
-  async function loadPublishAccounts() {
+  async function loadPublishAccounts(
+    preferredAccountId?: number,
+    fallbackToFirst = false,
+  ) {
     setPublishAccountsLoading(true);
     try {
       const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
       const accounts = (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
       setPublishAccounts(accounts);
-      if (accounts.length) publishForm.setFieldValue('account_id', accounts[0].id);
+      if (preferredAccountId !== undefined) {
+        publishForm.setFieldValue('account_id', preferredAccountId);
+      } else if (fallbackToFirst) {
+        publishForm.setFieldValue('account_id', accounts[0]?.id);
+      } else {
+        const currentId = publishForm.getFieldValue('account_id');
+        if (!accounts.some((account) => account.id === currentId)) {
+          publishForm.setFieldValue('account_id', accounts[0]?.id);
+        }
+      }
       return accounts;
     } catch (error) {
       message.error(error instanceof Error ? error.message : '加载授权账号失败');
@@ -127,19 +139,17 @@ export default function Drafts() {
     }
   }
 
-  async function restorePublishJob(targetProjectId: number, accountId: number) {
+  async function restorePublishJob(targetProjectId: number) {
     const request = beginPublishRequest(targetProjectId);
     try {
-      const resources = await Promise.all(
-        (['draft', 'publish'] as PublishAction[]).map((action) => (
-          api.currentPublishJob(targetProjectId, accountId, action)
-        )),
+      const resource = await api.projectPublishJob(targetProjectId);
+      if (!isPublishRequestCurrent(request)) return;
+      await loadPublishAccounts(
+        resource.job?.account_id,
+        resource.job === null,
       );
       if (!isPublishRequestCurrent(request)) return;
-      const existing = resources
-        .map((resource) => resource.job)
-        .filter((job): job is PublishJob => Boolean(job))
-        .sort((left, right) => right.id - left.id)[0];
+      const existing = resource.job;
       if (!existing) {
         setPublishJob(null);
         return;
@@ -165,11 +175,7 @@ export default function Drafts() {
     setPublishJob(null);
     setPublishPollingError('');
     publishForm.resetFields();
-    const accounts = await loadPublishAccounts();
-    const accountId = Number(publishForm.getFieldValue('account_id'));
-    if (accountId && accounts.some((account) => account.id === accountId)) {
-      await restorePublishJob(draft.project_id, accountId);
-    }
+    await restorePublishJob(draft.project_id);
   }
 
   function closePublishModal() {
@@ -342,9 +348,6 @@ export default function Drafts() {
               loading={publishAccountsLoading}
               placeholder={publishAccounts.length ? '请选择已授权公众号账号' : '暂无已授权公众号账号，请先到账号矩阵登录'}
               options={publishAccounts.map((account) => ({ value: account.id, label: account.name }))}
-              onChange={(accountId) => {
-                if (publishDraft) restorePublishJob(publishDraft.project_id, accountId);
-              }}
             />
           </Form.Item>
           {currentPublishJob && (
@@ -397,7 +400,7 @@ export default function Drafts() {
             >
               一键发布
             </Button>
-            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={loadPublishAccounts}>刷新账号</Button>
+            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={() => loadPublishAccounts()}>刷新账号</Button>
             <Button onClick={closePublishModal}>取消</Button>
           </Space>
         </Form>

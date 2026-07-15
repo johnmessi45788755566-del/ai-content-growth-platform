@@ -364,48 +364,12 @@ class ChromeCDPBrowserGateway:
             "",
         )
         expected_external_id = str(account.get("external_id") or "").strip()
-        if expected_external_id and live_external_id:
-            if expected_external_id != live_external_id:
-                raise WeChatPublishingError("当前登录公众号与所选账号不一致，已终止发布")
-            return
-
-        expected_name = self._normalize_account_name(account.get("name"))
-        live_name = self._normalize_account_name(
-            self.evaluate(session, self._account_name_expression())
-        )
-        if not expected_name or not live_name:
-            raise WeChatPublishingError("无法验证当前登录公众号身份，请重新授权所选账号")
-        if expected_name != live_name:
+        if not expected_external_id or not live_external_id:
+            raise WeChatPublishingError(
+                "无法验证当前登录公众号稳定身份，请重新授权所选账号"
+            )
+        if expected_external_id != live_external_id:
             raise WeChatPublishingError("当前登录公众号与所选账号不一致，已终止发布")
-
-    @staticmethod
-    def _normalize_account_name(value: Any) -> str:
-        return unicodedata.normalize("NFKC", str(value or "")).strip()
-
-    @staticmethod
-    def _account_name_expression() -> str:
-        return """
-        (() => {
-          const selectors = [
-            '.weui-desktop-account__nickname',
-            '.weui-desktop-account__name',
-            '.account_meta_info .nickname',
-            '.account_info .nickname'
-          ];
-          for (const selector of selectors) {
-            const text = document.querySelector(selector)?.textContent?.trim();
-            if (text && text.length <= 80) return text;
-          }
-          const roots = [window.wx?.cgiData, window.cgiData];
-          for (const root of roots) {
-            const text = root?.nickname || root?.nick_name || root?.account_name;
-            if (typeof text === 'string' && text.trim() && text.trim().length <= 80) {
-              return text.trim();
-            }
-          }
-          return '';
-        })()
-        """
 
     @staticmethod
     def _valid_auth_cookie(cookie: Mapping[str, Any]) -> bool:

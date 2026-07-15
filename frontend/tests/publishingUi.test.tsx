@@ -21,6 +21,7 @@ const api = vi.hoisted(() => ({
   generateImages: vi.fn(),
   getProject: vi.fn(),
   getPublishJob: vi.fn(),
+  projectPublishJob: vi.fn(),
   resumePublishJob: vi.fn(),
   retryPublishJob: vi.fn(),
   retryTasks: vi.fn(),
@@ -50,6 +51,12 @@ const unavailableAccounts = [
   { id: 12, platform: '微信公众号', name: '未授权公众号', auth_status: '未授权' },
   { id: 13, platform: '小红书', name: '其他平台账号', auth_status: '已授权' },
 ];
+
+const boundAccount = {
+  ...authorizedAccount,
+  id: 14,
+  name: '项目绑定公众号',
+};
 
 function project(id: number, title: string) {
   return {
@@ -161,6 +168,7 @@ beforeEach(() => {
   api.deleteDraft.mockResolvedValue({});
   api.deleteTask.mockResolvedValue({});
   api.currentPublishJob.mockResolvedValue({ job: null });
+  api.projectPublishJob.mockResolvedValue({ job: null });
   api.retryTasks.mockResolvedValue({});
 });
 
@@ -175,6 +183,7 @@ describe('Creator publishing', () => {
     const waiting = publishJob({
       id: 80,
       project_id: 1,
+      account_id: boundAccount.id,
       action: 'publish',
       status: 'awaiting_confirmation',
       platform_draft_id: '',
@@ -183,9 +192,8 @@ describe('Creator publishing', () => {
     window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
     api.getProject.mockResolvedValue(restoredProject);
     api.saveLayout.mockResolvedValue({ project: restoredProject, layout_blocks: [] });
-    api.currentPublishJob.mockImplementation((projectId, accountId, action) => Promise.resolve({
-      job: action === 'publish' ? waiting : null,
-    }));
+    api.accounts.mockResolvedValue({ accounts: [authorizedAccount, boundAccount, ...unavailableAccounts] });
+    api.projectPublishJob.mockResolvedValue({ job: waiting });
     api.resumePublishJob.mockResolvedValue(publishJob({
       id: 80,
       project_id: 1,
@@ -200,8 +208,9 @@ describe('Creator publishing', () => {
     await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
     clickButton('发布');
     await screen.findByText('等待运营人员确认');
-    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'draft');
-    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'publish');
+    expect(api.projectPublishJob).toHaveBeenCalledWith(1);
+    expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0);
+    expect(api.currentPublishJob).not.toHaveBeenCalled();
 
     clickButton('继续确认发布');
     await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(80));
@@ -324,6 +333,7 @@ describe('Draft publishing', () => {
     const failed = publishJob({
       id: 79,
       project_id: 1,
+      account_id: boundAccount.id,
       action: 'draft',
       status: 'failed',
       platform_draft_id: '',
@@ -331,9 +341,8 @@ describe('Draft publishing', () => {
       failure_reason: '平台暂时不可用',
     });
     api.drafts.mockResolvedValue({ drafts: [restoredDraft] });
-    api.currentPublishJob.mockImplementation((projectId, accountId, action) => Promise.resolve({
-      job: action === 'draft' ? failed : null,
-    }));
+    api.accounts.mockResolvedValue({ accounts: [authorizedAccount, boundAccount, ...unavailableAccounts] });
+    api.projectPublishJob.mockResolvedValue({ job: failed });
     api.retryPublishJob.mockResolvedValue(publishJob({ id: 79, project_id: 1 }));
 
     render(<Drafts />);
@@ -341,8 +350,9 @@ describe('Draft publishing', () => {
     await screen.findByText(restoredDraft.title);
     clickButton('发布');
     await screen.findByText('平台发布失败');
-    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'draft');
-    expect(api.currentPublishJob).toHaveBeenCalledWith(1, authorizedAccount.id, 'publish');
+    expect(api.projectPublishJob).toHaveBeenCalledWith(1);
+    expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0);
+    expect(api.currentPublishJob).not.toHaveBeenCalled();
 
     clickButton('重试');
     await waitFor(() => expect(api.retryPublishJob).toHaveBeenCalledWith(79));

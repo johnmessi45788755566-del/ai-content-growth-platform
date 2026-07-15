@@ -35,6 +35,14 @@ const account = {
 
 let intervalCallback: (() => Promise<void>) | null;
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
+}
+
 beforeAll(() => {
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
@@ -140,6 +148,71 @@ describe('Accounts authentication', () => {
     expect((await screen.findAllByText('登录超时，请重新发起登录')).length).toBeGreaterThan(0);
     expect(window.clearInterval).toHaveBeenCalled();
     expect(api.accounts).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a cancelled session response after a newer login session starts', async () => {
+    const staleStatus = deferred<{
+      session_id: string;
+      platform: string;
+      status: 'success';
+      message: string;
+      login_url: string;
+      account: { id: number; platform: string; name: string; auth_status: string };
+      error: string;
+    }>();
+    api.startAccountAuth
+      .mockResolvedValueOnce({
+        session_id: 'session-a',
+        platform: '微信公众号',
+        status: 'waiting',
+        message: '等待扫码登录',
+        login_url: 'https://mp.weixin.qq.com/',
+        account: null,
+        error: '',
+      })
+      .mockResolvedValueOnce({
+        session_id: 'session-b',
+        platform: '微信公众号',
+        status: 'waiting',
+        message: '等待扫码登录',
+        login_url: 'https://mp.weixin.qq.com/',
+        account: null,
+        error: '',
+      });
+    api.accountAuthStatus.mockImplementation(() => staleStatus.promise);
+
+    await startWechatLogin();
+    const pollA = intervalCallback;
+    let pollAPromise: Promise<void> | undefined;
+    act(() => { pollAPromise = pollA?.(); });
+    await waitFor(() => expect(api.accountAuthStatus).toHaveBeenCalledWith('session-a'));
+
+    const cancelButton = screen.getAllByRole('button').find(
+      (button) => button.textContent?.replace(/\s/g, '') === '取消',
+    );
+    expect(cancelButton).toBeDefined();
+    fireEvent.click(cancelButton as HTMLElement);
+    await waitFor(() => expect(api.cancelAccountAuth).toHaveBeenCalledWith('session-a'));
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(await screen.findByRole('button', { name: /微信公众号/ }));
+    await screen.findByText('等待微信公众号扫码登录');
+
+    staleStatus.resolve({
+      session_id: 'session-a',
+      platform: '微信公众号',
+      status: 'success',
+      message: 'A 登录成功',
+      login_url: 'https://mp.weixin.qq.com/cgi-bin/home',
+      account: { id: 8, platform: '微信公众号', name: 'A 账号', auth_status: '已授权' },
+      error: '',
+    });
+    await act(async () => { await pollAPromise; });
+
+    expect(screen.queryByText('已登录账号：A 账号')).toBeNull();
+    expect(screen.getByText('等待微信公众号扫码登录')).not.toBeNull();
+    expect(api.accounts).toHaveBeenCalledTimes(1);
+    expect(api.accountAuthStatus).not.toHaveBeenCalledWith('session-b');
   });
 
   it('shows the backend conflict when a referenced account cannot be deleted', async () => {

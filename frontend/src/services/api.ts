@@ -126,6 +126,10 @@ export const api = {
     });
     return request<{ job: PublishJob | null }>(`/api/publish-jobs/current?${params.toString()}`);
   },
+  projectPublishJob(projectId: number) {
+    const params = new URLSearchParams({ project_id: String(projectId) });
+    return request<{ job: PublishJob | null }>(`/api/publish-jobs/project?${params.toString()}`);
+  },
   retryPublishJob(id: number) {
     return request<PublishJob>(`/api/publish-jobs/${id}/retry`, { method: 'POST' });
   },
