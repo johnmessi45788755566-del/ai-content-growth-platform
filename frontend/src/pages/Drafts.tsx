@@ -56,12 +56,21 @@ export default function Drafts() {
   const publishDraftRef = useRef<Draft | null>(null);
   const publishAccountsProjectIdRef = useRef<number | null>(null);
   const publishRequestGenerationRef = useRef(0);
+  const publishAccountsRequestGenerationRef = useRef(0);
   const currentPublishJob = publishJob?.project_id === publishDraft?.project_id ? publishJob : null;
+  const currentPublishJobActive = Boolean(
+    currentPublishJob && !publishTerminalStatuses.includes(currentPublishJob.status),
+  );
 
   function invalidatePublishRequest() {
     publishRequestGenerationRef.current += 1;
     setPublishingAction('');
     setRefreshingPublishJob(false);
+  }
+
+  function invalidatePublishAccountsRequest() {
+    publishAccountsRequestGenerationRef.current += 1;
+    setPublishAccountsLoading(false);
   }
 
   function beginPublishRequest(targetProjectId: number) {
@@ -76,6 +85,18 @@ export default function Drafts() {
   function isPublishRequestCurrent(request: { projectId: number; generation: number }) {
     return publishDraftRef.current?.project_id === request.projectId
       && publishRequestGenerationRef.current === request.generation;
+  }
+
+  function beginPublishAccountsRequest(targetProjectId: number) {
+    const generation = publishAccountsRequestGenerationRef.current + 1;
+    publishAccountsRequestGenerationRef.current = generation;
+    setPublishAccountsLoading(true);
+    return { projectId: targetProjectId, generation };
+  }
+
+  function isPublishAccountsRequestCurrent(request: { projectId: number; generation: number }) {
+    return publishDraftRef.current?.project_id === request.projectId
+      && publishAccountsRequestGenerationRef.current === request.generation;
   }
 
   function acceptPublishJob(job: PublishJob, request: { projectId: number; generation: number }) {
@@ -141,64 +162,83 @@ export default function Drafts() {
 
   async function restorePublishJob(targetProjectId: number) {
     const request = beginPublishRequest(targetProjectId);
+    const accountsRequest = beginPublishAccountsRequest(targetProjectId);
+    const accountsPromise = loadPublishAccounts().then(
+      (accounts) => ({ ok: true as const, accounts }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    let existing: PublishJob | null | undefined;
+    let pollingPromise: Promise<void> = Promise.resolve();
     try {
       const resource = await api.projectPublishJob(targetProjectId);
       if (!isPublishRequestCurrent(request)) return;
-      setPublishAccountsLoading(true);
-      const accounts = await loadPublishAccounts();
-      if (!isPublishRequestCurrent(request)) return;
-      commitPublishAccounts(
-        targetProjectId,
-        accounts,
-        resource.job?.account_id,
-        resource.job === null,
-      );
-      setPublishAccountsLoading(false);
-      const existing = resource.job;
+      existing = resource.job;
       if (!existing) {
         setPublishJob(null);
-        return;
+      } else if (acceptPublishJob(existing, request)) {
+        pollingPromise = waitForPublishJob(
+          existing,
+          () => isPublishRequestCurrent(request),
+          (job) => acceptPublishJob(job, request),
+        ).then(() => undefined).catch((error) => {
+          if (!isPublishRequestCurrent(request)) return;
+          const text = error instanceof Error ? error.message : '恢复发布状态失败';
+          setPublishPollingError(text);
+          message.error(text);
+        });
       }
-      if (!acceptPublishJob(existing, request)) return;
-      await waitForPublishJob(
-        existing,
-        () => isPublishRequestCurrent(request),
-        (job) => acceptPublishJob(job, request),
-      );
     } catch (error) {
       if (!isPublishRequestCurrent(request)) return;
       const text = error instanceof Error ? error.message : '恢复发布状态失败';
       setPublishPollingError(text);
       message.error(text);
-    } finally {
-      if (isPublishRequestCurrent(request)) setPublishAccountsLoading(false);
     }
+
+    const accountsResult = await accountsPromise;
+    if (isPublishAccountsRequestCurrent(accountsRequest)) {
+      if (accountsResult.ok) {
+        commitPublishAccounts(
+          targetProjectId,
+          accountsResult.accounts,
+          existing?.account_id,
+          existing === null,
+        );
+      } else {
+        message.error(accountsResult.error instanceof Error ? accountsResult.error.message : '加载授权账号失败');
+      }
+      setPublishAccountsLoading(false);
+    }
+    await pollingPromise;
   }
 
   async function refreshPublishAccounts() {
     const targetProjectId = publishDraftRef.current?.project_id;
     if (!targetProjectId) return;
-    const request = beginPublishRequest(targetProjectId);
-    setPublishAccountsLoading(true);
+    const request = beginPublishAccountsRequest(targetProjectId);
     try {
       const accounts = await loadPublishAccounts();
-      if (!isPublishRequestCurrent(request)) return;
-      commitPublishAccounts(targetProjectId, accounts);
+      if (!isPublishAccountsRequestCurrent(request)) return;
+      commitPublishAccounts(
+        targetProjectId,
+        accounts,
+        currentPublishJob?.account_id,
+        !currentPublishJob,
+      );
     } catch (error) {
-      if (!isPublishRequestCurrent(request)) return;
+      if (!isPublishAccountsRequestCurrent(request)) return;
       message.error(error instanceof Error ? error.message : '加载授权账号失败');
     } finally {
-      if (isPublishRequestCurrent(request)) setPublishAccountsLoading(false);
+      if (isPublishAccountsRequestCurrent(request)) setPublishAccountsLoading(false);
     }
   }
 
   async function openPublishModal(draft: Draft) {
     invalidatePublishRequest();
+    invalidatePublishAccountsRequest();
     publishDraftRef.current = draft;
     publishAccountsProjectIdRef.current = null;
     setPublishDraft(draft);
     setPublishAccounts([]);
-    setPublishAccountsLoading(false);
     setPublishJob(null);
     setPublishPollingError('');
     publishForm.resetFields();
@@ -207,11 +247,11 @@ export default function Drafts() {
 
   function closePublishModal() {
     invalidatePublishRequest();
+    invalidatePublishAccountsRequest();
     publishDraftRef.current = null;
     publishAccountsProjectIdRef.current = null;
     setPublishDraft(null);
     setPublishAccounts([]);
-    setPublishAccountsLoading(false);
     setPublishJob(null);
     setPublishPollingError('');
     publishForm.resetFields();
@@ -398,9 +438,9 @@ export default function Drafts() {
                   {currentPublishJob.status === 'published' && <span>平台发布 ID：{currentPublishJob.platform_publish_id || '-'}</span>}
                   {currentPublishJob.platform_url && <a href={currentPublishJob.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
                   {currentPublishJob.status === 'awaiting_confirmation' && <span>请由运营人员使用微信扫描平台弹出的确认二维码，完成后点击继续确认发布。</span>}
-                  {currentPublishJob.status === 'awaiting_confirmation' && <Button type="primary" loading={publishingAction === 'publish'} onClick={resumePublishJob}>继续确认发布</Button>}
+                  {currentPublishJob.status === 'awaiting_confirmation' && <Button type="primary" loading={publishingAction === 'publish'} disabled={publishAccountsLoading} onClick={resumePublishJob}>继续确认发布</Button>}
                   {currentPublishJob.status === 'failed' && <span>失败阶段：{currentPublishJob.failure_stage || '-'}<br />失败原因：{currentPublishJob.failure_reason || '-'}</span>}
-                  {currentPublishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} onClick={retryPublishJob}>重试</Button>}
+                  {currentPublishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} disabled={publishAccountsLoading} onClick={retryPublishJob}>重试</Button>}
                 </Space>
               )}
             />
@@ -414,7 +454,7 @@ export default function Drafts() {
               description={(
                 <Space direction="vertical" size={4}>
                   <span>{publishPollingError}</span>
-                  <Button loading={refreshingPublishJob} onClick={refreshPublishJob}>刷新发布状态</Button>
+                  <Button loading={refreshingPublishJob} disabled={publishAccountsLoading} onClick={refreshPublishJob}>刷新发布状态</Button>
                 </Space>
               )}
             />
@@ -422,7 +462,7 @@ export default function Drafts() {
           <Space wrap>
             <Button
               loading={publishingAction === 'draft'}
-              disabled={!publishAccounts.length || Boolean(publishingAction) || Boolean(currentPublishJob && !['platform_draft', 'published'].includes(currentPublishJob.status))}
+              disabled={!publishAccounts.length || publishAccountsLoading || Boolean(publishingAction) || Boolean(currentPublishJob && !['platform_draft', 'published'].includes(currentPublishJob.status))}
               onClick={() => runPublishAction('draft')}
             >
               同步到平台草稿箱
@@ -430,12 +470,18 @@ export default function Drafts() {
             <Button
               type="primary"
               loading={publishingAction === 'publish'}
-              disabled={!publishAccounts.length || Boolean(publishingAction) || Boolean(currentPublishJob && !['platform_draft', 'published'].includes(currentPublishJob.status))}
+              disabled={!publishAccounts.length || publishAccountsLoading || Boolean(publishingAction) || Boolean(currentPublishJob && !['platform_draft', 'published'].includes(currentPublishJob.status))}
               onClick={() => runPublishAction('publish')}
             >
               一键发布
             </Button>
-            <Button disabled={Boolean(currentPublishJob)} loading={publishAccountsLoading} onClick={refreshPublishAccounts}>刷新账号</Button>
+            <Button
+              disabled={publishAccountsLoading || Boolean(publishingAction) || refreshingPublishJob || currentPublishJobActive}
+              loading={publishAccountsLoading}
+              onClick={refreshPublishAccounts}
+            >
+              刷新账号
+            </Button>
             <Button onClick={closePublishModal}>取消</Button>
           </Space>
         </Form>

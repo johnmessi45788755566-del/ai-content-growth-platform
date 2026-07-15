@@ -1004,6 +1004,69 @@ def test_create_publish_job_and_refresh_current_resource_are_idempotent(tmp_path
     assert "profile_path" not in refreshed.text
 
 
+def test_concurrent_publish_posts_load_before_claim_and_publish_once(tmp_path: Path):
+    class LoadMarkerPublisher(FakePlatformPublisher):
+        def __init__(self):
+            super().__init__()
+            self.load_markers = []
+
+        def publish(self, payload, account, action):
+            self.load_markers.append(payload["load_marker"])
+            return super().publish(payload, account, action)
+
+    publisher = LoadMarkerPublisher()
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+    service = client.app.state.content_service
+    pending = service.prepare_publish_job(project["id"], account_id, "draft")
+    original_builder = service.publish_coordinator.payload_builder
+    first_load_started = threading.Event()
+    release_first_load = threading.Event()
+    load_calls = 0
+    load_lock = threading.Lock()
+
+    def controlled_builder(project_row, account_name):
+        nonlocal load_calls
+        with load_lock:
+            load_calls += 1
+            call_number = load_calls
+        payload = dict(original_builder(project_row, account_name))
+        payload["load_marker"] = call_number
+        if call_number == 1:
+            first_load_started.set()
+            assert release_first_load.wait(timeout=5)
+        return payload
+
+    service.publish_coordinator.payload_builder = controlled_builder
+    request_payload = {
+        "project_id": project["id"],
+        "account_id": account_id,
+        "action": "draft",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slow_post = executor.submit(
+            client.post, "/api/publish-jobs", json=request_payload
+        )
+        assert first_load_started.wait(timeout=5)
+        fast_post = executor.submit(
+            client.post, "/api/publish-jobs", json=request_payload
+        )
+        try:
+            fast_response = fast_post.result(timeout=5)
+        finally:
+            release_first_load.set()
+        responses = [slow_post.result(timeout=5), fast_response]
+
+    assert fast_response.json()["status"] == "platform_draft"
+    assert [response.status_code for response in responses] == [200, 200]
+    assert {response.json()["id"] for response in responses} == {pending["id"]}
+    assert {response.json()["status"] for response in responses} == {
+        "platform_draft"
+    }
+    assert publisher.load_markers == [2]
+    assert len(publisher.calls) == 1
+
+
 def test_current_publish_job_returns_null_for_an_action_not_started(tmp_path: Path):
     client, project, account_id = prepare_publish_job_api(
         tmp_path, FakePlatformPublisher()

@@ -251,6 +251,97 @@ def test_concurrent_create_publish_job_is_idempotent_and_calls_publisher_once(tm
     )["count"] == 1
 
 
+def test_failed_pending_input_load_cannot_overwrite_concurrent_execution(tmp_path):
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "输入加载失败竞态")
+    pending = service.prepare_publish_job(project["id"], account_id, "draft")
+    original_loader = service.publish_coordinator.account_loader
+    first_load_started = threading.Event()
+    release_first_load = threading.Event()
+    load_calls = 0
+    load_lock = threading.Lock()
+
+    def fail_first_loader(requested_account_id):
+        nonlocal load_calls
+        with load_lock:
+            load_calls += 1
+            call_number = load_calls
+        if call_number == 1:
+            first_load_started.set()
+            assert release_first_load.wait(timeout=5)
+            raise RuntimeError("首个加载者读取到损坏输入")
+        return original_loader(requested_account_id)
+
+    publisher = CountingPublisher()
+    service.publish_coordinator.account_loader = fail_first_loader
+    service.publish_coordinator.publisher = publisher
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        slow_failure = executor.submit(
+            service.execute_publish_job, pending["id"]
+        )
+        assert first_load_started.wait(timeout=5)
+        concurrent_execution = executor.submit(
+            service.execute_publish_job, pending["id"]
+        )
+        try:
+            concurrent_result = concurrent_execution.result(timeout=5)
+        finally:
+            release_first_load.set()
+        results = [slow_failure.result(timeout=5), concurrent_result]
+
+    assert concurrent_result["status"] == "platform_draft"
+    assert publisher.calls == 1
+    assert {result["status"] for result in results} == {"platform_draft"}
+    assert service.get_publish_job(pending["id"])["status"] == "platform_draft"
+
+
+def test_lost_attempt_is_checked_before_calling_publisher(tmp_path):
+    class CountingPublisher(FakePlatformPublisher):
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, payload, account, action):
+            self.calls += 1
+            return super().publish(payload, account, action)
+
+    service = make_service(tmp_path)
+    project, account_id = prepare_publish_project(service, "调用平台前所有权检查")
+    pending = service.prepare_publish_job(project["id"], account_id, "draft")
+    publisher = CountingPublisher()
+    service.publish_coordinator.publisher = publisher
+    original_claim = service.publish_coordinator._claim_execution
+
+    def claim_then_lose_attempt(*args, **kwargs):
+        attempt_token = original_claim(*args, **kwargs)
+        if attempt_token is not None:
+            service.db.execute(
+                "UPDATE publish_jobs SET updated_at = '2026-07-15 01:00:00' WHERE id = ?",
+                (pending["id"],),
+            )
+            lost = service.publish_coordinator.fail_stale_in_progress_job(
+                pending["id"], "2026-07-15 01:15:00"
+            )
+            assert lost["status"] == "failed"
+        return attempt_token
+
+    service.publish_coordinator._claim_execution = claim_then_lose_attempt
+
+    result = service.execute_publish_job(pending["id"])
+
+    assert result["status"] == "failed"
+    assert result["failure_stage"] == "发布中断"
+    assert publisher.calls == 0
+
+
 def test_create_publish_job_executes_existing_pending_job_once(tmp_path):
     class CountingPublisher(FakePlatformPublisher):
         def __init__(self):

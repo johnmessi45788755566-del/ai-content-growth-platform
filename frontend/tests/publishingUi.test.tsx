@@ -218,6 +218,40 @@ describe('Creator publishing', () => {
     await screen.findByText('平台发布已完成');
   });
 
+  it('keeps an existing job when account restore fails and refreshes accounts independently', async () => {
+    const restoredProject = project(1, '账号失败恢复项目');
+    const waiting = publishJob({
+      id: 85,
+      project_id: 1,
+      account_id: boundAccount.id,
+      action: 'publish',
+      status: 'awaiting_confirmation',
+      platform_draft_id: '',
+      requires_confirmation: true,
+    });
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(restoredProject);
+    api.saveLayout.mockResolvedValue({ project: restoredProject, layout_blocks: [] });
+    api.projectPublishJob.mockResolvedValue({ job: waiting });
+    api.accounts
+      .mockRejectedValueOnce(new Error('账号恢复失败'))
+      .mockResolvedValueOnce({ accounts: [authorizedAccount, boundAccount] });
+
+    render(<Creator />);
+
+    await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
+    clickButton('发布');
+    await screen.findByText('等待运营人员确认');
+    expect(document.body.textContent).toContain('发布任务 ID：85');
+    expect(screen.queryByText('发布状态刷新失败')).toBeNull();
+
+    clickButton('刷新账号');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0));
+    expect(document.body.textContent).toContain('发布任务 ID：85');
+    expect(screen.queryByText('继续确认发布')).not.toBeNull();
+  });
+
   it('maps the two publish buttons to draft and publish for an authorized WeChat account only', async () => {
     const firstProject = project(1, '项目一');
     window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
@@ -253,6 +287,42 @@ describe('Creator publishing', () => {
       action: 'publish',
     }));
     await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-82'));
+  });
+
+  it('does not let account refresh cancel a deferred publish response', async () => {
+    const restoredProject = project(1, '发布刷新竞态项目');
+    const pendingPublish = deferred<PublishJob>();
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(restoredProject);
+    api.saveLayout.mockResolvedValue({ project: restoredProject, layout_blocks: [] });
+    api.createPublishJob.mockImplementation(() => pendingPublish.promise);
+
+    render(<Creator />);
+
+    await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
+    clickButton('发布');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(1));
+    clickButton('一键发布');
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledTimes(1));
+
+    const refreshAccounts = buttonsWithText('刷新账号')[0];
+    expect(refreshAccounts.disabled).toBe(true);
+    fireEvent.click(refreshAccounts);
+    expect(api.accounts).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingPublish.resolve(publishJob({
+        id: 86,
+        project_id: 1,
+        action: 'publish',
+        status: 'published',
+        platform_draft_id: '',
+        platform_publish_id: 'publish-86',
+      }));
+      await pendingPublish.promise;
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-86'));
   });
 
   it('ignores a deferred publish response after the active project changes', async () => {
@@ -415,6 +485,38 @@ describe('Draft publishing', () => {
     await screen.findByText('平台草稿已创建');
   });
 
+  it('keeps an existing job when account restore fails and refreshes accounts independently', async () => {
+    const restoredDraft = { id: 11, project_id: 1, title: '账号失败恢复草稿', stage: '排版已完成，待发布', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-15 09:00' };
+    const waiting = publishJob({
+      id: 87,
+      project_id: 1,
+      account_id: boundAccount.id,
+      action: 'publish',
+      status: 'awaiting_confirmation',
+      platform_draft_id: '',
+      requires_confirmation: true,
+    });
+    api.drafts.mockResolvedValue({ drafts: [restoredDraft] });
+    api.projectPublishJob.mockResolvedValue({ job: waiting });
+    api.accounts
+      .mockRejectedValueOnce(new Error('草稿账号恢复失败'))
+      .mockResolvedValueOnce({ accounts: [authorizedAccount, boundAccount] });
+
+    render(<Drafts />);
+
+    await screen.findByText(restoredDraft.title);
+    clickButton('发布');
+    await screen.findByText('等待运营人员确认');
+    expect(document.body.textContent).toContain('发布任务 ID：87');
+    expect(screen.queryByText('发布状态刷新失败')).toBeNull();
+
+    clickButton('刷新账号');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0));
+    expect(document.body.textContent).toContain('发布任务 ID：87');
+    expect(screen.queryByText('继续确认发布')).not.toBeNull();
+  });
+
   it('only offers publishing after layout and supports failed retry through confirmation resume', async () => {
     api.drafts.mockResolvedValue({
       drafts: [
@@ -447,6 +549,43 @@ describe('Draft publishing', () => {
     clickButton('继续确认发布');
     await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(81));
     await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-88'));
+  });
+
+  it('does not let account refresh cancel a deferred publish response', async () => {
+    const pendingPublish = deferred<PublishJob>();
+    api.drafts.mockResolvedValue({
+      drafts: [
+        { id: 2, project_id: 2, title: '发布刷新竞态草稿', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
+      ],
+    });
+    api.createPublishJob.mockImplementation(() => pendingPublish.promise);
+
+    render(<Drafts />);
+
+    await screen.findByText('发布刷新竞态草稿');
+    clickButton('发布');
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(1));
+    clickButton('一键发布');
+    await waitFor(() => expect(api.createPublishJob).toHaveBeenCalledTimes(1));
+
+    const refreshAccounts = buttonsWithText('刷新账号')[0];
+    expect(refreshAccounts.disabled).toBe(true);
+    fireEvent.click(refreshAccounts);
+    expect(api.accounts).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingPublish.resolve(publishJob({
+        id: 88,
+        project_id: 2,
+        action: 'publish',
+        status: 'published',
+        platform_draft_id: '',
+        platform_publish_id: 'publish-88-refresh',
+      }));
+      await pendingPublish.promise;
+    });
+
+    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-88-refresh'));
   });
 
   it('keeps publish state scoped to the selected draft when responses finish out of order', async () => {

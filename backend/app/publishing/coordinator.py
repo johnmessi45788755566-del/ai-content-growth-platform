@@ -188,17 +188,20 @@ class PublishCoordinator:
 
     def execute_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
-        attempt_token = self._claim_execution(job, "pending")
-        if attempt_token is None:
-            return self.get_publish_job(job_id)
         try:
             _, account, payload = self._load_inputs(
                 int(job["project_id"]), int(job["account_id"]), str(job["action"])
             )
         except Exception as exc:
-            self._persist_failure(job_id, "加载发布输入", exc, attempt_token)
+            self._persist_pending_input_failure(job, exc)
             return self.get_publish_job(job_id)
-        return self._execute_claimed(job, account, payload, attempt_token)
+        return self._execute(
+            job_id,
+            account,
+            payload,
+            expected_status="pending",
+            observed_job=job,
+        )
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         return self._public_job(self._get_row(job_id))
@@ -336,6 +339,10 @@ class PublishCoordinator:
             return self.get_publish_job(job_id)
         try:
             context = self._job_context(job)
+            if not self._owns_attempt(
+                job_id, attempt_token, UNCERTAIN_IN_PROGRESS_STATUSES
+            ):
+                return self.get_publish_job(job_id)
             result = self.publisher.resume(account, context)
             self._persist_result(job_id, str(job["action"]), result, attempt_token)
         except Exception as exc:
@@ -372,6 +379,10 @@ class PublishCoordinator:
                 self.publisher, "publish_with_progress", None
             )
             if callable(publish_with_progress):
+                if not self._owns_attempt(
+                    job_id, attempt_token, UNCERTAIN_IN_PROGRESS_STATUSES
+                ):
+                    return self.get_publish_job(job_id)
                 result = publish_with_progress(
                     payload,
                     account,
@@ -381,6 +392,10 @@ class PublishCoordinator:
                     ),
                 )
             else:
+                if not self._owns_attempt(
+                    job_id, attempt_token, UNCERTAIN_IN_PROGRESS_STATUSES
+                ):
+                    return self.get_publish_job(job_id)
                 result = self.publisher.publish(payload, account, str(job["action"]))
             self._persist_result(job_id, str(job["action"]), result, attempt_token)
         except Exception as exc:
@@ -466,6 +481,18 @@ class PublishCoordinator:
             conn.commit()
             return attempt_token if cursor.rowcount == 1 else None
 
+    def _owns_attempt(
+        self, job_id: int, attempt_token: str, statuses: tuple[str, ...] | set[str]
+    ) -> bool:
+        job = self.db.fetch_one(
+            "SELECT status, response_json FROM publish_jobs WHERE id = ?", (job_id,)
+        )
+        return bool(
+            job
+            and job["status"] in statuses
+            and self._attempt_token(job) == attempt_token
+        )
+
     def _persist_result(
         self, job_id: int, action: str, result: PublishResult, attempt_token: str
     ) -> None:
@@ -513,7 +540,11 @@ class PublishCoordinator:
                 ),
             )
             conn.commit()
-        if cursor.rowcount == 1 and result.status == "awaiting_confirmation":
+        if (
+            cursor.rowcount == 1
+            and result.status == "awaiting_confirmation"
+            and self._owns_attempt(job_id, attempt_token, {"awaiting_confirmation"})
+        ):
             self._bind_confirmation_expiry(
                 job_id, self._require_job_context(response), attempt_token
             )
@@ -562,6 +593,31 @@ class PublishCoordinator:
                     reason,
                     job_id,
                     *UNCERTAIN_IN_PROGRESS_STATUSES,
+                    response_json,
+                ),
+            )
+            conn.commit()
+
+    def _persist_pending_input_failure(
+        self, observed_job: Mapping[str, Any], exc: Exception
+    ) -> None:
+        reason = str(exc).strip() or exc.__class__.__name__
+        reason = self._redact_sensitive_text(observed_job, reason)
+        response_json = str(observed_job.get("response_json") or "{}")
+        with self.db.connect() as conn:
+            conn.execute(
+                """
+                UPDATE publish_jobs
+                SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
+                    platform_url = '', response_json = ?, requires_confirmation = 0,
+                    failure_stage = '加载发布输入', failure_reason = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'pending' AND response_json = ?
+                """,
+                (
+                    response_json,
+                    reason,
+                    int(observed_job["id"]),
                     response_json,
                 ),
             )
