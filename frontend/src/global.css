@@ -488,6 +488,64 @@ h3 {
   margin-top: 14px;
 }
 
+.markdown-layout-editor {
+  display: grid;
+  gap: 12px;
+}
+
+.markdown-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--panel-soft);
+}
+
+.toolbar-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-right: 8px;
+  border-right: 1px solid var(--line);
+}
+
+.toolbar-group:last-child {
+  border-right: 0;
+  padding-right: 0;
+}
+
+.markdown-toolbar .ant-btn {
+  min-width: 42px;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-weight: 700;
+}
+
+.markdown-image-picker {
+  width: 100%;
+}
+
+.markdown-textarea {
+  width: 100%;
+  min-height: 620px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: #fff;
+  color: var(--text);
+  font: 16px/1.8 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  resize: vertical;
+  outline: none;
+}
+
+.markdown-textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(47, 91, 255, 0.12);
+}
+
 .article-segment textarea,
 .layout-block textarea {
   min-height: 118px;
@@ -537,10 +595,34 @@ h3 {
   font-weight: 700;
 }
 
+.image-delete-icon {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.94);
+  color: var(--muted);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.image-delete-icon:hover {
+  color: #ef4444;
+  background: #fff;
+}
+
 .check-mark {
   position: absolute;
   top: 10px;
-  right: 10px;
+  left: 10px;
   display: grid;
   place-items: center;
   width: 34px;
@@ -587,11 +669,33 @@ h3 {
   color: var(--muted);
 }
 
+.selected-image-row span {
+  flex: 1;
+}
+
 .selected-image-row img {
   width: 74px;
   height: 42px;
   border-radius: 6px;
   object-fit: contain;
+}
+
+.selected-image-remove {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.selected-image-remove:hover {
+  color: #ef4444;
+  background: #fff1f2;
 }
 
 .paragraph-image-picker {
@@ -618,6 +722,17 @@ h3 {
   font-size: 22px;
 }
 
+.wechat-preview h1 {
+  margin: 18px 0 14px;
+  font-size: 24px;
+  line-height: 1.45;
+}
+
+.wechat-preview h3 {
+  margin: 18px 0 10px;
+  font-size: 18px;
+}
+
 .wechat-preview blockquote {
   margin: 0 0 16px;
   padding-left: 14px;
@@ -639,6 +754,64 @@ h3 {
 
 .preview-inline-img {
   margin: 16px 0;
+}
+
+.markdown-preview-row {
+  margin-bottom: 14px;
+}
+
+.markdown-image-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  margin: 14px 0 18px;
+}
+
+.markdown-image-grid.image-count-1 {
+  grid-template-columns: 1fr;
+}
+
+.markdown-image-grid.image-count-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.markdown-image-grid.image-count-3 {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.markdown-image-grid .ant-image {
+  width: 100%;
+}
+
+.markdown-image-grid .preview-cover-img,
+.markdown-image-grid .preview-inline-img {
+  height: auto;
+  margin: 0;
+}
+
+.markdown-preview-row p {
+  margin: 0 0 12px;
+}
+
+.markdown-preview-row hr {
+  height: 1px;
+  margin: 18px 0;
+  border: 0;
+  background: var(--line);
+}
+
+.markdown-list-item::before {
+  content: "•";
+  margin-right: 8px;
+  color: var(--blue);
+}
+
+.markdown-table-line {
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
 }
 
 .bar-row {

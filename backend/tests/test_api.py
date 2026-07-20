@@ -3960,6 +3960,314 @@ def test_retry_recovers_terminal_job_retained_only_in_history(
     assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
 
 
+def test_retry_legacy_publish_failure_creates_real_publish_job(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "legacy-publish-failure.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "旧失败公众号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "旧失败公众号",
+            "execute_time": "2026-07-15 14:24",
+            "task_type": "微信公众号图文生成",
+            "topic": "旧发布包必须转入真实发布链路",
+            "publish_action": "draft",
+        }
+    )
+    project = service.create_project("旧失败包标题", platform="微信公众号")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": article["blocks"][0]["type"],
+                "content": article["blocks"][0]["content"],
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+    package_id = service.db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status,
+          failure_stage, failure_reason, updated_at
+        ) VALUES (?, ?, '微信公众号', '旧失败公众号', '{}', 'failed', ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (
+            project["id"],
+            account_id,
+            "提交平台草稿",
+            "旧版发布路径失败",
+        ),
+    )
+    service.db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET status = '失败', failure_stage = '提交平台草稿',
+            failure_reason = '旧版发布路径失败',
+            content_project_id = ?, publish_package_id = ?
+        WHERE id = ?
+        """,
+        (project["id"], package_id, task["id"]),
+    )
+
+    retried = service.retry_failed_tasks([task["id"]])
+    detail = service.get_task(task["id"])
+
+    assert retried == {"updated": 1}
+    assert detail["status"] == "已生成平台草稿"
+    assert detail["publish_job"]["status"] == "platform_draft"
+    assert detail["publish_package"]["publish_job_id"] == detail["publish_job_id"]
+    assert detail["publish_package"]["status"] == "platform_draft"
+    assert service.db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 1
+    assert len(publisher.calls) == 1
+    assert publisher.calls[0][2] == "draft"
+
+
+def test_api_sync_failed_task_to_platform_draft_without_existing_job(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "sync-legacy-failed-task.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "失败后补草稿账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "失败后补草稿账号",
+            "execute_time": "2026-07-15 14:24",
+            "task_type": "微信公众号图文生成",
+            "topic": "失败后补同步平台草稿",
+            "publish_action": "publish",
+        }
+    )
+    project = service.create_project("失败后补草稿标题", platform="微信公众号")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": article["blocks"][0]["type"],
+                "content": article["blocks"][0]["content"],
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+    package_id = service.db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status,
+          failure_stage, failure_reason, updated_at
+        ) VALUES (?, ?, '微信公众号', '失败后补草稿账号', '{}', 'failed', ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (project["id"], account_id, "发布文章", "直发失败"),
+    )
+    service.db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET status = '失败', failure_stage = '发布文章', failure_reason = '直发失败',
+            content_project_id = ?, publish_package_id = ?
+        WHERE id = ?
+        """,
+        (project["id"], package_id, task["id"]),
+    )
+
+    response = client.post(f"/api/tasks/{task['id']}/sync-draft")
+    detail = response.json()
+
+    assert response.status_code == 200
+    assert detail["status"] == "已生成平台草稿"
+    assert detail["publish_action"] == "draft"
+    assert detail["publish_job"]["action"] == "draft"
+    assert detail["publish_package"]["publish_job_id"] == detail["publish_job_id"]
+    assert detail["publish_package"]["status"] == "platform_draft"
+    assert len(publisher.calls) == 1
+    assert publisher.calls[0][2] == "draft"
+
+
+def test_api_sync_failed_task_to_platform_draft_returns_error_when_platform_fails(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "sync-legacy-failed-task-platform-fails.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=FailingPlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    service = app.state.content_service
+    account_id = add_authorized_account(service, "补同步失败账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "补同步失败账号",
+            "execute_time": "2026-07-15 16:05",
+            "task_type": "微信公众号图文生成",
+            "topic": "补同步失败要返回错误",
+            "publish_action": "publish",
+        }
+    )
+    project = service.create_project("补同步失败标题", platform="微信公众号")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": article["blocks"][0]["type"],
+                "content": article["blocks"][0]["content"],
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+    package_id = service.db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status,
+          failure_stage, failure_reason, updated_at
+        ) VALUES (?, ?, '微信公众号', '补同步失败账号', '{}', 'failed', ?, ?, CURRENT_TIMESTAMP)
+        """,
+        (project["id"], account_id, "发布文章", "旧发布失败"),
+    )
+    service.db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET status = '失败', failure_stage = '发布文章', failure_reason = '旧发布失败',
+            content_project_id = ?, publish_package_id = ?
+        WHERE id = ?
+        """,
+        (project["id"], package_id, task["id"]),
+    )
+
+    response = client.post(f"/api/tasks/{task['id']}/sync-draft")
+    detail = service.get_task(task["id"])
+
+    assert response.status_code == 400
+    assert "微信接口错误" in response.json()["detail"]
+    assert detail["status"] == "失败"
+    assert detail["publish_job"]["status"] == "failed"
+    assert detail["publish_package"]["status"] == "failed"
+
+
+def test_sync_failed_task_to_platform_draft_does_not_reuse_dirty_or_wrong_account_package(tmp_path: Path):
+    publisher = FakePlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "sync-legacy-failed-task-dirty-package.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    task_account_id = add_authorized_account(service, "当前任务账号")
+    old_account_id = add_authorized_account(service, "旧发布包账号")
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": task_account_id,
+            "account_name": "当前任务账号",
+            "execute_time": "2026-07-15 16:05",
+            "task_type": "微信公众号图文生成",
+            "topic": "旧发布包不能被污染",
+            "publish_action": "publish",
+        }
+    )
+    project = service.create_project("旧发布包不能复用标题", platform="微信公众号")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": article["blocks"][0]["type"],
+                "content": article["blocks"][0]["content"],
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+    dirty_package_id = service.db.execute(
+        """
+        INSERT INTO publish_packages (
+          project_id, account_id, platform, account_name, payload_json, status,
+          platform_draft_id, platform_draft_url, platform_response_json,
+          failure_stage, failure_reason, updated_at
+        ) VALUES (?, ?, '微信公众号', '旧发布包账号', '{}', 'platform_draft',
+          'old-draft-id', 'https://mp.weixin.qq.com/draft/old-draft-id',
+          '{"event":"draft_created"}', '', '', CURRENT_TIMESTAMP)
+        """,
+        (project["id"], old_account_id),
+    )
+    service.db.execute(
+        """
+        UPDATE scheduled_tasks
+        SET status = '失败', failure_stage = '发布文章', failure_reason = '旧发布失败',
+            content_project_id = ?, publish_package_id = ?
+        WHERE id = ?
+        """,
+        (project["id"], dirty_package_id, task["id"]),
+    )
+
+    detail = service.sync_failed_task_to_platform_draft(task["id"])
+    old_package = service.db.fetch_one(
+        "SELECT * FROM publish_packages WHERE id = ?", (dirty_package_id,)
+    )
+
+    assert detail["status"] == "已生成平台草稿"
+    assert detail["publish_package_id"] != dirty_package_id
+    assert old_package["account_id"] == old_account_id
+    assert old_package["status"] == "platform_draft"
+    assert old_package["platform_draft_id"] == "old-draft-id"
+    assert detail["publish_package"]["account_id"] == task_account_id
+
+
 @pytest.mark.parametrize("source", ["run", "package"])
 def test_scan_recovers_terminal_job_retained_only_in_history(
     tmp_path: Path, source: str
@@ -4163,10 +4471,15 @@ def test_stale_generation_claim_does_not_backfill_old_publish_job(tmp_path: Path
     assert len(publisher.calls) == 1
 
 
-def test_task_image_failure_keeps_generated_draft_and_reports_exact_stage(tmp_path: Path):
+def test_task_image_failure_uses_placeholder_images_and_continues_scheduled_publish(tmp_path: Path):
     db = Database(tmp_path / "content.db")
     db.init_schema()
-    service = ContentService(db=db, ai_client=FailingImageAIClient(), upload_dir=tmp_path / "uploads")
+    service = ContentService(
+        db=db,
+        ai_client=FailingImageAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
     add_authorized_account(service, "AI记账助手")
     task = service.create_task(
         {
@@ -4175,17 +4488,24 @@ def test_task_image_failure_keeps_generated_draft_and_reports_exact_stage(tmp_pa
             "execute_time": "2026-07-11 09:30",
             "task_type": "微信公众号图文生成",
             "topic": "AI记账",
+            "publish_action": "draft",
         }
     )
 
     result = service.execute_task(task["id"], datetime(2026, 7, 11, 9, 31))
 
-    assert result["status"] == "失败"
-    assert result["failure_stage"] == "生成图片"
+    assert result["status"] == "已生成平台草稿"
+    assert result["failure_stage"] == ""
     assert result["content_project_id"]
-    assert result["content_project"]["current_stage"] == "article"
+    assert result["content_project"]["current_stage"] == "publish"
+    assets = db.fetch_all(
+        "SELECT asset_type, prompt FROM media_assets WHERE project_id = ? ORDER BY id",
+        (result["content_project_id"],),
+    )
+    assert [asset["asset_type"] for asset in assets] == ["cover", "inline"]
+    assert all("本地兜底图" in asset["prompt"] for asset in assets)
     draft = db.fetch_one("SELECT restore_stage FROM draft_snapshots WHERE project_id = ?", (result["content_project_id"],))
-    assert draft and draft["restore_stage"] == "images"
+    assert draft and draft["restore_stage"] == "layout"
 
 
 def make_task_service(tmp_path: Path) -> ContentService:

@@ -125,6 +125,283 @@ def test_content_creation_flow_persists_article_images_draft_and_publish_package
     assert package["platform"] == "微信公众号"
 
 
+def test_delete_media_asset_removes_file_selection_and_layout_reference(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("删除图片测试")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    inline = next(asset for asset in images if asset["asset_type"] == "inline")
+    cover_file = tmp_path / cover["local_path"]
+    inline_file = tmp_path / inline["local_path"]
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": "body",
+                "content": article["blocks"][1]["content"],
+                "media_asset_id": inline["id"],
+                "sort_order": 2,
+            },
+        ],
+    )
+
+    result = service.delete_media_asset(project["id"], cover["id"])
+    assert result["deleted"] is True
+    assert not cover_file.exists()
+    assert inline_file.exists()
+    assert all(asset["id"] != cover["id"] for asset in result["assets"])
+    assert service.db.fetch_one(
+        "SELECT COUNT(*) AS count FROM layout_blocks WHERE media_asset_id = ?",
+        (cover["id"],),
+    )["count"] == 0
+
+
+def test_wechat_publish_payload_allows_text_only_after_deleting_cover(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("纯文字发布测试")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.delete_media_asset(project["id"], cover["id"])
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": None,
+                "sort_order": 1,
+            },
+            {
+                "section_type": "intro",
+                "content": article["blocks"][0]["content"],
+                "media_asset_id": None,
+                "sort_order": 2,
+            },
+        ],
+    )
+
+    payload = service._build_wechat_publish_payload(
+        service.get_project(project["id"]),
+        "纯文字公众号",
+    )
+    assert payload["cover_path"] == ""
+    assert payload["cover_candidate_path"] == ""
+    assert payload["blocks"][0]["image_path"] == ""
+
+
+def test_wechat_publish_payload_moves_old_intro_image_to_first_body(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("旧排版图片错位")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    inline = next(asset for asset in images if asset["asset_type"] == "inline")
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "title",
+                "content": project["title"],
+                "media_asset_id": cover["id"],
+                "sort_order": 1,
+            },
+            {
+                "section_type": "intro",
+                "content": article["blocks"][0]["content"],
+                "media_asset_id": inline["id"],
+                "sort_order": 2,
+            },
+            {
+                "section_type": "body",
+                "content": article["blocks"][1]["content"],
+                "media_asset_id": None,
+                "sort_order": 3,
+            },
+        ],
+    )
+
+    payload = service._build_wechat_publish_payload(
+        service.get_project(project["id"]),
+        "旧排版公众号",
+    )
+
+    assert payload["cover_path"] == str(service._media_file_path(cover))
+    assert payload["cover_candidate_path"] == str(service._media_file_path(cover))
+    assert payload["blocks"][0]["type"] == "intro"
+    assert payload["blocks"][0]["image_paths"] == []
+    assert payload["blocks"][1]["type"] == "body"
+    assert payload["blocks"][1]["image_paths"] == [str(service._media_file_path(inline))]
+
+
+def test_wechat_publish_payload_uses_markdown_layout_assets(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("旧标题")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    inline = next(asset for asset in images if asset["asset_type"] == "inline")
+    markdown = "\n\n".join(
+        [
+            "# Markdown 新标题",
+            f"![封面图](asset:{cover['id']})",
+            f"> {article['blocks'][0]['content']}",
+            article["blocks"][1]["content"],
+            f"![正文配图](asset:{inline['id']})",
+            "## 小标题",
+            article["blocks"][2]["content"],
+        ]
+    )
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "markdown",
+                "content": markdown,
+                "media_asset_id": None,
+                "sort_order": 1,
+            }
+        ],
+    )
+
+    payload = service._build_wechat_publish_payload(
+        service.get_project(project["id"]),
+        "Markdown 公众号",
+    )
+
+    assert payload["title"] == "Markdown 新标题"
+    assert payload["cover_path"] == str(service._media_file_path(cover))
+    assert payload["cover_candidate_path"] == str(service._media_file_path(cover))
+    assert payload["blocks"][0]["type"] == "intro"
+    assert payload["blocks"][0]["content"] == article["blocks"][0]["content"]
+    assert payload["blocks"][1]["type"] == "body"
+    assert payload["blocks"][1]["content"] == article["blocks"][1]["content"]
+    assert payload["blocks"][1]["image_path"] == str(service._media_file_path(inline))
+    assert payload["blocks"][2]["type"] == "heading"
+    assert payload["blocks"][2]["content"] == "小标题"
+
+
+def test_wechat_publish_payload_keeps_multiple_markdown_images_on_one_line(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("多图排版")
+    article = service.generate_article(project["id"])
+    service.generate_images(project["id"])
+    first_inline = service.generate_images(project["id"], "inline")["generated_assets"][0]
+    second_inline = service.generate_images(project["id"], "inline")["generated_assets"][0]
+    third_inline = service.generate_images(project["id"], "inline")["generated_assets"][0]
+    markdown = "\n\n".join(
+        [
+            "# 多图排版",
+            article["blocks"][1]["content"],
+            " ".join(
+                [
+                    f"![图1](asset:{first_inline['id']})",
+                    f"![图2](asset:{second_inline['id']})",
+                    f"![图3](asset:{third_inline['id']})",
+                ]
+            ),
+        ]
+    )
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "markdown",
+                "content": markdown,
+                "media_asset_id": None,
+                "sort_order": 1,
+            }
+        ],
+    )
+
+    payload = service._build_wechat_publish_payload(
+        service.get_project(project["id"]),
+        "Markdown 公众号",
+    )
+
+    expected_paths = [
+        str(service._media_file_path(first_inline)),
+        str(service._media_file_path(second_inline)),
+        str(service._media_file_path(third_inline)),
+    ]
+    assert payload["blocks"][0]["image_paths"] == expected_paths
+    assert payload["blocks"][0]["image_path"] == expected_paths[0]
+
+
+def test_wechat_publish_payload_keeps_pasted_markdown_data_image(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("粘贴图片排版")
+    article = service.generate_article(project["id"])
+    data_image = "data:image/png;base64,aW1hZ2U="
+    markdown = "\n\n".join(
+        [
+            "# 粘贴图片排版",
+            article["blocks"][1]["content"],
+            f"![粘贴图片]({data_image})",
+        ]
+    )
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "markdown",
+                "content": markdown,
+                "media_asset_id": None,
+                "sort_order": 1,
+            }
+        ],
+    )
+
+    payload = service._build_wechat_publish_payload(
+        service.get_project(project["id"]),
+        "Markdown 公众号",
+    )
+
+    assert payload["blocks"][0]["image_paths"] == [data_image]
+    assert payload["blocks"][0]["image_path"] == data_image
+
+
+def test_wechat_publish_payload_markdown_layout_does_not_fallback_to_selected_cover(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("Markdown 无封面")
+    article = service.generate_article(project["id"])
+    service.generate_images(project["id"])
+    markdown = "\n\n".join(
+        [
+            "# Markdown 无封面标题",
+            f"> {article['blocks'][0]['content']}",
+            article["blocks"][1]["content"],
+        ]
+    )
+    service.save_layout(
+        project["id"],
+        [
+            {
+                "section_type": "markdown",
+                "content": markdown,
+                "media_asset_id": None,
+                "sort_order": 1,
+            }
+        ],
+    )
+
+    payload = service._build_wechat_publish_payload(
+        service.get_project(project["id"]),
+        "Markdown 公众号",
+    )
+
+    assert payload["cover_path"] == ""
+    assert payload["cover_candidate_path"] == ""
+    assert all(block["image_path"] == "" for block in payload["blocks"])
+
+
 def test_publish_coordinator_persists_transition_before_external_publish(tmp_path):
     class TransitionPublisher(FakePlatformPublisher):
         def __init__(self, db):
@@ -1601,6 +1878,48 @@ def test_migration_does_not_revive_completed_once_run_after_new_generation_patch
     assert second["publish_job_id"] != old_job_id
     assert db.fetch_one("SELECT COUNT(*) AS count FROM publish_jobs")["count"] == 2
     assert publisher.calls == ["旧主题标题", "新主题标题"]
+
+
+def test_scheduled_task_continues_with_placeholder_images_when_image_model_blocks_prompt(tmp_path):
+    class SensitiveImageAIClient(FakeAIClient):
+        def generate_image(self, prompt: str, image_type: str):
+            raise RuntimeError("图片模型调用失败：HTTP 400，返回：InputTextSensitiveContentDetected")
+
+    db = Database(tmp_path / "task-image-fallback.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=SensitiveImageAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    account_id = db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('微信公众号', '图片兜底账号', '已授权')"
+    )
+    task = service.create_task(
+        {
+            "platform": "微信公众号",
+            "account_id": account_id,
+            "account_name": "图片兜底账号",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "微信公众号图文生成",
+            "topic": "你每月花8000请的会计，做一套账要4小时",
+            "publish_action": "draft",
+        }
+    )
+
+    finished = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+
+    assert finished["status"] == "已生成平台草稿"
+    assert finished["failure_reason"] == ""
+    assets = db.fetch_all(
+        "SELECT asset_type, local_path, prompt, selected FROM media_assets WHERE project_id = ? ORDER BY id",
+        (finished["content_project_id"],),
+    )
+    assert [asset["asset_type"] for asset in assets] == ["cover", "inline"]
+    assert all(asset["selected"] == 1 for asset in assets)
+    assert all("本地兜底图" in asset["prompt"] for asset in assets)
+    assert all((tmp_path / asset["local_path"]).exists() for asset in assets)
 
 
 def test_existing_publish_package_backfills_publish_job_id_from_payload(tmp_path):

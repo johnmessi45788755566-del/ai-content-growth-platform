@@ -24,7 +24,7 @@ const publishJobStatusLabels: Record<PublishJobStatus, string> = {
   filling_content: '填写内容',
   platform_draft: '已生成平台草稿',
   publishing: '发布中',
-  awaiting_confirmation: '待人工确认',
+  awaiting_confirmation: '平台要求二次安全确认',
   published: '已发布',
   failed: '失败',
 };
@@ -76,8 +76,8 @@ export default function Tasks() {
   const [selectedRetryIds, setSelectedRetryIds] = useState<number[]>([]);
   const [loadError, setLoadError] = useState('');
   const [accountsLoading, setAccountsLoading] = useState(false);
-  const [resumingJobId, setResumingJobId] = useState<number | null>(null);
   const [retryingJobId, setRetryingJobId] = useState<number | null>(null);
+  const [syncingDraftTaskId, setSyncingDraftTaskId] = useState<number | null>(null);
   const taskFiltersRef = useRef({ status, platform, search });
   const taskLoadGenerationRef = useRef(0);
   const tasksMountedRef = useRef(true);
@@ -225,19 +225,6 @@ export default function Tasks() {
     }
   }
 
-  async function resumeTaskPublish(task: ScheduledTask) {
-    if (!task.publish_job || task.publish_job.status !== 'awaiting_confirmation') return;
-    setResumingJobId(task.publish_job.id);
-    try {
-      await api.resumePublishJob(task.publish_job.id);
-      await refreshTaskPublishState(task);
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '继续发布失败');
-    } finally {
-      setResumingJobId(null);
-    }
-  }
-
   async function retryTaskPublish(task: ScheduledTask) {
     if (!task.publish_job || task.publish_job.status !== 'failed') return;
     setRetryingJobId(task.publish_job.id);
@@ -249,6 +236,26 @@ export default function Tasks() {
     } finally {
       setRetryingJobId(null);
     }
+  }
+
+  async function syncTaskDraft(task: ScheduledTask) {
+    setSyncingDraftTaskId(task.id);
+    try {
+      const synced = await api.syncTaskDraft(task.id);
+      await refreshTaskPublishState(task);
+      if (synced.status !== '已生成平台草稿' || synced.publish_job?.status !== 'platform_draft') {
+        throw new Error(synced.failure_reason || synced.publish_job?.failure_reason || '同步到平台草稿箱失败');
+      }
+      message.success('已同步到平台草稿箱');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '同步到平台草稿箱失败');
+    } finally {
+      setSyncingDraftTaskId(null);
+    }
+  }
+
+  function canSyncTaskDraft(task: ScheduledTask) {
+    return task.status === '失败' && isWechatV1Task(task) && Boolean(task.content_project_id);
   }
 
   async function refreshTaskPublishState(task: ScheduledTask) {
@@ -269,6 +276,13 @@ export default function Tasks() {
     onChange: (keys: React.Key[]) => setSelectedRetryIds(keys.map(Number)),
     getCheckboxProps: (record: ScheduledTask) => ({ disabled: record.status !== '失败' }),
   } : undefined, [retryMode, selectedRetryIds]);
+  const orderedTasks = useMemo(() => [...tasks].sort((left, right) => {
+    const leftTime = dayjs((left.next_run_at || left.execute_time || '').replace(' ', 'T')).valueOf();
+    const rightTime = dayjs((right.next_run_at || right.execute_time || '').replace(' ', 'T')).valueOf();
+    const leftValue = Number.isFinite(leftTime) ? leftTime : -Infinity;
+    const rightValue = Number.isFinite(rightTime) ? rightTime : -Infinity;
+    return rightValue - leftValue || right.id - left.id;
+  }), [tasks]);
 
   return (
     <>
@@ -280,7 +294,6 @@ export default function Tasks() {
               { value: '', label: '全部状态' },
               { value: '待执行', label: '待执行' },
               { value: '执行中', label: '执行中' },
-              { value: '待人工确认', label: '待人工确认' },
               { value: '已生成平台草稿', label: '已生成平台草稿' },
               { value: '已发布', label: '已发布' },
               { value: '失败', label: '失败' },
@@ -307,7 +320,7 @@ export default function Tasks() {
           rowKey="id"
           rowSelection={rowSelection}
           pagination={false}
-          dataSource={tasks}
+          dataSource={orderedTasks}
           columns={[
             { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
             { title: '账号', dataIndex: 'account_name' },
@@ -328,11 +341,18 @@ export default function Tasks() {
                   {row.publish_job.status === 'failed' && (
                     <Button type="link" loading={retryingJobId === row.publish_job.id} onClick={() => retryTaskPublish(row)}>重试发布任务</Button>
                   )}
-                  {row.publish_job.status === 'awaiting_confirmation' && (
-                    <Button type="link" loading={resumingJobId === row.publish_job.id} onClick={() => resumeTaskPublish(row)}>继续确认发布</Button>
+                  {canSyncTaskDraft(row) && (
+                    <Button type="link" loading={syncingDraftTaskId === row.id} onClick={() => syncTaskDraft(row)}>同步到平台草稿箱</Button>
                   )}
                 </Space>
-              ) : <span className="muted">尚未执行</span>,
+              ) : (
+                <Space direction="vertical" size={0}>
+                  <span className="muted">尚未执行</span>
+                  {canSyncTaskDraft(row) && (
+                    <Button type="link" loading={syncingDraftTaskId === row.id} onClick={() => syncTaskDraft(row)}>同步到平台草稿箱</Button>
+                  )}
+                </Space>
+              ),
             },
             {
               title: '操作',
@@ -430,21 +450,16 @@ export default function Tasks() {
             <Detail label="平台结果地址" value={detailTask.publish_job?.platform_url ? <a href={detailTask.publish_job.platform_url} target="_blank" rel="noreferrer">查看平台结果</a> : '-'} />
             <Detail label="失败阶段" value={detailTask.publish_job?.failure_stage || detailTask.failure_stage || '-'} />
             <Detail label="失败原因" value={detailTask.publish_job?.failure_reason || detailTask.failure_reason || '-'} />
-            {detailTask.publish_job?.status === 'awaiting_confirmation' && (
-              <Detail
-                label="人工确认"
-                value={(
-                  <Space direction="vertical" size={4}>
-                    <span>请由运营人员使用微信扫描平台弹出的确认二维码，完成后继续发布。</span>
-                    <Button type="primary" loading={resumingJobId === detailTask.publish_job.id} onClick={() => resumeTaskPublish(detailTask)}>继续确认发布</Button>
-                  </Space>
-                )}
-              />
-            )}
             {detailTask.publish_job?.status === 'failed' && (
               <Detail
                 label="发布任务重试"
                 value={<Button type="primary" loading={retryingJobId === detailTask.publish_job.id} onClick={() => retryTaskPublish(detailTask)}>重试发布任务</Button>}
+              />
+            )}
+            {canSyncTaskDraft(detailTask) && (
+              <Detail
+                label="同步草稿"
+                value={<Button type="primary" loading={syncingDraftTaskId === detailTask.id} onClick={() => syncTaskDraft(detailTask)}>同步到平台草稿箱</Button>}
               />
             )}
           </div>

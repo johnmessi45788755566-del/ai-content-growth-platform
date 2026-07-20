@@ -2,6 +2,8 @@ import json
 import re
 import secrets
 import sqlite3
+from datetime import datetime
+from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlparse, urlsplit, urlunsplit
@@ -67,6 +69,7 @@ PUBLIC_RESPONSE_FIELDS = (
     "url",
     "report_id",
     "author_name",
+    "trace_path",
 )
 PUBLIC_RECEIPT_FIELDS = (
     "id",
@@ -364,7 +367,8 @@ class PublishCoordinator:
         )
         if attempt_token is None:
             return self.get_publish_job(job_id)
-        return self._execute_claimed(job, account, payload, attempt_token)
+        trace_path = self._publish_trace_path(job_id)
+        return self._execute_claimed(job, account, payload, attempt_token, trace_path)
 
     def _execute_claimed(
         self,
@@ -372,8 +376,10 @@ class PublishCoordinator:
         account: dict[str, Any],
         payload: dict[str, Any],
         attempt_token: str,
+        trace_path: str,
     ) -> dict[str, Any]:
         job_id = int(job["id"])
+        self._bind_trace_context(job_id, trace_path)
         try:
             publish_with_progress = getattr(
                 self.publisher, "publish_with_progress", None
@@ -400,7 +406,9 @@ class PublishCoordinator:
             self._persist_result(job_id, str(job["action"]), result, attempt_token)
         except Exception as exc:
             stage = "提交平台草稿" if job["action"] == "draft" else "发布文章"
-            self._persist_failure(job_id, stage, exc, attempt_token)
+            self._persist_failure(job_id, stage, exc, attempt_token, trace_path)
+        finally:
+            self._clear_trace_context()
         return self.get_publish_job(job_id)
 
     def _persist_progress(
@@ -570,12 +578,20 @@ class PublishCoordinator:
             )
 
     def _persist_failure(
-        self, job_id: int, stage: str, exc: Exception, attempt_token: str
+        self,
+        job_id: int,
+        stage: str,
+        exc: Exception,
+        attempt_token: str,
+        trace_path: str = "",
     ) -> None:
         job = self._get_row(job_id)
         reason = str(exc).strip() or exc.__class__.__name__
         reason = self._redact_sensitive_text(job, reason)
-        response_json = self._attempt_response_json(attempt_token)
+        response_json = self._attempt_response_json(
+            attempt_token, {"trace_path": trace_path} if trace_path else None
+        )
+        expected_response_json = self._attempt_response_json(attempt_token)
         with self.db.connect() as conn:
             conn.execute(
                 f"""
@@ -593,7 +609,7 @@ class PublishCoordinator:
                     reason,
                     job_id,
                     *UNCERTAIN_IN_PROGRESS_STATUSES,
-                    response_json,
+                    expected_response_json,
                 ),
             )
             conn.commit()
@@ -666,8 +682,13 @@ class PublishCoordinator:
         return self._require_job_context(response)
 
     @staticmethod
-    def _attempt_response_json(attempt_token: str) -> str:
-        return json.dumps({ATTEMPT_TOKEN_KEY: attempt_token}, ensure_ascii=False)
+    def _attempt_response_json(
+        attempt_token: str, extra: Mapping[str, Any] | None = None
+    ) -> str:
+        payload: dict[str, Any] = {ATTEMPT_TOKEN_KEY: attempt_token}
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
     def _attempt_token(job: Mapping[str, Any]) -> str:
@@ -762,6 +783,23 @@ class PublishCoordinator:
                 )
             }
         return projected
+
+    @staticmethod
+    def _publish_trace_path(job_id: int) -> str:
+        trace_dir = Path(__file__).resolve().parents[2] / "logs" / "publish"
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        return str(trace_dir / f"publish-job-{job_id}-{timestamp}.jsonl")
+
+    def _bind_trace_context(self, job_id: int, trace_path: str) -> None:
+        binder = getattr(self.publisher, "set_trace_context", None)
+        if callable(binder):
+            binder(job_id, trace_path)
+
+    def _clear_trace_context(self) -> None:
+        clearer = getattr(self.publisher, "clear_trace_context", None)
+        if callable(clearer):
+            clearer()
 
 
 __all__ = ["PublishCoordinator", "PublishJobValidationError"]

@@ -6,9 +6,11 @@ from unittest.mock import Mock
 
 import pytest
 
+from app.publishing import browser_gateway as browser_gateway_module
 from app.publishing.browser_gateway import (
     COVER_FILE_SELECTORS,
     INLINE_FILE_SELECTORS,
+    SAVE_DRAFT_TEXTS,
     STATE_TRAVERSAL_MAX_DEPTH,
     STATE_TRAVERSAL_MAX_ENTRIES,
     BrowserSession,
@@ -162,6 +164,12 @@ def article_payload(tmp_path: Path):
     }
 
 
+def article_payload_without_cover(tmp_path: Path):
+    payload = article_payload(tmp_path)
+    payload["cover_path"] = ""
+    return payload
+
+
 def browser_account(tmp_path: Path):
     profile_path = tmp_path / "profile"
     profile_path.mkdir()
@@ -290,6 +298,33 @@ def test_wechat_browser_publisher_returns_verified_publish_receipt(tmp_path: Pat
     assert len(gateway.closed_sessions) == 1
 
 
+def test_wechat_browser_publish_requires_cover_before_opening_platform(tmp_path: Path):
+    gateway = FakeWeChatGateway(published_outcome())
+
+    with pytest.raises(WeChatPublishingError, match="一键发布必须上传封面图"):
+        WeChatBrowserPublisher(gateway=gateway).publish(
+            article_payload_without_cover(tmp_path),
+            browser_account(tmp_path),
+            action="publish",
+        )
+
+    assert gateway.actions == []
+    assert gateway.closed_sessions == []
+
+
+def test_wechat_browser_draft_allows_article_without_cover(tmp_path: Path):
+    gateway = FakeWeChatGateway(draft_outcome())
+
+    result = WeChatBrowserPublisher(gateway=gateway).publish(
+        article_payload_without_cover(tmp_path),
+        browser_account(tmp_path),
+        action="draft",
+    )
+
+    assert result.status == "platform_draft"
+    assert "click_save_draft" in gateway.actions
+
+
 @pytest.mark.parametrize(
     ("action", "state_setup", "expected_reason"),
     [
@@ -341,7 +376,9 @@ def test_actual_state_collector_aborts_publisher_before_click_at_budget_boundary
     assert len(gateway.closed_sessions) == 1
 
 
-def test_wechat_browser_publisher_pauses_for_operator_confirmation(tmp_path: Path):
+def test_wechat_browser_publisher_rejects_operator_confirmation_without_second_scan(
+    tmp_path: Path,
+):
     gateway = FakeWeChatGateway(
         {
             "status": "awaiting_confirmation",
@@ -350,23 +387,14 @@ def test_wechat_browser_publisher_pauses_for_operator_confirmation(tmp_path: Pat
             "confirmation": {"kind": "operator_qr", "screenshot_available": True},
         }
     )
-    result = WeChatBrowserPublisher(gateway=gateway).publish(
-        article_payload(tmp_path), browser_account(tmp_path), action="publish"
-    )
 
-    assert result.status == "awaiting_confirmation"
-    assert result.requires_confirmation is True
-    assert result.platform_url == "https://mp.weixin.qq.com/cgi-bin/masssendpage"
-    assert result.response == {
-        "source": "wechat_platform",
-        "event": "operator_confirmation_required",
-        "confirmation": "operator_qr",
-        "job_context": {"resume_handle": "opaque-resume-handle"},
-    }
-    public_text = str(result.response)
-    for forbidden in ("debug_port", "target_id", "profile_path", "session_id", "secret-token"):
-        assert forbidden not in public_text
-    assert gateway.closed_sessions == []
+    with pytest.raises(WeChatPublishingError, match="微信平台要求二次安全确认"):
+        WeChatBrowserPublisher(gateway=gateway).publish(
+            article_payload(tmp_path), browser_account(tmp_path), action="publish"
+        )
+
+    assert "retain_confirmation" not in gateway.actions
+    assert len(gateway.closed_sessions) == 1
 
 
 def test_wechat_browser_publisher_resumes_preserved_confirmation_session(tmp_path: Path):
@@ -605,6 +633,70 @@ def browser_session(tmp_path: Path, url="https://mp.weixin.qq.com/"):
         websocket_url="ws://127.0.0.1/devtools/page/page-1",
         url=url,
     )
+
+
+def test_cdp_call_refreshes_target_and_retries_when_target_id_is_stale(
+    tmp_path: Path,
+    monkeypatch,
+):
+    gateway = ChromeCDPBrowserGateway()
+    session = BrowserSession(
+        session_id="session-1",
+        profile_path=tmp_path.resolve(),
+        port=9322,
+        target_id="old-target",
+        websocket_url="ws://old-target",
+        url="https://mp.weixin.qq.com/cgi-bin/appmsg",
+    )
+    attempts = []
+
+    class FakeConnection:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def send(self, payload):
+            self.sent.append(json.loads(payload))
+
+        def recv(self):
+            return json.dumps({"id": self.sent[-1]["id"], "result": {"value": "ok"}})
+
+        def close(self):
+            self.closed = True
+
+    def fake_create_connection(url, timeout):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise browser_gateway_module.websocket.WebSocketException(
+                "Handshake status 500 Internal Server Error -+-+- {'content-length': '51'} -+-+- "
+                "b'No such target id: old-target'"
+            )
+        return FakeConnection()
+
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        fake_create_connection,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_targets",
+        lambda port: [
+            {
+                "id": "new-target",
+                "type": "page",
+                "url": "https://mp.weixin.qq.com/cgi-bin/appmsg",
+                "webSocketDebuggerUrl": "ws://new-target",
+            }
+        ],
+    )
+
+    result = gateway._cdp_call(session, "Runtime.evaluate", {"expression": "1"})
+
+    assert result == {"value": "ok"}
+    assert attempts == ["ws://old-target", "ws://new-target"]
+    assert session.target_id == "new-target"
+    assert session.websocket_url == "ws://new-target"
 
 
 def test_browser_gateway_auth_requires_both_scoped_nonexpired_cookies(tmp_path: Path):
@@ -990,10 +1082,717 @@ def test_cover_and_inline_upload_selectors_are_disjoint_and_not_generic():
 def test_file_upload_locator_requires_unique_visible_image_file_input():
     expression = ChromeCDPBrowserGateway._file_input_expression(COVER_FILE_SELECTORS)
 
-    assert "matches.length > 1" in expression
+    assert "ambiguous file input" in expression
     assert "node.type !== 'file'" in expression
     assert "visibleControl(node)" in expression
+    assert "requireVisibleControl" in expression
     assert "accept.includes('image')" in expression
+    assert "priority" in expression
+
+
+def test_file_upload_locator_prefers_input_with_visible_upload_host():
+    expression = ChromeCDPBrowserGateway._file_input_expression(INLINE_FILE_SELECTORS)
+
+    assert "hostVisible" in expression
+    assert "hostArea" in expression
+    assert "right.hostVisible - left.hostVisible" in expression
+    assert "right.hostArea - left.hostArea" in expression
+
+
+def test_file_upload_locator_can_allow_hidden_input_after_upload_entry_is_opened():
+    expression = ChromeCDPBrowserGateway._file_input_expression(
+        COVER_FILE_SELECTORS,
+        require_visible_control=False,
+    )
+
+    assert "const requireVisibleControl = false" in expression
+    assert "(!requireVisibleControl || visibleControl(node))" in expression
+
+
+def test_save_draft_action_supports_visible_wechat_text_button():
+    expression = ChromeCDPBrowserGateway._click_text_expression(SAVE_DRAFT_TEXTS)
+
+    assert "保存为草稿" in expression
+    assert "button, a, [role=button]" in expression
+    assert "node.click()" in expression
+
+
+def test_file_upload_can_click_wechat_upload_entry_before_resolving_input():
+    expression = ChromeCDPBrowserGateway._upload_trigger_expression("cover")
+
+    assert "拖拽或选择封面" in expression
+    assert ".js_cover_area" in expression
+    assert "body *" not in expression
+    assert "closest('label, button, a, [role=button]')" in expression
+    assert "textLength" in expression
+    assert "const triggerWithDomClick = false" in expression
+    assert "if (triggerWithDomClick) node.click()" in expression
+    assert "getBoundingClientRect" in expression
+
+
+def test_inline_upload_trigger_keeps_dom_click_for_editor_menu():
+    expression = ChromeCDPBrowserGateway._upload_trigger_expression("inline")
+
+    assert "const triggerWithDomClick = true" in expression
+    assert "if (triggerWithDomClick) node.click()" in expression
+
+
+class MissingFileInputGateway(ChromeCDPBrowserGateway):
+    def __init__(self, trigger_result=False):
+        super().__init__()
+        self.trigger_result = trigger_result
+
+    def _remote_image_state(self, session, role):
+        return {"urls": [], "loading": False}
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "Runtime.evaluate":
+            return {"result": {}}
+        return {}
+
+    def _trigger_upload_entry(self, session, role):
+        return self.trigger_result
+
+
+class CoverTriggerMouseGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.mouse_events = []
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "Input.dispatchMouseEvent":
+            self.mouse_events.append(params)
+            return {}
+        return {}
+
+    def evaluate(self, session, expression):
+        return {
+            "ok": True,
+            "count": 1,
+            "rect": {"x": 100, "y": 200, "width": 240, "height": 100},
+        }
+
+
+def test_cover_upload_trigger_uses_real_mouse_click_on_cover_area(tmp_path: Path):
+    gateway = CoverTriggerMouseGateway()
+
+    assert gateway._trigger_upload_entry(browser_session(tmp_path), "cover") is True
+
+    assert gateway.mouse_events == [
+        {"type": "mouseMoved", "x": 220, "y": 250, "button": "none"},
+        {"type": "mousePressed", "x": 220, "y": 250, "button": "left", "clickCount": 1},
+        {"type": "mouseReleased", "x": 220, "y": 250, "button": "left", "clickCount": 1},
+    ]
+
+
+class FakeFileChooserConnection:
+    def __init__(self):
+        self.sent = []
+        self.file_chooser_sent = False
+        self.closed = False
+
+    def send(self, value):
+        self.sent.append(json.loads(value))
+
+    def recv(self):
+        last = self.sent[-1]
+        method = last["method"]
+        response_id = last["id"]
+        if method == "Page.setInterceptFileChooserDialog":
+            return json.dumps({"id": response_id, "result": {}})
+        if method == "Runtime.evaluate":
+            return json.dumps(
+                {
+                    "id": response_id,
+                    "result": {
+                        "result": {
+                            "value": {
+                                "ok": True,
+                                "rect": {"x": 10, "y": 20, "width": 200, "height": 80},
+                            }
+                        }
+                    },
+                }
+            )
+        if method == "Input.dispatchMouseEvent":
+            if not self.file_chooser_sent and last["params"]["type"] == "mouseReleased":
+                self.file_chooser_sent = True
+                return json.dumps(
+                    {
+                        "method": "Page.fileChooserOpened",
+                        "params": {"backendNodeId": 321, "mode": "selectSingle"},
+                    }
+                )
+            return json.dumps({"id": response_id, "result": {}})
+        if method == "DOM.setFileInputFiles":
+            return json.dumps({"id": response_id, "result": {}})
+        return json.dumps({"id": response_id, "result": {}})
+
+    def close(self):
+        self.closed = True
+
+
+def test_cover_upload_can_use_file_chooser_event_backend_node_id(
+    tmp_path: Path, monkeypatch
+):
+    image_path = tmp_path / "cover.png"
+    image_path.write_bytes(b"fake image")
+    connection = FakeFileChooserConnection()
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        lambda url, timeout: connection,
+    )
+    gateway = ChromeCDPBrowserGateway()
+
+    assert gateway._set_cover_file_via_file_chooser(
+        browser_session(tmp_path),
+        image_path.resolve(),
+    )
+
+    methods = [item["method"] for item in connection.sent]
+    assert methods[:2] == ["Page.setInterceptFileChooserDialog", "Runtime.evaluate"]
+    assert "Input.dispatchMouseEvent" in methods
+    assert {
+        "id": 6,
+        "method": "DOM.setFileInputFiles",
+        "params": {"files": [str(image_path.resolve())], "backendNodeId": 321},
+    } in connection.sent
+    assert connection.sent[-1]["method"] == "Page.setInterceptFileChooserDialog"
+    assert connection.sent[-1]["params"] == {"enabled": False}
+    assert connection.closed
+
+
+class FakeInlineFileChooserConnection:
+    def __init__(self):
+        self.sent = []
+        self.file_chooser_sent = False
+        self.closed = False
+
+    def send(self, value):
+        self.sent.append(json.loads(value))
+
+    def recv(self):
+        last = self.sent[-1]
+        method = last["method"]
+        response_id = last["id"]
+        if method == "Page.setInterceptFileChooserDialog":
+            return json.dumps({"id": response_id, "result": {}})
+        if method == "Runtime.evaluate":
+            return json.dumps(
+                {
+                    "id": response_id,
+                    "result": {
+                        "result": {
+                            "value": {
+                                "ok": True,
+                                "rect": {"x": 120, "y": 80, "width": 96, "height": 36},
+                            }
+                        }
+                    },
+                }
+            )
+        if method == "Input.dispatchMouseEvent":
+            if not self.file_chooser_sent and last["params"]["type"] == "mouseReleased":
+                self.file_chooser_sent = True
+                return json.dumps(
+                    {
+                        "method": "Page.fileChooserOpened",
+                        "params": {"backendNodeId": 654, "mode": "selectSingle"},
+                    }
+                )
+            return json.dumps({"id": response_id, "result": {}})
+        if method == "DOM.setFileInputFiles":
+            return json.dumps({"id": response_id, "result": {}})
+        return json.dumps({"id": response_id, "result": {}})
+
+    def close(self):
+        self.closed = True
+
+
+class FakeInlineFileChooserDelayedConnection:
+    def __init__(self):
+        self.sent = []
+        self.file_chooser_sent = False
+        self.closed = False
+        self.inline_trigger_returned = False
+        self.timeout_after_inline_trigger = True
+
+    def send(self, value):
+        self.sent.append(json.loads(value))
+
+    def recv(self):
+        last = self.sent[-1]
+        method = last["method"]
+        response_id = last["id"]
+        if method == "Page.setInterceptFileChooserDialog":
+            return json.dumps({"id": response_id, "result": {}})
+        if method == "Runtime.evaluate":
+            expression = str(last["params"].get("expression") or "")
+            if (
+                "edui-for-insertimage" in expression
+                and self.inline_trigger_returned
+                and self.timeout_after_inline_trigger
+            ):
+                self.timeout_after_inline_trigger = False
+                raise browser_gateway_module.websocket.WebSocketTimeoutException("timed out")
+            if "edui-for-insertimage" in expression:
+                self.inline_trigger_returned = True
+            return json.dumps(
+                {
+                    "id": response_id,
+                    "result": {
+                        "result": {
+                            "value": {
+                                "ok": True,
+                                "rect": {"x": 120, "y": 80, "width": 96, "height": 36},
+                                "text": "上传图片",
+                            }
+                        }
+                    },
+                }
+            )
+        if method == "Input.dispatchMouseEvent":
+            if not self.file_chooser_sent and last["params"]["type"] == "mouseReleased":
+                self.file_chooser_sent = True
+                return json.dumps(
+                    {
+                        "method": "Page.fileChooserOpened",
+                        "params": {"backendNodeId": 987, "mode": "selectSingle"},
+                    }
+                )
+            return json.dumps({"id": response_id, "result": {}})
+        if method == "DOM.setFileInputFiles":
+            return json.dumps({"id": response_id, "result": {}})
+        return json.dumps({"id": response_id, "result": {}})
+
+    def close(self):
+        self.closed = True
+
+
+class InlineChooserRecoveryGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.image_states = [
+            {"urls": ["https://mmbiz.qpic.cn/old-inline.jpg"], "loading": False},
+            {
+                "urls": [
+                    "https://mmbiz.qpic.cn/old-inline.jpg",
+                    "https://mmbiz.qpic.cn/uploaded-inline.jpg",
+                ],
+                "loading": False,
+            },
+        ]
+
+    def _remote_image_state(self, session, role):
+        return self.image_states.pop(0)
+
+    def _resolve_file_input_reference(
+        self, session, selectors, require_visible_control=True, role="inline", label="图片"
+    ):
+        return {"object_id": "stale-runtime-object", "backend_node_id": 0}
+
+    def _backend_node_id_for_object(self, session, object_id):
+        return 0
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "DOM.setFileInputFiles":
+            raise OSError("DOM.setFileInputFiles：Could not find object with given id")
+        return {}
+
+
+def test_inline_upload_uses_file_chooser_when_runtime_object_id_is_stale(
+    tmp_path: Path, monkeypatch
+):
+    image_path = tmp_path / "inline.png"
+    image_path.write_bytes(b"fake image")
+    connection = FakeInlineFileChooserConnection()
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        lambda url, timeout: connection,
+    )
+    gateway = InlineChooserRecoveryGateway()
+
+    evidence = gateway.set_file_input(
+        browser_session(tmp_path),
+        INLINE_FILE_SELECTORS,
+        image_path,
+        "正文配图",
+        "inline",
+    )
+
+    assert {
+        "id": 7,
+        "method": "DOM.setFileInputFiles",
+        "params": {"files": [str(image_path.resolve())], "backendNodeId": 654},
+    } in connection.sent
+    assert evidence["remote_url"] == "https://mmbiz.qpic.cn/uploaded-inline.jpg"
+    assert connection.closed
+
+
+def test_inline_upload_clicks_visible_host_when_initial_chooser_wait_times_out(
+    tmp_path: Path, monkeypatch
+):
+    image_path = tmp_path / "inline.png"
+    image_path.write_bytes(b"fake image")
+    connection = FakeInlineFileChooserDelayedConnection()
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        lambda url, timeout: connection,
+    )
+    gateway = ChromeCDPBrowserGateway()
+
+    assert gateway._set_inline_file_via_file_chooser(
+        browser_session(tmp_path),
+        image_path.resolve(),
+        INLINE_FILE_SELECTORS,
+        "正文配图",
+    )
+
+    methods = [item["method"] for item in connection.sent]
+    assert methods.count("Runtime.evaluate") >= 2
+    assert {
+        "id": 7,
+        "method": "DOM.setFileInputFiles",
+        "params": {"files": [str(image_path.resolve())], "backendNodeId": 987},
+    } in connection.sent
+    assert connection.closed
+
+
+def test_inline_file_chooser_runtime_clicks_use_user_gesture(tmp_path: Path, monkeypatch):
+    image_path = tmp_path / "inline.png"
+    image_path.write_bytes(b"fake image")
+    connection = FakeInlineFileChooserDelayedConnection()
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        lambda url, timeout: connection,
+    )
+    gateway = ChromeCDPBrowserGateway()
+
+    assert gateway._set_inline_file_via_file_chooser(
+        browser_session(tmp_path),
+        image_path.resolve(),
+        INLINE_FILE_SELECTORS,
+        "正文配图",
+    )
+
+    runtime_calls = [
+        item for item in connection.sent if item["method"] == "Runtime.evaluate"
+    ]
+    assert runtime_calls
+    assert all(call["params"].get("userGesture") is True for call in runtime_calls)
+
+
+def test_file_upload_error_reports_trigger_status_and_all_attempted_selectors(tmp_path: Path):
+    image_path = tmp_path / "cover.png"
+    image_path.write_bytes(b"fake image")
+    gateway = MissingFileInputGateway(trigger_result=False)
+
+    with pytest.raises(WeChatPublishingError) as error:
+        gateway.set_file_input(
+            browser_session(tmp_path),
+            COVER_FILE_SELECTORS,
+            image_path,
+            "封面图",
+            "cover",
+        )
+
+    message = str(error.value)
+    assert "未触发上传入口" in message
+    assert ".js_cover_area input[type='file']" in message
+    assert "input[type='file'][accept*='image']" not in message
+
+
+class StaleObjectIdFileInputGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.set_file_params = None
+        self.image_states = [
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg"], "loading": False},
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg", "https://mmbiz.qpic.cn/uploaded-cover.jpg"], "loading": False},
+        ]
+
+    def _remote_image_state(self, session, role):
+        return self.image_states.pop(0)
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "Runtime.evaluate":
+            return {"result": {"objectId": "stale-object-id"}}
+        if method == "DOM.describeNode":
+            assert params == {"objectId": "stale-object-id"}
+            return {"node": {"backendNodeId": 42}}
+        if method == "DOM.setFileInputFiles":
+            self.set_file_params = params
+            if params and "objectId" in params:
+                raise OSError("DOM.setFileInputFiles: Could not find object with given id")
+            return {}
+        return {}
+
+
+def test_file_upload_uses_stable_backend_node_id_instead_of_runtime_object_id(tmp_path: Path):
+    image_path = tmp_path / "cover.png"
+    image_path.write_bytes(b"fake image")
+    gateway = StaleObjectIdFileInputGateway()
+
+    evidence = gateway.set_file_input(
+        browser_session(tmp_path),
+        COVER_FILE_SELECTORS,
+        image_path,
+        "封面图",
+        "cover",
+    )
+
+    assert gateway.set_file_params == {
+        "files": [str(image_path.resolve())],
+        "backendNodeId": 42,
+    }
+    assert evidence["remote_url"] == "https://mmbiz.qpic.cn/uploaded-cover.jpg"
+
+
+class RequestNodeFallbackFileInputGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.set_file_params = None
+        self.describe_object_calls = 0
+        self.request_node_calls = 0
+        self.image_states = [
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg"], "loading": False},
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg", "https://mmbiz.qpic.cn/uploaded-cover.jpg"], "loading": False},
+        ]
+
+    def _set_cover_file_via_file_chooser(self, session, path):
+        return False
+
+    def _remote_image_state(self, session, role):
+        return self.image_states.pop(0)
+
+    def _trigger_upload_entry(self, session, role):
+        return True
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "Runtime.evaluate":
+            return {"result": {"objectId": "runtime-object-id"}}
+        if method == "DOM.getDocument":
+            return {"root": {"nodeId": 1}}
+        if method == "DOM.querySelector":
+            return {"nodeId": 0}
+        if method == "DOM.describeNode" and params == {"objectId": "runtime-object-id"}:
+            self.describe_object_calls += 1
+            raise OSError("No node with given id")
+        if method == "DOM.requestNode":
+            assert params == {"objectId": "runtime-object-id"}
+            self.request_node_calls += 1
+            return {"nodeId": 88}
+        if method == "DOM.describeNode" and params == {"nodeId": 88}:
+            return {"node": {"backendNodeId": 880}}
+        if method == "DOM.setFileInputFiles":
+            self.set_file_params = params
+            if params and "objectId" in params:
+                raise OSError("DOM.setFileInputFiles: Could not find object with given id")
+            return {}
+        return {}
+
+
+def test_file_upload_resolves_backend_node_id_via_request_node_when_object_id_is_stale(
+    tmp_path: Path,
+):
+    image_path = tmp_path / "cover.png"
+    image_path.write_bytes(b"fake image")
+    gateway = RequestNodeFallbackFileInputGateway()
+
+    evidence = gateway.set_file_input(
+        browser_session(tmp_path),
+        COVER_FILE_SELECTORS,
+        image_path,
+        "封面图",
+        "cover",
+    )
+
+    assert gateway.request_node_calls == 1
+    assert gateway.set_file_params == {
+        "files": [str(image_path.resolve())],
+        "backendNodeId": 880,
+    }
+    assert evidence["remote_url"] == "https://mmbiz.qpic.cn/uploaded-cover.jpg"
+
+
+class InlineUploadReopensInputGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.trigger_roles = []
+        self.set_file_params = []
+        self.image_states = [
+            {"urls": ["https://mmbiz.qpic.cn/old-inline.jpg"], "loading": False},
+            {
+                "urls": [
+                    "https://mmbiz.qpic.cn/old-inline.jpg",
+                    "https://mmbiz.qpic.cn/uploaded-inline.jpg",
+                ],
+                "loading": False,
+            },
+        ]
+
+    def _set_inline_file_via_file_chooser(self, session, path, selectors, label):
+        return False
+
+    def _remote_image_state(self, session, role):
+        return self.image_states.pop(0)
+
+    def _trigger_upload_entry(self, session, role):
+        self.trigger_roles.append(role)
+        return True
+
+    def _resolve_file_input_reference(
+        self, session, selectors, require_visible_control=True, role="inline", label="图片"
+    ):
+        if "inline" in self.trigger_roles:
+            return {"object_id": "fresh-runtime-object", "backend_node_id": 404}
+        return {"object_id": "stale-runtime-object", "backend_node_id": 0}
+
+    def _backend_node_id_for_object(self, session, object_id):
+        return 0
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "DOM.setFileInputFiles":
+            self.set_file_params.append(params)
+            if params and "objectId" in params:
+                raise OSError("DOM.setFileInputFiles: Could not find object with given id")
+            return {}
+        return {}
+
+
+def test_inline_upload_reopens_upload_entry_before_retrying_stale_input(tmp_path: Path):
+    image_path = tmp_path / "inline.png"
+    image_path.write_bytes(b"fake image")
+    gateway = InlineUploadReopensInputGateway()
+
+    evidence = gateway.set_file_input(
+        browser_session(tmp_path),
+        INLINE_FILE_SELECTORS,
+        image_path,
+        "正文配图",
+        "inline",
+    )
+
+    assert "inline" in gateway.trigger_roles
+    assert gateway.set_file_params == [
+        {"files": [str(image_path.resolve())], "objectId": "stale-runtime-object"},
+        {"files": [str(image_path.resolve())], "backendNodeId": 404},
+    ]
+    assert evidence["remote_url"] == "https://mmbiz.qpic.cn/uploaded-inline.jpg"
+
+
+class MarkerBackendNodeFileInputGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.set_file_params = None
+        self.queried_selector = ""
+        self.image_states = [
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg"], "loading": False},
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg", "https://mmbiz.qpic.cn/backend-cover.jpg"], "loading": False},
+        ]
+
+    def _remote_image_state(self, session, role):
+        return self.image_states.pop(0)
+
+    def _trigger_upload_entry(self, session, role):
+        return True
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "Runtime.evaluate":
+            return {"result": {"objectId": "runtime-object-id"}}
+        if method == "DOM.getDocument":
+            return {"root": {"nodeId": 1}}
+        if method == "DOM.querySelector":
+            self.queried_selector = params["selector"]
+            return {"nodeId": 77}
+        if method == "DOM.describeNode":
+            assert params == {"nodeId": 77}
+            return {"node": {"backendNodeId": 909}}
+        if method == "DOM.setFileInputFiles":
+            self.set_file_params = params
+            return {}
+        return {}
+
+
+def test_file_upload_marks_runtime_input_and_uploads_by_dom_backend_node_id(
+    tmp_path: Path,
+):
+    image_path = tmp_path / "cover.png"
+    image_path.write_bytes(b"fake image")
+    gateway = MarkerBackendNodeFileInputGateway()
+
+    evidence = gateway.set_file_input(
+        browser_session(tmp_path),
+        COVER_FILE_SELECTORS,
+        image_path,
+        "封面图",
+        "cover",
+    )
+
+    assert 'input[type="file"][data-codex-upload-marker="' in gateway.queried_selector
+    assert gateway.set_file_params == {
+        "files": [str(image_path.resolve())],
+        "backendNodeId": 909,
+    }
+    assert evidence["remote_url"] == "https://mmbiz.qpic.cn/backend-cover.jpg"
+
+
+class ReplacedFileInputGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.runtime_object_ids = ["old-object-id", "fresh-object-id"]
+        self.set_file_params = []
+        self.image_states = [
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg"], "loading": False},
+            {"urls": ["https://mmbiz.qpic.cn/old-cover.jpg", "https://mmbiz.qpic.cn/fresh-cover.jpg"], "loading": False},
+        ]
+
+    def _remote_image_state(self, session, role):
+        return self.image_states.pop(0)
+
+    def _trigger_upload_entry(self, session, role):
+        return True
+
+    def _cdp_call(self, session, method, params=None):
+        if method == "Runtime.evaluate":
+            return {"result": {"objectId": self.runtime_object_ids.pop(0)}}
+        if method == "DOM.describeNode":
+            object_id = params["objectId"]
+            return {
+                "node": {
+                    "backendNodeId": 101 if object_id == "old-object-id" else 202
+                }
+            }
+        if method == "DOM.setFileInputFiles":
+            self.set_file_params.append(params)
+            if params == {"files": [params["files"][0]], "backendNodeId": 101}:
+                raise OSError("DOM.setFileInputFiles：Could not find object with given id")
+            return {}
+        return {}
+
+
+def test_file_upload_re_resolves_input_when_wechat_replaces_cover_control(tmp_path: Path):
+    image_path = tmp_path / "cover.png"
+    image_path.write_bytes(b"fake image")
+    gateway = ReplacedFileInputGateway()
+
+    evidence = gateway.set_file_input(
+        browser_session(tmp_path),
+        COVER_FILE_SELECTORS,
+        image_path,
+        "封面图",
+        "cover",
+    )
+
+    assert gateway.set_file_params == [
+        {"files": [str(image_path.resolve())], "backendNodeId": 101},
+        {"files": [str(image_path.resolve())], "backendNodeId": 202},
+    ]
+    assert evidence["remote_url"] == "https://mmbiz.qpic.cn/fresh-cover.jpg"
 
 
 class ExpressionCaptureGateway(ChromeCDPBrowserGateway):
@@ -1003,7 +1802,23 @@ class ExpressionCaptureGateway(ChromeCDPBrowserGateway):
 
     def evaluate(self, session, expression):
         self.expressions.append(expression)
+        if "candidateRecords" in expression:
+            return {"ok": True, "count": 2, "selected": "main-editor"}
         return {"ok": False, "reason": "ambiguous", "count": 2}
+
+
+def test_upload_area_diagnostics_records_cover_inputs_dialogs_and_iframes(tmp_path: Path):
+    gateway = ExpressionCaptureGateway()
+
+    gateway._upload_area_diagnostics(browser_session(tmp_path), "cover")
+
+    expression = gateway.expressions[-1]
+    assert "input[type=\"file\"]" in expression
+    assert "iframe" in expression
+    assert "role=\"dialog\"" in expression
+    assert "domPath" in expression
+    assert "封面" in expression
+    assert "拖拽" in expression
 
 
 def test_all_control_resolvers_deduplicate_matches_across_every_selector(tmp_path: Path):
@@ -1014,42 +1829,559 @@ def test_all_control_resolvers_deduplicate_matches_across_every_selector(tmp_pat
         gateway._click_first(session, (".primary", "button.primary"), "按钮")
     with pytest.raises(WeChatPublishingError, match="不唯一"):
         gateway._set_value(session, ("#title", "textarea#title"), "标题", "标题")
-    with pytest.raises(WeChatPublishingError, match="不唯一"):
-        gateway._set_editor_html(session, "<p>正文</p>")
+    gateway._set_editor_html(session, "<p>正文</p>")
 
     expressions = gateway.expressions + [
         ChromeCDPBrowserGateway._file_input_expression(
             (".cover input", "input.cover")
         )
     ]
-    assert all("new Set(selectors.flatMap" in expression for expression in expressions)
+    assert "candidateRecords" in gateway.expressions[-1]
+    assert all(
+        "new Set(selectors.flatMap" in expression or "candidateRecords" in expression
+        for expression in expressions
+    )
+
+
+def test_editor_resolver_scores_multiple_visible_editors_instead_of_rejecting(tmp_path: Path):
+    gateway = ExpressionCaptureGateway()
+
+    gateway._set_editor_html(browser_session(tmp_path), "<p>正文</p>")
+
+    expression = gateway.expressions[-1]
+    assert "matches.sort" in expression
+    assert "priority" in expression
+    assert "area" in expression
 
 
 class UploadRecordingGateway(ChromeCDPBrowserGateway):
     def __init__(self):
         super().__init__()
         self.uploads = []
+        self.editor_html = ""
+        self.selected_from_body = False
 
     def _set_value(self, *args, **kwargs):
         return None
 
-    def _set_editor_html(self, *args, **kwargs):
+    def _set_editor_html(self, session, content_html):
+        self.editor_html = content_html
+        return None
+
+    def _focus_editor_for_upload(self, session):
         return None
 
     def set_file_input(self, session, selectors, file_path, label, role):
         self.uploads.append((tuple(selectors), file_path, label, role))
         return {"remote_url": f"https://mmbiz.qpic.cn/{role}.jpg"}
 
+    def _set_cover_from_article_image_picker(self, session, cover_path, target_image_url=""):
+        self.selected_from_body = True
+        self.target_image_url = target_image_url
+        return {"remote_url": "https://mmbiz.qpic.cn/cover-from-body.jpg"}
 
-def test_fill_article_uses_distinct_verified_cover_and_inline_upload_roles(tmp_path: Path):
+
+def test_fill_article_embeds_cover_candidate_before_inline_images_and_selects_cover_from_body(tmp_path: Path):
     gateway = UploadRecordingGateway()
     payload = article_payload(tmp_path)
 
     gateway.fill_article(browser_session(tmp_path), payload)
 
-    assert [upload[3] for upload in gateway.uploads] == ["cover", "inline"]
-    assert gateway.uploads[0][0] == COVER_FILE_SELECTORS
-    assert gateway.uploads[1][0] == INLINE_FILE_SELECTORS
+    assert gateway.uploads == []
+    assert gateway.selected_from_body is True
+    assert gateway.target_image_url == ""
+    assert "正文" in gateway.editor_html
+    cover_index = gateway.editor_html.index("data:image/jpeg;base64,Y292ZXI=")
+    inline_index = gateway.editor_html.index("data:image/png;base64,aW5saW5l")
+    assert cover_index < inline_index
+    assert "data-wechat-cover-candidate=\"true\"" in gateway.editor_html
+    assert "inline.png" not in gateway.editor_html
+
+
+class CoverPickerFromBodyGateway(ChromeCDPBrowserGateway):
+    def __init__(self):
+        super().__init__()
+        self.uploads = []
+        self.selected_from_body = False
+
+    def set_file_input(self, session, selectors, file_path, label, role):
+        self.uploads.append((tuple(selectors), file_path, label, role))
+        return {"remote_url": f"https://mmbiz.qpic.cn/{role}.jpg"}
+
+    def _focus_editor_for_upload(self, session):
+        return None
+
+    def _set_cover_from_article_image_picker(self, session, cover_path, target_image_url=""):
+        self.selected_from_body = True
+        self.target_image_url = target_image_url
+        return {"remote_url": "https://mmbiz.qpic.cn/cover-from-body.jpg"}
+
+
+def test_cover_upload_uses_wechat_body_image_picker_as_primary_flow(tmp_path: Path):
+    payload = article_payload(tmp_path)
+    gateway = CoverPickerFromBodyGateway()
+
+    gateway.upload_article_assets(browser_session(tmp_path), payload)
+
+    assert gateway.uploads == []
+    assert gateway.selected_from_body is True
+    assert gateway.target_image_url == ""
+
+
+def test_cover_upload_allows_cover_only_article_by_using_cover_candidate(tmp_path: Path):
+    payload = article_payload(tmp_path)
+    payload["blocks"] = [
+        {"type": "body", "content": "只有正文，没有正文配图", "image_path": "", "image_paths": []}
+    ]
+    gateway = CoverPickerFromBodyGateway()
+
+    gateway.upload_article_assets(browser_session(tmp_path), payload)
+
+    assert gateway.uploads == []
+    assert gateway.selected_from_body is True
+    assert gateway.target_image_url == ""
+
+
+class StepwiseCoverPickerGateway(ChromeCDPBrowserGateway):
+    def __init__(
+        self,
+        fail_marker="",
+        cover_applied_after_next=True,
+        delayed_entry_attempts=0,
+        edit_cover_dialog_open=False,
+        next_button_missing_when_edit_cover_open=False,
+    ):
+        super().__init__()
+        self.fail_marker = fail_marker
+        self.cover_applied_after_next = cover_applied_after_next
+        self.delayed_entry_attempts = delayed_entry_attempts
+        self.next_button_missing_when_edit_cover_open = next_button_missing_when_edit_cover_open
+        self.entry_attempts = 0
+        self.complete_clicked = False
+        self.edit_cover_dialog_open = edit_cover_dialog_open
+        self.edit_cover_confirm_clicked = False
+        self.card_selected = False
+        self.actions = []
+        self.traces = []
+
+    def _trace(self, event, **fields):
+        self.traces.append((event, fields))
+
+    def _trigger_upload_entry(self, session, role):
+        self.actions.append(f"trigger:{role}")
+        return True
+
+    def evaluate(self, session, expression):
+        markers = [
+            "codex-cover-picker:from-article-entry",
+            "codex-cover-picker:snapshot",
+            "codex-cover-picker:select-image",
+            "codex-cover-picker:selection-state",
+            "codex-cover-picker:click-next",
+            "codex-cover-picker:click-complete",
+            "codex-cover-picker:edit-cover-dialog-state",
+            "codex-cover-picker:click-edit-cover-confirm",
+            "codex-cover-picker:article-editor-return-state",
+            "codex-cover-picker:cover-applied",
+        ]
+        marker = next((item for item in markers if item in expression), "legacy")
+        self.actions.append(marker)
+        if self.fail_marker and marker == self.fail_marker:
+            raise WeChatPublishingError("微信浏览器 CDP 会话失败：timed out")
+        if marker == "codex-cover-picker:from-article-entry":
+            self.entry_attempts += 1
+            if self.entry_attempts <= self.delayed_entry_attempts:
+                return {
+                    "ok": False,
+                    "reason": "from_article_entry_not_found",
+                    "entryCandidates": [],
+                }
+            return {
+                "ok": True,
+                "clicked": True,
+                "entryCandidates": [{"text": "从正文选择"}],
+            }
+        if marker == "codex-cover-picker:snapshot":
+            return {
+                "ok": True,
+                "dialogFound": True,
+                "imageCount": 2,
+                "selectedIndex": 0,
+                "candidates": [
+                    {"index": 0, "src": "https://mmbiz.qpic.cn/cover.jpg"},
+                    {"index": 1, "src": "https://mmbiz.qpic.cn/inline.jpg"},
+                ],
+                "dialogText": "选择图片 请从正文插入的图片和视频封面中选择封面",
+            }
+        if marker == "codex-cover-picker:selection-state":
+            return {
+                "ok": self.card_selected,
+                "reason": "" if self.card_selected else "candidate_not_selected",
+                "selectedIndex": 0,
+                "selectedIndices": [0] if self.card_selected else [],
+                "candidateSelected": self.card_selected,
+                "nextButtons": [{"disabled": not self.card_selected}],
+            }
+        if marker == "codex-cover-picker:select-image":
+            return {
+                "ok": True,
+                "selectedIndex": 0,
+                "selectedBefore": False,
+                "clickableRect": {"x": 100, "y": 100, "width": 120, "height": 120},
+            }
+        if marker == "codex-cover-picker:click-complete":
+            self.complete_clicked = True
+            return {"ok": True}
+        if marker == "codex-cover-picker:click-next":
+            if self.next_button_missing_when_edit_cover_open and self.edit_cover_dialog_open:
+                return {
+                    "ok": False,
+                    "reason": "button_not_found",
+                    "availableButtons": [{"text": "确认", "disabled": False}],
+                }
+            return {"ok": True}
+        if marker == "codex-cover-picker:edit-cover-dialog-state":
+            return {
+                "ok": True,
+                "dialogOpen": self.edit_cover_dialog_open,
+                "dialogText": "编辑封面 确认" if self.edit_cover_dialog_open else "",
+            }
+        if marker == "codex-cover-picker:click-edit-cover-confirm":
+            self.edit_cover_confirm_clicked = True
+            self.complete_clicked = True
+            self.edit_cover_dialog_open = False
+            return {"ok": True, "text": "确认"}
+        if marker == "codex-cover-picker:article-editor-return-state":
+            return {
+                "ok": True,
+                "url": "https://mp.weixin.qq.com/cgi-bin/appmsg",
+                "editorReady": True,
+                "editCoverDialogOpen": False,
+                "saveDraftButtonVisible": True,
+                "publishButtonVisible": True,
+                "visibleButtonTexts": ["保存为草稿", "发表"],
+            }
+        if marker == "codex-cover-picker:cover-applied":
+            return {
+                "ok": True,
+                "coverApplied": (
+                    (self.cover_applied_after_next and not self.edit_cover_dialog_open)
+                    or self.complete_clicked
+                ),
+            }
+        if marker == "legacy":
+            raise WeChatPublishingError("unexpected legacy cover picker expression")
+        return {"ok": True}
+
+    def _dispatch_mouse_click(self, session, rect):
+        self.actions.append("cdp:mouse-click")
+        self.card_selected = True
+
+
+class EditCoverUnverifiedGateway(StepwiseCoverPickerGateway):
+    def __init__(self):
+        super().__init__(edit_cover_dialog_open=True)
+
+    def _wait_for_cover_picker_cover_applied(self, session, timeout=5):
+        self.actions.append("codex-cover-picker:cover-applied")
+        self._trace("upload.cover_picker.cover_applied_unverified", last_result={})
+        return False
+
+
+def test_cover_picker_from_article_image_runs_short_observable_steps(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway()
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    assert gateway.actions == [
+        "trigger:cover",
+        "codex-cover-picker:from-article-entry",
+        "codex-cover-picker:snapshot",
+        "codex-cover-picker:select-image",
+        "cdp:mouse-click",
+        "codex-cover-picker:selection-state",
+        "codex-cover-picker:selection-state",
+        "codex-cover-picker:edit-cover-dialog-state",
+        "codex-cover-picker:click-next",
+        "codex-cover-picker:edit-cover-dialog-state",
+        "codex-cover-picker:cover-applied",
+    ]
+    trace_events = [event for event, _ in gateway.traces]
+    assert "upload.cover_picker.candidates" in trace_events
+    assert "upload.cover_picker.cover_applied_after_next" in trace_events
+    assert "upload.cover_picker_from_article_image.completed" in trace_events
+
+
+def test_cover_picker_waits_for_delayed_from_article_menu_entry(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway(delayed_entry_attempts=1)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    assert gateway.entry_attempts == 2
+    trace_events = [event for event, _ in gateway.traces]
+    assert "upload.cover_picker.from_article_entry_wait" in trace_events
+
+
+def test_cover_picker_waits_for_stable_image_selection_before_next(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway()
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    next_click_index = gateway.actions.index("codex-cover-picker:click-next")
+    selection_checks = gateway.actions[:next_click_index].count(
+        "codex-cover-picker:selection-state"
+    )
+
+    assert selection_checks >= 2
+
+
+def test_cover_picker_waits_three_seconds_after_image_selection_before_next(
+    tmp_path: Path,
+    monkeypatch,
+):
+    gateway = StepwiseCoverPickerGateway()
+
+    def record_sleep(seconds):
+        gateway.actions.append(f"sleep:{seconds}")
+
+    monkeypatch.setattr(browser_gateway_module.time, "sleep", record_sleep)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    next_click_index = gateway.actions.index("codex-cover-picker:click-next")
+    assert "sleep:3.0" in gateway.actions[:next_click_index]
+    wait_index = gateway.actions.index("sleep:3.0")
+    assert gateway.actions[:wait_index].count("codex-cover-picker:selection-state") >= 2
+
+
+def test_cover_picker_clicks_complete_when_next_does_not_apply_cover(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway(cover_applied_after_next=False)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    assert gateway.actions[:9] == [
+        "trigger:cover",
+        "codex-cover-picker:from-article-entry",
+        "codex-cover-picker:snapshot",
+        "codex-cover-picker:select-image",
+        "cdp:mouse-click",
+        "codex-cover-picker:selection-state",
+        "codex-cover-picker:selection-state",
+        "codex-cover-picker:edit-cover-dialog-state",
+        "codex-cover-picker:click-next",
+    ]
+    assert "codex-cover-picker:click-complete" in gateway.actions
+    first_cover_check = gateway.actions.index("codex-cover-picker:cover-applied")
+    complete_click = gateway.actions.index("codex-cover-picker:click-complete")
+    assert first_cover_check < complete_click
+    assert gateway.actions[-1] == "codex-cover-picker:cover-applied"
+
+
+def test_cover_picker_confirms_the_edit_cover_dialog_before_verifying_cover(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway(edit_cover_dialog_open=True)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    assert gateway.edit_cover_confirm_clicked is True
+    assert "codex-cover-picker:click-edit-cover-confirm" in gateway.actions
+    trace_events = [event for event, _ in gateway.traces]
+    assert "upload.cover_picker.edit_cover_confirm_dispatched" in trace_events
+
+
+def test_cover_picker_traces_article_editor_return_after_edit_cover_confirm(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway(edit_cover_dialog_open=True)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    trace_events = [event for event, _ in gateway.traces]
+    assert (
+        trace_events.index("upload.cover_picker.edit_cover_dialog_closed")
+        < trace_events.index("upload.cover_picker.returned_to_editor_after_edit_cover_confirm")
+        < trace_events.index("upload.cover_picker.cover_applied_after_edit_cover_confirm")
+    )
+    return_events = [
+        fields
+        for event, fields in gateway.traces
+        if event == "upload.cover_picker.returned_to_editor_after_edit_cover_confirm"
+    ]
+    assert return_events[-1]["result"]["editorReady"] is True
+    assert return_events[-1]["result"]["editCoverDialogOpen"] is False
+    assert return_events[-1]["result"]["publishButtonVisible"] is True
+
+
+def test_cover_picker_does_not_click_complete_after_edit_cover_confirm_when_cover_unverified(
+    tmp_path: Path,
+):
+    gateway = EditCoverUnverifiedGateway()
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    assert gateway.edit_cover_confirm_clicked is True
+    assert "codex-cover-picker:click-complete" not in gateway.actions
+
+
+def test_cover_picker_skips_next_when_edit_cover_dialog_is_already_open(
+    tmp_path: Path,
+    monkeypatch,
+):
+    gateway = StepwiseCoverPickerGateway(
+        edit_cover_dialog_open=True,
+        next_button_missing_when_edit_cover_open=True,
+    )
+
+    monkeypatch.setattr(browser_gateway_module.time, "sleep", lambda seconds: None)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    assert "codex-cover-picker:click-next" not in gateway.actions
+    assert gateway.edit_cover_confirm_clicked is True
+    trace_events = [event for event, _ in gateway.traces]
+    assert "upload.cover_picker.next_already_on_edit_cover" in trace_events
+
+
+def test_cover_picker_waits_two_seconds_before_edit_cover_confirm(
+    tmp_path: Path,
+    monkeypatch,
+):
+    gateway = StepwiseCoverPickerGateway(edit_cover_dialog_open=True)
+
+    def record_sleep(seconds):
+        gateway.actions.append(f"sleep:{seconds}")
+
+    monkeypatch.setattr(browser_gateway_module.time, "sleep", record_sleep)
+
+    gateway._set_cover_from_article_image_picker(
+        browser_session(tmp_path),
+        str(tmp_path / "cover.jpg"),
+    )
+
+    confirm_index = gateway.actions.index("codex-cover-picker:click-edit-cover-confirm")
+    assert "sleep:2.0" in gateway.actions[:confirm_index]
+    trace_events = [event for event, _ in gateway.traces]
+    assert "upload.cover_picker.wait_before_edit_cover_confirm" in trace_events
+
+
+def test_edit_cover_confirm_expression_is_scoped_to_the_wechat_edit_cover_dialog():
+    expression = ChromeCDPBrowserGateway._edit_cover_confirm_expression()
+
+    assert ".weui-desktop-dialog__wrp" in expression
+    assert "编辑封面" in expression
+    assert "weui-desktop-btn_primary" in expression
+    assert "buttonText === '确认'" in expression
+
+
+def test_cover_picker_traces_failed_step_when_cdp_times_out(tmp_path: Path):
+    gateway = StepwiseCoverPickerGateway(
+        fail_marker="codex-cover-picker:snapshot"
+    )
+
+    with pytest.raises(WeChatPublishingError, match="wait_image_candidates"):
+        gateway._set_cover_from_article_image_picker(
+            browser_session(tmp_path),
+            str(tmp_path / "cover.jpg"),
+        )
+
+    failure_events = [
+        fields
+        for event, fields in gateway.traces
+        if event == "upload.cover_picker_from_article_image.failed"
+    ]
+    assert failure_events
+    assert failure_events[-1]["stage"] == "wait_image_candidates"
+    assert "timed out" in failure_events[-1]["error"]
+
+
+def test_cover_picker_candidates_ignore_dialog_container_nodes():
+    source = ChromeCDPBrowserGateway._cover_picker_common_source()
+
+    assert "'.appmsg_conent_img_container'," not in source
+    assert "'.appmsg_content_img_container'," not in source
+    assert "candidate.matches('img')" in source
+    assert "candidate.querySelector?.('img, [style*=\"background-image\"]')" not in source
+
+
+def test_cover_picker_uses_wechat_card_selected_state_for_confirmation():
+    source = ChromeCDPBrowserGateway._cover_picker_common_source()
+    expression = ChromeCDPBrowserGateway._cover_picker_select_image_expression(0)
+
+    assert "li.appmsg_conent_img_item" in source
+    assert "classList.contains('selected')" in source
+    assert "clickableRect" in expression
+
+
+def test_cover_picker_button_expression_reports_visible_button_diagnostics():
+    expression = ChromeCDPBrowserGateway._cover_picker_click_button_expression(
+        ("下一步",),
+        "codex-cover-picker:click-next",
+    )
+
+    assert "availableButtons" in expression
+    assert "disabled" in expression
+    assert "ariaDisabled" in expression
+    assert "buttonClass" in expression
+
+
+def test_cover_picker_from_article_entry_does_not_click_page_containers():
+    expression = ChromeCDPBrowserGateway._cover_picker_from_article_entry_expression()
+
+    assert "querySelectorAll('button, a, [role=\"button\"], li, label, span, div')" not in expression
+    assert "text.length <= 24" in expression
+    assert "text === '从正文选择'" in expression
+
+
+def test_cover_picker_from_article_entry_returns_rect_and_diagnostics():
+    expression = ChromeCDPBrowserGateway._cover_picker_from_article_entry_expression()
+
+    assert "entryCandidates" in expression
+    assert "menuRootCount" in expression
+    assert "visibleMenuTexts" in expression
+    assert "rect:" in expression
+    assert "clickableRect" in expression
+    assert "source: 'precise-menu-item'" in expression
+
+
+def test_cover_picker_from_article_entry_prefers_wechat_cover_menu_selector():
+    expression = ChromeCDPBrowserGateway._cover_picker_from_article_entry_expression()
+
+    assert ".pop-opr__group-select-cover .js_selectCoverFromContent" in expression
+    assert "directWechatEntries" in expression
+    assert "source: 'wechat-cover-menu'" in expression
+
+
+def test_cover_upload_trigger_reports_the_selected_target():
+    expression = ChromeCDPBrowserGateway._upload_trigger_expression("cover")
+
+    assert "selectedSelector" in expression
+    assert "selectedText" in expression
+    assert "selectedClassName" in expression
+    assert "triggerCandidates" in expression
 
 
 class RemoteImageGateway(ChromeCDPBrowserGateway):
@@ -1101,6 +2433,7 @@ class FakeProcess:
         self.wait_calls = 0
         self.terminate_calls = 0
         self.kill_calls = 0
+        self.stderr = None
 
     def poll(self):
         return None if self.running else 0
@@ -1119,6 +2452,14 @@ class FakeProcess:
         self.running = False
 
 
+class ExitedProcess(FakeProcess):
+    def __init__(self, stderr_text: str):
+        super().__init__()
+        self.running = False
+        self.stderr = Mock()
+        self.stderr.read.return_value = stderr_text
+
+
 class ClosingGateway(ChromeCDPBrowserGateway):
     def _cdp_call(self, session, method, params=None):
         raise OSError("closed")
@@ -1133,6 +2474,13 @@ def test_browser_close_waits_for_child_exit_after_cdp_failure(tmp_path: Path):
 
     assert process.terminate_calls == 1
     assert process.wait_calls == 1
+
+
+def test_wait_for_target_includes_chrome_stderr_when_process_exits():
+    process = ExitedProcess("profile is locked")
+
+    with pytest.raises(WeChatPublishingError, match="profile is locked"):
+        ChromeCDPBrowserGateway(startup_timeout=0.01)._wait_for_target(9222, process)
 
 
 def test_open_profile_cleans_process_when_navigation_fails(monkeypatch, tmp_path: Path):

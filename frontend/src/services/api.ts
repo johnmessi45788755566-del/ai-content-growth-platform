@@ -97,6 +97,14 @@ export const api = {
       body: JSON.stringify({ selected_asset_ids }),
     });
   },
+  deleteMedia(id: number, assetId: number) {
+    return request<{ deleted: boolean; project: ContentProject; assets: MediaAsset[] }>(
+      `/api/content-projects/${id}/media-assets/${assetId}`,
+      {
+        method: 'DELETE',
+      },
+    );
+  },
   saveLayout(id: number, blocks: LayoutBlock[]) {
     return request<{ project: ContentProject; layout_blocks: LayoutBlock[] }>(`/api/content-projects/${id}/layout`, {
       method: 'PATCH',
@@ -194,5 +202,8 @@ export const api = {
   },
   retryTasks(task_ids: number[]) {
     return request('/api/tasks/retry', { method: 'POST', body: JSON.stringify({ task_ids }) });
+  },
+  syncTaskDraft(id: number) {
+    return request<ScheduledTask>(`/api/tasks/${id}/sync-draft`, { method: 'POST' });
   },
 };

@@ -13,6 +13,7 @@ function formatNumber(value?: number) {
 export default function Analytics() {
   const [accountRows, setAccountRows] = useState<AccountAnalyticsRow[]>([]);
   const [workRows, setWorkRows] = useState<WorkAnalyticsRow[]>([]);
+  const [activeTab, setActiveTab] = useState<'account' | 'work'>('account');
   const [platform, setPlatform] = useState('');
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(false);
@@ -59,11 +60,11 @@ export default function Analytics() {
     <>
       <div className="toolbar">
         <Tabs
-          defaultActiveKey="account"
+          activeKey={activeTab}
+          onChange={(key) => setActiveTab(key as 'account' | 'work')}
           items={[
-            { key: 'account', label: '账号分析' },
-            { key: 'work', label: '作品分析' },
-            { key: 'rule', label: 'AI 规则变更' },
+            { key: 'account', label: '账号数据' },
+            { key: 'work', label: '作品数据' },
           ]}
         />
         <Space wrap>
@@ -72,50 +73,55 @@ export default function Analytics() {
           <Input.Search placeholder="搜索账号或作品" value={search} onChange={(event) => setSearch(event.target.value)} onSearch={loadAnalytics} />
         </Space>
       </div>
-      <MetricCards items={summary} />
-      <Card className="panel">
-        <Table
-          loading={loading}
-          rowKey="account_id"
-          pagination={false}
-          locale={{ emptyText: <Empty description="暂无账号数据，请先在账号矩阵添加并同步账号" /> }}
-          dataSource={accountRows}
-          columns={[
-            { title: '账号', dataIndex: 'account_name' },
-            { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
-            { title: '粉丝数', render: (_, row) => formatNumber(row.fans) },
-            { title: '阅读 / 播放', render: (_, row) => formatNumber(row.reads) },
-            { title: '推荐数', render: (_, row) => formatNumber(row.recommends) },
-            { title: '点赞', render: (_, row) => formatNumber(row.likes) },
-            { title: '评论', render: (_, row) => formatNumber(row.comments) },
-            { title: '转发', render: (_, row) => formatNumber(row.shares) },
-            { title: '收藏', render: (_, row) => formatNumber(row.favorites) },
-            { title: '更新时间', render: (_, row) => row.last_sync_at || '-' },
-          ]}
-        />
-      </Card>
-      <Card className="panel block-gap" title="作品分析">
-        <Table
-          loading={loading}
-          rowKey="work_id"
-          pagination={false}
-          locale={{ emptyText: <Empty description="暂无作品数据，请先同步账号数据" /> }}
-          dataSource={workRows}
-          columns={[
-            { title: '作品标题', dataIndex: 'title' },
-            { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
-            { title: '账号', dataIndex: 'account_name' },
-            { title: '类型', dataIndex: 'content_type' },
-            { title: '阅读 / 播放', render: (_, row) => formatNumber(row.reads) },
-            { title: '推荐数', render: (_, row) => formatNumber(row.recommends) },
-            { title: '点赞', render: (_, row) => formatNumber(row.likes) },
-            { title: '评论', render: (_, row) => formatNumber(row.comments) },
-            { title: '转发', render: (_, row) => formatNumber(row.shares) },
-            { title: '收藏', render: (_, row) => formatNumber(row.favorites) },
-            { title: '状态', render: (_, row) => <Status value={row.status} /> },
-          ]}
-        />
-      </Card>
+      {activeTab === 'account' ? (
+        <>
+          <MetricCards items={summary} />
+          <Card className="panel">
+            <Table
+              loading={loading}
+              rowKey="account_id"
+              pagination={false}
+              locale={{ emptyText: <Empty description="暂无账号数据，请先在账号矩阵添加并同步账号" /> }}
+              dataSource={accountRows}
+              columns={[
+                { title: '账号', dataIndex: 'account_name' },
+                { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
+                { title: '粉丝数', render: (_, row) => formatNumber(row.fans) },
+                { title: '阅读 / 播放', render: (_, row) => formatNumber(row.reads) },
+                { title: '推荐数', render: (_, row) => formatNumber(row.recommends) },
+                { title: '点赞', render: (_, row) => formatNumber(row.likes) },
+                { title: '评论', render: (_, row) => formatNumber(row.comments) },
+                { title: '转发', render: (_, row) => formatNumber(row.shares) },
+                { title: '收藏', render: (_, row) => formatNumber(row.favorites) },
+                { title: '更新时间', render: (_, row) => row.last_sync_at || '-' },
+              ]}
+            />
+          </Card>
+        </>
+      ) : (
+        <Card className="panel" title="作品数据">
+          <Table
+            loading={loading}
+            rowKey="work_id"
+            pagination={false}
+            locale={{ emptyText: <Empty description="暂无作品数据，请先同步账号数据" /> }}
+            dataSource={workRows}
+            columns={[
+              { title: '作品标题', dataIndex: 'title' },
+              { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
+              { title: '账号', dataIndex: 'account_name' },
+              { title: '类型', dataIndex: 'content_type' },
+              { title: '阅读 / 播放', render: (_, row) => formatNumber(row.reads) },
+              { title: '推荐数', render: (_, row) => formatNumber(row.recommends) },
+              { title: '点赞', render: (_, row) => formatNumber(row.likes) },
+              { title: '评论', render: (_, row) => formatNumber(row.comments) },
+              { title: '转发', render: (_, row) => formatNumber(row.shares) },
+              { title: '收藏', render: (_, row) => formatNumber(row.favorites) },
+              { title: '状态', render: (_, row) => <Status value={row.status} /> },
+            ]}
+          />
+        </Card>
+      )}
     </>
   );
 }

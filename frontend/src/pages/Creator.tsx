@@ -1,5 +1,6 @@
-import { Alert, Button, Card, Col, Empty, Form, Image, Input, Modal, Row, Select, Space, Spin, Steps, message } from 'antd';
+import { Alert, Button, Card, Col, Empty, Form, Image, Input, Modal, Popconfirm, Row, Select, Space, Spin, Steps, message } from 'antd';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { api, assetUrl } from '@/services/api';
 import type { ArticleBlock, ContentProject, CreatorStep, LayoutBlock, MediaAsset, PlatformAccount, PublishAction, PublishJob, TopicDirection } from '@/types';
 
@@ -15,6 +16,68 @@ function frontendStage(stage = 'title'): CreatorStep {
 
 function isIntroBlock(block: ArticleBlock, index: number) {
   return index === 0 || block.block_type === 'intro' || block.type === 'intro' || block.label === '引言';
+}
+
+const markdownAssetPattern = /!\[[^\]]*]\(asset:(\d+)\)/g;
+const markdownImagePattern = /!\[([^\]]*)]\(([^)]+)\)/g;
+
+function markdownBlockContent(blocks: LayoutBlock[]) {
+  return blocks.find((block) => block.section_type === 'markdown')?.content || '';
+}
+
+function extractMarkdownTitle(markdown: string, fallback: string) {
+  const titleLine = markdown.split('\n').find((line) => line.trim().startsWith('# '));
+  return titleLine?.trim().slice(2).trim() || fallback;
+}
+
+function markdownImageTag(asset: MediaAsset, label: string) {
+  return `![${label}](asset:${asset.id})`;
+}
+
+function selectedCoverFromAssets(assets: MediaAsset[]) {
+  return assets.find((asset) => asset.asset_type === 'cover' && Number(asset.selected) === 1);
+}
+
+function inlineAssetsForLayout(assets: MediaAsset[]) {
+  const inline = assets.filter((asset) => asset.asset_type === 'inline');
+  const selected = inline.filter((asset) => Number(asset.selected) === 1);
+  return selected.length ? selected : inline;
+}
+
+function buildDefaultLayoutMarkdown(title: string, blocks: ArticleBlock[], assets: MediaAsset[]) {
+  const parts: string[] = [];
+  const cover = selectedCoverFromAssets(assets);
+  const inline = inlineAssetsForLayout(assets);
+  let bodyIndex = 0;
+
+  if (title.trim()) parts.push(`# ${title.trim()}`);
+  if (cover) parts.push(markdownImageTag(cover, '封面图'));
+
+  blocks.forEach((block, index) => {
+    const content = block.content.trim();
+    if (!content) return;
+    if (isIntroBlock(block, index)) {
+      parts.push(`> ${content}`);
+      return;
+    }
+    parts.push(content);
+    const image = inline[bodyIndex];
+    if (image) parts.push(markdownImageTag(image, `正文配图 ${bodyIndex + 1}`));
+    bodyIndex += 1;
+  });
+
+  return parts.join('\n\n');
+}
+
+function removeAssetFromMarkdown(markdown: string, assetId: number) {
+  const pattern = new RegExp(`!\\[[^\\]]*\\]\\(asset:${assetId}\\)`, 'g');
+  return markdown
+    .split('\n')
+    .map((line) => line.replace(pattern, '').trimEnd())
+    .filter((line, index, lines) => line.trim() || lines[index - 1]?.trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 const publishTerminalStatuses = ['platform_draft', 'published', 'awaiting_confirmation', 'failed'];
@@ -55,7 +118,8 @@ export default function Creator() {
   const [articleBlocks, setArticleBlocks] = useState<ArticleBlock[]>([]);
   const [mediaAssets, setMediaAssets] = useState<MediaAsset[]>([]);
   const [layoutBlocks, setLayoutBlocks] = useState<LayoutBlock[]>([]);
-  const [layoutImageSelections, setLayoutImageSelections] = useState<Record<number, number | undefined>>({});
+  const [layoutMarkdown, setLayoutMarkdown] = useState('');
+  const [layoutImageSelections, setLayoutImageSelections] = useState<Record<number, number | null | undefined>>({});
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishAccounts, setPublishAccounts] = useState<PlatformAccount[]>([]);
   const [publishAccountsLoading, setPublishAccountsLoading] = useState(false);
@@ -71,6 +135,8 @@ export default function Creator() {
   const publishAccountsProjectIdRef = useRef<number | null>(null);
   const publishRequestGenerationRef = useRef(0);
   const publishAccountsRequestGenerationRef = useRef(0);
+  const layoutEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const layoutImageUploadRef = useRef<HTMLInputElement | null>(null);
   const currentPublishJob = publishJob?.project_id === projectId ? publishJob : null;
   const currentPublishJobActive = Boolean(
     currentPublishJob && !publishTerminalStatuses.includes(currentPublishJob.status),
@@ -124,7 +190,8 @@ export default function Creator() {
 
   function applyProject(project?: ContentProject) {
     if (!project) return;
-    if (activeProjectIdRef.current !== project.id) {
+    const projectChanged = activeProjectIdRef.current !== project.id;
+    if (projectChanged) {
       activeProjectIdRef.current = project.id;
       publishModalProjectIdRef.current = null;
       publishAccountsProjectIdRef.current = null;
@@ -133,13 +200,25 @@ export default function Creator() {
       setPublishAccounts([]);
       setPublishJob(null);
       setPublishPollingError('');
+      setLayoutMarkdown('');
     }
+    const nextArticleBlocks = project.article_blocks || [];
+    const nextMediaAssets = project.media_assets || [];
+    const nextLayoutBlocks = project.layout_blocks || [];
     setProjectId(project.id);
     setSelectedTitle(project.title || '');
     setTitleDirection(project.title_direction || '');
-    setArticleBlocks(project.article_blocks || []);
-    setMediaAssets(project.media_assets || []);
-    setLayoutBlocks(project.layout_blocks || []);
+    setArticleBlocks(nextArticleBlocks);
+    setMediaAssets(nextMediaAssets);
+    setLayoutBlocks(nextLayoutBlocks);
+    const savedMarkdown = markdownBlockContent(nextLayoutBlocks);
+    if (savedMarkdown) {
+      setLayoutMarkdown(savedMarkdown);
+    } else if (frontendStage(project.current_stage || '') === 'layout') {
+      setLayoutMarkdown(buildDefaultLayoutMarkdown(project.title || '', nextArticleBlocks, nextMediaAssets));
+    } else if (projectChanged) {
+      setLayoutMarkdown('');
+    }
     if (project.current_stage) setStep(frontendStage(project.current_stage));
   }
 
@@ -293,18 +372,163 @@ export default function Creator() {
     }
   }
 
+  async function deleteImage(asset: MediaAsset) {
+    if (!projectId) return;
+    try {
+      const data = await api.deleteMedia(projectId, asset.id);
+      applyProject(data.project);
+      setMediaAssets(data.assets || []);
+      setLayoutBlocks(data.project.layout_blocks || []);
+      setLayoutMarkdown((prev) => removeAssetFromMarkdown(prev, asset.id));
+      setLayoutImageSelections((prev) => {
+        const next = { ...prev };
+        Object.entries(next).forEach(([key, value]) => {
+          if (value === asset.id) delete next[Number(key)];
+        });
+        return next;
+      });
+      message.success('图片已删除');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除图片失败');
+    }
+  }
+
   const selectedCover = useMemo(
-    () => mediaAssets.filter((asset) => asset.asset_type === 'cover' && Number(asset.selected) === 1)[0] || mediaAssets.filter((asset) => asset.asset_type === 'cover').at(-1),
+    () => selectedCoverFromAssets(mediaAssets),
     [mediaAssets],
   );
 
   const inlineAssets = useMemo(() => mediaAssets.filter((asset) => asset.asset_type === 'inline'), [mediaAssets]);
 
   function layoutImageForBlock(index: number, bodyIndex: number) {
-    const configured = layoutImageSelections[index];
-    if (configured !== undefined) return inlineAssets.find((asset) => asset.id === configured);
+    if (Object.prototype.hasOwnProperty.call(layoutImageSelections, index)) {
+      const configured = layoutImageSelections[index];
+      return configured ? inlineAssets.find((asset) => asset.id === configured) : undefined;
+    }
     const selected = inlineAssets.filter((asset) => Number(asset.selected) === 1);
     return selected[bodyIndex] || inlineAssets[bodyIndex];
+  }
+
+  async function clearCoverFromLayout() {
+    if (!projectId) return;
+    const selectedInlineIds = mediaAssets
+      .filter((asset) => asset.asset_type === 'inline' && Number(asset.selected) === 1)
+      .map((asset) => asset.id);
+    try {
+      const data = await api.selectMedia(projectId, selectedInlineIds);
+      applyProject(data.project);
+      setMediaAssets(data.assets || []);
+      message.success('已不显示封面图');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '移除封面图失败');
+    }
+  }
+
+  function clearParagraphImage(index: number) {
+    setLayoutImageSelections((prev) => ({ ...prev, [index]: null }));
+  }
+
+  function defaultLayoutMarkdown() {
+    return buildDefaultLayoutMarkdown(selectedTitle, articleBlocks, mediaAssets);
+  }
+
+  function ensureLayoutMarkdown() {
+    const savedMarkdown = markdownBlockContent(layoutBlocks);
+    const nextMarkdown = layoutMarkdown.trim() || savedMarkdown || defaultLayoutMarkdown();
+    setLayoutMarkdown(nextMarkdown);
+    return nextMarkdown;
+  }
+
+  async function enterLayoutStep() {
+    ensureLayoutMarkdown();
+    await goStep('layout');
+  }
+
+  async function handleStepChange(index: number) {
+    const nextStep = ['title', 'article', 'image', 'layout'][index] as CreatorStep;
+    if (nextStep === 'layout') ensureLayoutMarkdown();
+    await goStep(nextStep);
+  }
+
+  function insertMarkdown(before: string, after = '', fallback = '') {
+    const editor = layoutEditorRef.current;
+    if (!editor) {
+      setLayoutMarkdown((prev) => `${prev}${prev ? '\n\n' : ''}${before}${fallback}${after}`);
+      return;
+    }
+    const start = editor.selectionStart ?? layoutMarkdown.length;
+    const end = editor.selectionEnd ?? layoutMarkdown.length;
+    const selectedText = layoutMarkdown.slice(start, end) || fallback;
+    const next = `${layoutMarkdown.slice(0, start)}${before}${selectedText}${after}${layoutMarkdown.slice(end)}`;
+    setLayoutMarkdown(next);
+    window.requestAnimationFrame(() => {
+      editor.focus();
+      const cursor = start + before.length + selectedText.length;
+      editor.setSelectionRange(cursor, cursor);
+    });
+  }
+
+  function insertMarkdownLine(prefix: string, fallback: string) {
+    const editor = layoutEditorRef.current;
+    const start = editor?.selectionStart ?? layoutMarkdown.length;
+    const lineStart = layoutMarkdown.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+    const next = `${layoutMarkdown.slice(0, lineStart)}${prefix}${layoutMarkdown.slice(lineStart) || fallback}`;
+    setLayoutMarkdown(next);
+    window.requestAnimationFrame(() => {
+      editor?.focus();
+      editor?.setSelectionRange(lineStart + prefix.length, lineStart + prefix.length);
+    });
+  }
+
+  function insertMarkdownList(type: 'ul' | 'ol') {
+    const editor = layoutEditorRef.current;
+    const start = editor?.selectionStart ?? layoutMarkdown.length;
+    const end = editor?.selectionEnd ?? layoutMarkdown.length;
+    const selectedText = layoutMarkdown.slice(start, end).trim();
+    const lines = selectedText ? selectedText.split('\n') : ['列表项'];
+    const nextText = lines
+      .map((line, index) => `${type === 'ol' ? `${index + 1}. ` : '- '}${line.replace(/^([-*]|\d+\.)\s+/, '')}`)
+      .join('\n');
+    const next = `${layoutMarkdown.slice(0, start)}${nextText}${layoutMarkdown.slice(end)}`;
+    setLayoutMarkdown(next);
+    window.requestAnimationFrame(() => {
+      editor?.focus();
+      editor?.setSelectionRange(start + nextText.length, start + nextText.length);
+    });
+  }
+
+  function insertMarkdownTable() {
+    insertMarkdown('\n\n| 项目 | 内容 |\n| --- | --- |\n| 示例 | 说明 |\n\n');
+  }
+
+  function insertMarkdownLink() {
+    insertMarkdown('[', '](https://)', '链接文字');
+  }
+
+  function insertMarkdownCodeBlock() {
+    insertMarkdown('\n\n```\n', '\n```\n\n', '代码内容');
+  }
+
+  function insertMarkdownImage(assetId: number) {
+    const asset = mediaAssets.find((item) => item.id === assetId);
+    if (!asset) return;
+    const label = asset.asset_type === 'cover' ? '封面图' : `正文配图 ${inlineAssets.findIndex((item) => item.id === asset.id) + 1 || ''}`.trim();
+    insertMarkdown('', '', markdownImageTag(asset, label));
+  }
+
+  function insertLayoutImageDataUrl(dataUrl: string, label = '图片') {
+    insertMarkdown('', '', `![${label}](${dataUrl})`);
+  }
+
+  function handleLayoutImageFile(file?: File | null) {
+    if (!file || !file.type.startsWith('image/')) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = String(reader.result || '');
+      if (!dataUrl) return;
+      insertLayoutImageDataUrl(dataUrl, file.name.replace(/\.[^.]+$/, '') || '图片');
+    };
+    reader.readAsDataURL(file);
   }
 
   async function saveLayout() {
@@ -312,20 +536,15 @@ export default function Creator() {
       message.warning('请先完成内容创作');
       return;
     }
+    const markdown = layoutMarkdown.trim() || defaultLayoutMarkdown();
+    const nextTitle = extractMarkdownTitle(markdown, selectedTitle);
     const blocks: LayoutBlock[] = [
-      { section_type: 'title', content: selectedTitle, media_asset_id: selectedCover?.id || null, sort_order: 1 },
-      ...articleBlocks.map((block, index) => {
-        const bodyIndex = articleBlocks.slice(0, index).filter((item, itemIndex) => !isIntroBlock(item, itemIndex)).length;
-        const isIntro = isIntroBlock(block, index);
-        return {
-          section_type: isIntro ? 'intro' : 'body',
-          content: block.content,
-          media_asset_id: isIntro ? null : layoutImageForBlock(index, bodyIndex)?.id || null,
-          sort_order: index + 2,
-        };
-      }),
+      { section_type: 'title', content: nextTitle, media_asset_id: selectedCover?.id || null, sort_order: 1 },
+      { section_type: 'markdown', content: markdown, media_asset_id: null, sort_order: 2 },
     ];
     const data = await api.saveLayout(projectId, blocks);
+    setSelectedTitle(nextTitle);
+    setLayoutMarkdown(markdown);
     applyProject(data.project);
     setLayoutBlocks(data.layout_blocks || []);
   }
@@ -513,29 +732,6 @@ export default function Creator() {
     }
   }
 
-  async function resumePublishJob() {
-    if (!currentPublishJob) return;
-    const targetProjectId = currentPublishJob.project_id;
-    const request = beginPublishRequest(targetProjectId);
-    setPublishingAction('publish');
-    try {
-      const job = await api.resumePublishJob(currentPublishJob.id);
-      if (!acceptPublishJob(job, request)) return;
-      await waitForPublishJob(
-        job,
-        () => isPublishRequestCurrent(request),
-        (nextJob) => acceptPublishJob(nextJob, request),
-      );
-    } catch (error) {
-      if (!isPublishRequestCurrent(request)) return;
-      const text = error instanceof Error ? error.message : '继续发布失败';
-      setPublishPollingError(text);
-      message.error(text);
-    } finally {
-      if (isPublishRequestCurrent(request)) setPublishingAction('');
-    }
-  }
-
   async function refreshPublishJob() {
     if (!currentPublishJob) return;
     const request = beginPublishRequest(currentPublishJob.project_id);
@@ -574,7 +770,7 @@ export default function Creator() {
         className="creator-stepper"
         current={['title', 'article', 'image', 'layout'].indexOf(step)}
         items={['标题确认', '生成文章', '生成图片', '文章排版'].map((title) => ({ title }))}
-        onChange={(index) => goStep(['title', 'article', 'image', 'layout'][index] as CreatorStep)}
+        onChange={handleStepChange}
       />
       <div className="draft-tip">每一步都会实时自动保存到草稿箱，可从草稿恢复到对应步骤继续创作。</div>
       {step === 'title' && (
@@ -652,11 +848,11 @@ export default function Creator() {
       )}
       {step === 'image' && (
         <Card className="panel" title="图片生成" extra={<span className="muted">基于已确认标题和文章内容统一生成封面图和正文配图。</span>}>
-          <ImageGallery title="公众号封面图" type="cover" assets={mediaAssets} loading={imageLoadingType} onGenerate={generateImage} onSelect={selectImage} />
-          <ImageGallery title="正文配图" type="inline" assets={mediaAssets} loading={imageLoadingType} onGenerate={generateImage} onSelect={selectImage} />
+          <ImageGallery title="公众号封面图" type="cover" assets={mediaAssets} loading={imageLoadingType} onGenerate={generateImage} onSelect={selectImage} onDelete={deleteImage} />
+          <ImageGallery title="正文配图" type="inline" assets={mediaAssets} loading={imageLoadingType} onGenerate={generateImage} onSelect={selectImage} onDelete={deleteImage} />
           <Space className="block-gap" style={{ width: '100%' }}>
             <Button onClick={() => goStep('article')}>上一步</Button>
-            <Button type="primary" block onClick={() => goStep('layout')}>图片完成，进入文章排版</Button>
+            <Button type="primary" block onClick={enterLayoutStep}>图片完成，进入文章排版</Button>
           </Space>
         </Card>
       )}
@@ -664,39 +860,67 @@ export default function Creator() {
         <Row gutter={16} align="top">
           <Col xs={24} xl={10}>
             <Card className="panel" title="编辑排版">
-              <div className="layout-editor">
-                <LayoutSection title="标题+封面图">
-                  <Input value={selectedTitle} onChange={(event) => setSelectedTitle(event.target.value)} />
-                  <SelectedImage asset={selectedCover} label="封面图" />
-                </LayoutSection>
-                <LayoutSection title="引言">
-                  {articleBlocks.filter(isIntroBlock).map((block, index) => (
-                    <div className="layout-block" key={index}>
-                      <label>引言</label>
-                      <TextArea value={block.content} onChange={(event) => setArticleBlocks((prev) => prev.map((item, itemIndex) => isIntroBlock(item, itemIndex) ? { ...item, content: event.target.value } : item))} />
-                    </div>
-                  ))}
-                </LayoutSection>
-                <LayoutSection title="正文+配图">
-                  {articleBlocks.map((block, index) => ({ block, index })).filter(({ block, index }) => !isIntroBlock(block, index)).map(({ block, index }, bodyIndex) => (
-                    <div className="layout-block" key={index}>
-                      <label>正文 {bodyIndex + 1}</label>
-                      <TextArea value={block.content} onChange={(event) => setArticleBlocks((prev) => prev.map((item, itemIndex) => itemIndex === index ? { ...item, content: event.target.value } : item))} />
-                      <div className="paragraph-image-picker">
-                        <Button onClick={() => document.querySelector<HTMLElement>(`[data-layout-image="${index}"]`)?.focus()}>+ {layoutImageForBlock(index, bodyIndex) ? '更换图片' : '添加图片'}</Button>
-                        <Select
-                          data-layout-image={index}
-                          value={layoutImageForBlock(index, bodyIndex)?.id}
-                          allowClear
-                          placeholder="不插入图片"
-                          onChange={(value) => setLayoutImageSelections((prev) => ({ ...prev, [index]: value }))}
-                          options={inlineAssets.map((asset, assetIndex) => ({ value: asset.id, label: `正文配图 ${assetIndex + 1}` }))}
-                        />
-                        <SelectedImage asset={layoutImageForBlock(index, bodyIndex)} label="正文配图" />
-                      </div>
-                    </div>
-                  ))}
-                </LayoutSection>
+              <div className="markdown-layout-editor">
+                <div className="markdown-toolbar" aria-label="微信公众号 Markdown 排版工具栏">
+                  <div className="toolbar-group">
+                    <Button onClick={() => insertMarkdownLine('# ', '标题')}>H1</Button>
+                    <Button onClick={() => insertMarkdownLine('## ', '小标题')}>H2</Button>
+                    <Button onClick={() => insertMarkdownLine('### ', '三级标题')}>H3</Button>
+                  </div>
+                  <div className="toolbar-group">
+                    <Button onClick={() => insertMarkdown('**', '**', '加粗文字')}>B</Button>
+                    <Button onClick={() => insertMarkdown('*', '*', '斜体文字')}>I</Button>
+                    <Button onClick={() => insertMarkdown('~~', '~~', '删除线')}>S</Button>
+                    <Button onClick={() => insertMarkdown('==', '==', '高亮文字')}>高亮</Button>
+                  </div>
+                  <div className="toolbar-group">
+                    <Button onClick={() => insertMarkdownLine('> ', '引用内容')}>引用</Button>
+                    <Button onClick={() => insertMarkdownList('ul')}>列表</Button>
+                    <Button onClick={() => insertMarkdownList('ol')}>序号</Button>
+                    <Button onClick={insertMarkdownTable}>表格</Button>
+                  </div>
+                  <div className="toolbar-group">
+                    <Button onClick={insertMarkdownLink}>链接</Button>
+                    <Button onClick={insertMarkdownCodeBlock}>代码</Button>
+                    <Button onClick={() => insertMarkdown('\n\n---\n\n')}>分割线</Button>
+                    <Button onClick={() => layoutImageUploadRef.current?.click()}>上传图片</Button>
+                  </div>
+                </div>
+                <input
+                  ref={layoutImageUploadRef}
+                  type="file"
+                  accept="image/*"
+                  hidden
+                  onChange={(event) => {
+                    handleLayoutImageFile(event.target.files?.[0]);
+                    event.target.value = '';
+                  }}
+                />
+                <Select
+                  className="markdown-image-picker"
+                  placeholder="插入生成图片"
+                  value={undefined}
+                  onChange={insertMarkdownImage}
+                  options={mediaAssets.map((asset, index) => ({
+                    value: asset.id,
+                    label: `${asset.asset_type === 'cover' ? '封面图' : '正文配图'} ${index + 1}`,
+                  }))}
+                />
+                <textarea
+                  ref={layoutEditorRef}
+                  aria-label="Markdown 排版内容"
+                  className="markdown-textarea"
+                  value={layoutMarkdown}
+                  onChange={(event) => setLayoutMarkdown(event.target.value)}
+                  onPaste={(event) => {
+                    const imageFile = Array.from(event.clipboardData.files).find((file) => file.type.startsWith('image/'));
+                    if (imageFile) {
+                      event.preventDefault();
+                      handleLayoutImageFile(imageFile);
+                    }
+                  }}
+                  placeholder="# 输入文章标题&#10;&#10;> 输入引言&#10;&#10;输入正文，也可以插入图片。连续放多张图片可以在预览中一行展示，例如：&#10;![图1](asset:1) ![图2](asset:2) ![图3](asset:3)"
+                />
               </div>
               <Space className="block-gap" style={{ width: '100%' }}>
                 <Button onClick={() => goStep('image')}>上一步</Button>
@@ -706,20 +930,7 @@ export default function Creator() {
           </Col>
           <Col xs={24} xl={14}>
             <Card className="panel" title="排版预览">
-              <div className="wechat-preview">
-                {selectedCover ? <Image className="preview-cover-img" src={assetUrl(selectedCover.url)} alt="公众号封面图" /> : <Empty description="未选择封面图" />}
-                <h2>{selectedTitle || '未确认标题'}</h2>
-                {articleBlocks.map((block, index) => {
-                  const bodyIndex = articleBlocks.slice(0, index).filter((item, itemIndex) => !isIntroBlock(item, itemIndex)).length;
-                  const image = isIntroBlock(block, index) ? undefined : layoutImageForBlock(index, bodyIndex);
-                  return (
-                    <div key={index}>
-                      {isIntroBlock(block, index) ? <blockquote>{block.content}</blockquote> : <p>{block.content}</p>}
-                      {image && <Image className="preview-inline-img" src={assetUrl(image.url)} alt={`正文配图 ${bodyIndex + 1}`} />}
-                    </div>
-                  );
-                })}
-              </div>
+              <MarkdownPreview markdown={layoutMarkdown} assets={mediaAssets} fallbackTitle={selectedTitle} />
             </Card>
           </Col>
         </Row>
@@ -739,15 +950,14 @@ export default function Creator() {
               className="block-gap"
               showIcon
               type={currentPublishJob.status === 'failed' ? 'error' : currentPublishJob.status === 'awaiting_confirmation' ? 'warning' : ['platform_draft', 'published'].includes(currentPublishJob.status) ? 'success' : 'info'}
-              message={currentPublishJob.status === 'platform_draft' ? '平台草稿已创建' : currentPublishJob.status === 'published' ? '平台发布已完成' : currentPublishJob.status === 'awaiting_confirmation' ? '等待运营人员确认' : currentPublishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
+              message={currentPublishJob.status === 'platform_draft' ? '平台草稿已创建' : currentPublishJob.status === 'published' ? '平台发布已完成' : currentPublishJob.status === 'awaiting_confirmation' ? '平台要求二次安全确认' : currentPublishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
               description={(
                 <Space direction="vertical" size={4}>
                   <span>发布任务 ID：{currentPublishJob.id}</span>
                   {currentPublishJob.status === 'platform_draft' && <span>平台草稿 ID：{currentPublishJob.platform_draft_id || '-'}</span>}
                   {currentPublishJob.status === 'published' && <span>平台发布 ID：{currentPublishJob.platform_publish_id || '-'}</span>}
                   {currentPublishJob.platform_url && <a href={currentPublishJob.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
-                  {currentPublishJob.status === 'awaiting_confirmation' && <span>请由运营人员使用微信扫描平台弹出的确认二维码，完成后点击继续确认发布。</span>}
-                  {currentPublishJob.status === 'awaiting_confirmation' && <Button type="primary" loading={publishingAction === 'publish'} disabled={publishAccountsLoading} onClick={resumePublishJob}>继续确认发布</Button>}
+                  {currentPublishJob.status === 'awaiting_confirmation' && <span>当前版本不会发起二次扫码，请重新发布或同步到平台草稿箱后在平台后台处理。</span>}
                   {currentPublishJob.status === 'failed' && <span>失败阶段：{currentPublishJob.failure_stage || '-'}<br />失败原因：{currentPublishJob.failure_reason || '-'}</span>}
                   {currentPublishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} disabled={publishAccountsLoading} onClick={retryPublishJob}>重试</Button>}
                 </Space>
@@ -806,6 +1016,7 @@ function ImageGallery({
   loading,
   onGenerate,
   onSelect,
+  onDelete,
 }: {
   title: string;
   type: 'cover' | 'inline';
@@ -813,6 +1024,7 @@ function ImageGallery({
   loading: string;
   onGenerate: (type: 'cover' | 'inline') => void;
   onSelect: (asset: MediaAsset) => void;
+  onDelete: (asset: MediaAsset) => void;
 }) {
   const typed = assets.filter((asset) => asset.asset_type === type);
   const isLoading = loading === type || loading === 'all';
@@ -827,6 +1039,24 @@ function ImageGallery({
           {typed.map((asset, index) => (
             <div className={`image-option ${Number(asset.selected) === 1 ? 'active' : ''}`} key={asset.id}>
               <Image src={assetUrl(asset.url)} alt={`${title} ${index + 1}`} />
+              <Popconfirm
+                title="删除这张图片？"
+                okText="删除"
+                cancelText="取消"
+                onConfirm={(event) => {
+                  event?.stopPropagation();
+                  onDelete(asset);
+                }}
+              >
+                <Button
+                  aria-label="删除图片"
+                  className="image-delete-icon"
+                  type="text"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  ×
+                </Button>
+              </Popconfirm>
               <Button className="image-select-button" onClick={() => onSelect(asset)}>
                 {Number(asset.selected) === 1 ? '已选择' : '选择'}
               </Button>
@@ -841,21 +1071,124 @@ function ImageGallery({
   );
 }
 
-function LayoutSection({ title, children }: { title: string; children: React.ReactNode }) {
+function MarkdownPreview({
+  markdown,
+  assets,
+  fallbackTitle,
+}: {
+  markdown: string;
+  assets: MediaAsset[];
+  fallbackTitle: string;
+}) {
+  const assetsById = new Map(assets.map((asset) => [asset.id, asset]));
+  const lines = markdown.trim() ? markdown.split('\n') : [`# ${fallbackTitle || '未确认标题'}`];
+  const rendered = lines
+    .map((line, index) => renderMarkdownLine(line, index, assetsById))
+    .filter(Boolean);
+
+  if (!rendered.length) return <Empty description="暂无排版内容" />;
+  return <div className="wechat-preview markdown-preview">{rendered}</div>;
+}
+
+function renderMarkdownLine(line: string, index: number, assetsById: Map<number, MediaAsset>) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  const imageMatches = Array.from(trimmed.matchAll(markdownImagePattern));
+  const text = trimmed.replace(markdownImagePattern, '').trim();
+  const images = imageMatches
+    .map((match, matchIndex) => resolvePreviewImage(match[2], match[1], matchIndex, assetsById))
+    .filter((image): image is PreviewImage => Boolean(image));
+
+  const contentNode = renderMarkdownText(text, index);
   return (
-    <section className="layout-section">
-      <h3>{title}</h3>
-      {children}
-    </section>
+    <div className="markdown-preview-row" key={`${index}-${trimmed}`}>
+      {contentNode}
+      {images.length > 0 && (
+        <Image.PreviewGroup>
+          <div className={`markdown-image-grid image-count-${Math.min(images.length, 3)}`}>
+            {images.map((image) => (
+              <Image
+                className={image.type === 'cover' ? 'preview-cover-img' : 'preview-inline-img'}
+                src={image.src}
+                alt={image.alt}
+                key={image.key}
+              />
+            ))}
+          </div>
+        </Image.PreviewGroup>
+      )}
+    </div>
   );
 }
 
-function SelectedImage({ asset, label }: { asset?: MediaAsset; label: string }) {
-  if (!asset) return <div className="selected-image-row"><span>{`暂未选择${label}`}</span></div>;
-  return (
-    <div className="selected-image-row">
-      <Image src={assetUrl(asset.url)} alt={label} />
-      <span>已选择{label}</span>
-    </div>
-  );
+type PreviewImage = {
+  key: string;
+  src: string;
+  alt: string;
+  type: 'cover' | 'inline';
+};
+
+function resolvePreviewImage(
+  rawSrc: string,
+  alt: string,
+  index: number,
+  assetsById: Map<number, MediaAsset>,
+): PreviewImage | null {
+  const src = rawSrc.trim();
+  const assetMatch = /^asset:(\d+)$/.exec(src);
+  if (assetMatch) {
+    const asset = assetsById.get(Number(assetMatch[1]));
+    if (!asset) return null;
+    return {
+      key: `asset-${asset.id}`,
+      src: assetUrl(asset.url),
+      alt: alt || (asset.asset_type === 'cover' ? '封面图' : '正文配图'),
+      type: asset.asset_type === 'cover' ? 'cover' : 'inline',
+    };
+  }
+  if (!src) return null;
+  return {
+    key: `${src}-${index}`,
+    src,
+    alt: alt || '图片',
+    type: 'inline',
+  };
+}
+
+function renderMarkdownText(text: string, index: number) {
+  if (!text) return null;
+  if (text.startsWith('# ')) return <h1>{renderInlineMarkdown(text.slice(2))}</h1>;
+  if (text.startsWith('## ')) return <h2>{renderInlineMarkdown(text.slice(3))}</h2>;
+  if (text.startsWith('### ')) return <h3>{renderInlineMarkdown(text.slice(4))}</h3>;
+  if (text.startsWith('>')) return <blockquote>{renderInlineMarkdown(text.slice(1).trim())}</blockquote>;
+  if (text === '---') return <hr />;
+  if (text.startsWith('|')) return <p className="markdown-table-line">{text}</p>;
+  if (text.startsWith('- ') || text.startsWith('* ')) return <p className="markdown-list-item">{renderInlineMarkdown(text.slice(2))}</p>;
+  if (/^\d+\.\s+/.test(text)) return <p className="markdown-list-item">{renderInlineMarkdown(text.replace(/^\d+\.\s+/, ''))}</p>;
+  return <p key={index}>{renderInlineMarkdown(text)}</p>;
+}
+
+function renderInlineMarkdown(text: string) {
+  const nodes: ReactNode[] = [];
+  const pattern = /(\*\*[^*]+\*\*|~~[^~]+~~|==[^=]+==|`[^`]+`|\[[^\]]+]\([^)]+\)|\*[^*]+\*)/g;
+  let cursor = 0;
+  Array.from(text.matchAll(pattern)).forEach((match, index) => {
+    if (match.index === undefined) return;
+    if (match.index > cursor) nodes.push(text.slice(cursor, match.index));
+    const token = match[0];
+    const content = token.replace(/^(\*\*|~~|==|`|\*|\[)/, '').replace(/(\*\*|~~|==|`|\*)$/, '');
+    if (token.startsWith('**')) nodes.push(<strong key={index}>{content}</strong>);
+    else if (token.startsWith('~~')) nodes.push(<del key={index}>{content}</del>);
+    else if (token.startsWith('==')) nodes.push(<mark key={index}>{content}</mark>);
+    else if (token.startsWith('`')) nodes.push(<code key={index}>{content}</code>);
+    else if (token.startsWith('*')) nodes.push(<em key={index}>{content}</em>);
+    else {
+      const linkMatch = /^\[([^\]]+)]\(([^)]+)\)$/.exec(token);
+      nodes.push(linkMatch ? <a href={linkMatch[2]} target="_blank" rel="noreferrer" key={index}>{linkMatch[1]}</a> : token);
+    }
+    cursor = match.index + token.length;
+  });
+  if (cursor < text.length) nodes.push(text.slice(cursor));
+  return nodes.length ? nodes : text;
 }

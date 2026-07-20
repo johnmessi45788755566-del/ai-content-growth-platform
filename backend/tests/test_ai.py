@@ -1,8 +1,9 @@
 from pathlib import Path
 
 import httpx
+import pytest
 
-from app.ai import OpenAICompatibleClient
+from app.ai import AIResponseError, OpenAICompatibleClient, _raise_for_status
 
 
 def test_doubao_image_generation_uses_ark_payload(monkeypatch, tmp_path: Path):
@@ -38,3 +39,14 @@ def test_doubao_image_generation_uses_ark_payload(monkeypatch, tmp_path: Path):
     }
     assert calls["get"]["url"] == "https://example.com/image.png"
     assert image.content == b"image-bytes"
+
+
+def test_doubao_overdue_error_is_explained_for_task_retry():
+    response = httpx.Response(
+        403,
+        json={"error": {"code": "AccountOverdueError", "message": "account overdue"}},
+        request=httpx.Request("POST", "https://ark.cn-beijing.volces.com/api/v3/images/generations"),
+    )
+
+    with pytest.raises(AIResponseError, match="图片模型账户欠费或余额不足"):
+        _raise_for_status(response, "图片模型调用失败")

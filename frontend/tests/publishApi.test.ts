@@ -61,4 +61,16 @@ describe('publish job API', () => {
       expect.any(Object),
     );
   });
+
+  it('syncs one failed scheduled task to a platform draft', async () => {
+    const fetch = vi.fn().mockResolvedValue(jsonResponse({ id: 18, status: '已生成平台草稿' }));
+    vi.stubGlobal('fetch', fetch);
+
+    await api.syncTaskDraft(18);
+
+    expect(fetch).toHaveBeenCalledWith(
+      `${API_BASE}/api/tasks/18/sync-draft`,
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
 });

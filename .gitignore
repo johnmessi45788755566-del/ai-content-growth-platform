@@ -22,5 +22,12 @@ __pycache__/
 
 # local data / uploads
 backend/data/*.db
+backend/data/browser_profiles/
+backend/logs/
 backend/uploads/
 .superpowers/
+
+# local database files
+*.db
+*.sqlite
+*.sqlite3

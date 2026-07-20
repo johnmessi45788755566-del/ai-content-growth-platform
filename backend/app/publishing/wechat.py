@@ -42,6 +42,16 @@ class WeChatBrowserPublisher:
     def __init__(self, gateway: Any | None = None):
         self.gateway = gateway or ChromeCDPBrowserGateway()
 
+    def set_trace_context(self, job_id: int, trace_path: str) -> None:
+        setter = getattr(self.gateway, "set_trace_context", None)
+        if callable(setter):
+            setter(job_id, trace_path)
+
+    def clear_trace_context(self) -> None:
+        clearer = getattr(self.gateway, "clear_trace_context", None)
+        if callable(clearer):
+            clearer()
+
     def publish(
         self,
         payload: dict[str, Any],
@@ -68,7 +78,7 @@ class WeChatBrowserPublisher:
     ) -> PublishingResult:
         self._validate_action(action)
         profile_path = self._profile_path(account)
-        self._validate_payload(payload)
+        self._validate_payload(payload, action)
         session = None
         preserve_session = False
         account_key = self._account_key(account)
@@ -183,22 +193,8 @@ class WeChatBrowserPublisher:
             )
 
         if status == "awaiting_confirmation":
-            confirmation = outcome.get("confirmation")
-            if not isinstance(confirmation, Mapping) or confirmation.get("kind") != "operator_qr":
-                raise WeChatPublishingError("微信页面未返回可验证的运营者扫码确认信号")
-            resume_handle = self.gateway.retain_confirmation(
-                session, account_key, title, baseline
-            )
-            return PublishingResult(
-                status=status,
-                platform_url=platform_url,
-                response={
-                    "source": "wechat_platform",
-                    "event": "operator_confirmation_required",
-                    "confirmation": "operator_qr",
-                    "job_context": {"resume_handle": resume_handle},
-                },
-                requires_confirmation=True,
+            raise WeChatPublishingError(
+                "微信平台要求二次安全确认，系统不会再次发起扫码；请改用同步到平台草稿箱，或到微信后台手动发布"
             )
         if status != "published":
             raise WeChatPublishingError(f"微信直发流程返回了无效状态：{status or '空'}")
@@ -249,10 +245,14 @@ class WeChatBrowserPublisher:
         return handle
 
     @staticmethod
-    def _validate_payload(payload: Mapping[str, Any]) -> None:
+    def _validate_payload(payload: Mapping[str, Any], action: PublishAction) -> None:
         if not str(payload.get("title") or "").strip():
             raise WeChatPublishingError("微信公众号文章标题不能为空")
-        WeChatBrowserPublisher._require_file(payload.get("cover_path"), "封面图")
+        cover_path = str(payload.get("cover_path") or "").strip()
+        if action == "publish" and not cover_path:
+            raise WeChatPublishingError("微信公众号一键发布必须上传封面图；可先生成封面图后发布，或改用同步到平台草稿箱")
+        if cover_path:
+            WeChatBrowserPublisher._require_file(cover_path, "封面图")
         blocks = payload.get("blocks") or []
         if not isinstance(blocks, list):
             raise WeChatPublishingError("微信公众号文章 blocks 格式不正确")

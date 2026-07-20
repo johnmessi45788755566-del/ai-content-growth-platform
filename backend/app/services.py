@@ -1,4 +1,5 @@
 import json
+import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ WAITING_TASK_RECOVERY_JOB_STATUSES = (
     *TERMINAL_PUBLISH_JOB_STATUSES,
 )
 PLATFORMS = ["微信公众号", "视频号", "小红书", "抖音"]
+MARKDOWN_ASSET_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(asset:(\d+)\)")
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 PLATFORM_ALIASES = {
     "公众号": "微信公众号",
     "微信公众平台": "微信公众号",
@@ -323,6 +326,12 @@ class ContentService:
     def save_layout(self, project_id: int, blocks: list[dict[str, Any]]) -> dict[str, Any]:
         self.get_project(project_id)
         self.db.execute("DELETE FROM layout_blocks WHERE project_id = ?", (project_id,))
+        layout_title = self._layout_title_from_blocks(blocks)
+        if layout_title:
+            self.db.execute(
+                "UPDATE content_projects SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (layout_title, project_id),
+            )
         params = [
             (
                 project_id,
@@ -367,6 +376,34 @@ class ContentService:
             )
         self.autosave(project_id, stage="images", restore_stage="layout")
         return {"project": self.get_project(project_id), "assets": self.get_media_assets(project_id)}
+
+    def delete_media_asset(self, project_id: int, asset_id: int) -> dict[str, Any]:
+        self.get_project(project_id)
+        asset = self.db.fetch_one(
+            "SELECT * FROM media_assets WHERE project_id = ? AND id = ?",
+            (project_id, asset_id),
+        )
+        if not asset:
+            raise NotFoundError("图片不存在")
+
+        file_path = self._media_file_path(asset)
+        if file_path.exists() and file_path.is_file():
+            file_path.unlink()
+
+        self.db.execute(
+            "UPDATE layout_blocks SET media_asset_id = NULL WHERE project_id = ? AND media_asset_id = ?",
+            (project_id, asset_id),
+        )
+        self.db.execute(
+            "DELETE FROM media_assets WHERE project_id = ? AND id = ?",
+            (project_id, asset_id),
+        )
+        self.autosave(project_id, stage="images", restore_stage="layout")
+        return {
+            "deleted": True,
+            "project": self.get_project(project_id),
+            "assets": self.get_media_assets(project_id),
+        }
 
     def set_project_stage(self, project_id: int, stage: str) -> dict[str, Any]:
         if stage not in STAGE_ORDER:
@@ -982,6 +1019,91 @@ class ContentService:
             updated += int(claimed)
         return {"updated": updated}
 
+    def sync_failed_task_to_platform_draft(
+        self, task_id: int, now: datetime | None = None
+    ) -> dict[str, Any]:
+        current = now or datetime.now()
+        started_at = _format_task_time(current)
+        with self.db.transaction() as conn:
+            observed = conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if observed is None:
+                raise NotFoundError("任务不存在")
+            task = dict(observed)
+            if task["status"] != "失败":
+                raise RuntimeError("只有失败任务可以同步到平台草稿箱")
+            if not task.get("content_project_id"):
+                raise RuntimeError("该任务还没有生成文章内容，不能同步到平台草稿箱")
+            if not task.get("account_id"):
+                raise RuntimeError("请选择一个已授权的微信公众号账号")
+            cursor = conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = '执行中', last_run_at = ?, next_run_at = '',
+                    publish_action = 'draft', publish_result = '',
+                    failure_stage = '', failure_reason = '', manual_takeover_url = '',
+                    publish_job_id = NULL, retry_count = retry_count + 1,
+                    generation = generation + 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = '失败' AND generation = ?
+                """,
+                (started_at, task_id, task["generation"]),
+            )
+            if cursor.rowcount != 1:
+                raise TaskConflictError("任务代次已变化，请刷新后重试")
+            run_generation = int(task["generation"]) + 1
+            run_id = int(
+                conn.execute(
+                    """
+                    INSERT INTO task_runs (task_id, generation, status, started_at)
+                    VALUES (?, ?, '执行中', ?)
+                    """,
+                    (task_id, run_generation, started_at),
+                ).lastrowid
+            )
+        task = self.get_task(task_id)
+        stage = "提交平台草稿"
+        project_id = int(task["content_project_id"])
+        failed_job_id: int | None = None
+        package_id: int | None = (
+            int(task["publish_package_id"]) if task.get("publish_package_id") else None
+        )
+        try:
+            account = self._validate_task_publish_target(task)
+            project = self.get_project(project_id)
+            job = self.prepare_publish_job(project_id, int(account["id"]), "draft")
+            failed_job_id = int(job["id"])
+            package_id = self._prepare_existing_task_publish_package(
+                task, project, account, job
+            )
+            self._link_task_publish_job(task_id, run_id, failed_job_id, package_id)
+            job = self.execute_publish_job(failed_job_id)
+            self._postprocess_publish_package(project, account, job)
+            self._finish_task_from_publish_job(
+                task,
+                run_id,
+                project_id,
+                package_id,
+                job,
+                current,
+            )
+        except Exception as exc:
+            self._finish_task_failure(
+                task_id,
+                run_id,
+                stage,
+                str(exc),
+                current,
+                package_id,
+                failed_job_id,
+            )
+            raise RuntimeError(str(exc)) from exc
+        result = self.get_task(task_id)
+        if result["status"] == "失败":
+            reason = result.get("failure_reason") or "同步到平台草稿箱失败"
+            raise RuntimeError(str(reason))
+        return result
+
     def execute_due_tasks(self, now: datetime | None = None) -> dict[str, Any]:
         current = now or datetime.now()
         due_at = _format_task_time(current)
@@ -1237,6 +1359,69 @@ class ContentService:
             )
             return True
 
+    def _prepare_existing_task_publish_package(
+        self,
+        task: dict[str, Any],
+        project: dict[str, Any],
+        account: dict[str, Any],
+        job: dict[str, Any],
+    ) -> int:
+        package_id = task.get("publish_package_id")
+        if package_id is not None:
+            with self.db.transaction() as conn:
+                package = conn.execute(
+                    "SELECT * FROM publish_packages WHERE id = ? AND project_id = ?",
+                    (package_id, project["id"]),
+                ).fetchone()
+                reusable = False
+                if package and (
+                    package["publish_job_id"] is None
+                    or int(package["publish_job_id"]) == int(job["id"])
+                ):
+                    package_account_id = package["account_id"]
+                    same_account = (
+                        package_account_id is None
+                        or int(package_account_id) == int(account["id"])
+                    )
+                    no_platform_result = (
+                        not str(package["platform_draft_id"] or "").strip()
+                        and not str(package["platform_draft_url"] or "").strip()
+                        and not str(package["published_at"] or "").strip()
+                        and str(package["platform_response_json"] or "{}").strip() == "{}"
+                    )
+                    reusable = (
+                        same_account
+                        and no_platform_result
+                        and str(package["status"]) in {"failed", "pending_publish"}
+                    )
+                if reusable:
+                    cursor = conn.execute(
+                        """
+                        UPDATE publish_packages
+                        SET account_id = ?, publish_job_id = ?, platform = ?,
+                            account_name = ?, status = 'pending_publish',
+                            platform_draft_id = '', platform_draft_url = '',
+                            platform_response_json = '{}',
+                            failure_stage = '', failure_reason = '',
+                            published_at = '', updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND project_id = ?
+                          AND (publish_job_id IS NULL OR publish_job_id = ?)
+                        """,
+                        (
+                            account["id"],
+                            job["id"],
+                            account["platform"],
+                            account["name"],
+                            package_id,
+                            project["id"],
+                            job["id"],
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        return int(package_id)
+        package = self._persist_publish_package(project, account, job, pending=True)
+        return int(package["id"])
+
     def _execute_task(
         self,
         task_id: int,
@@ -1314,7 +1499,10 @@ class ContentService:
             stage = "生成文章"
             article = self.generate_article(project["id"])
             stage = "生成图片"
-            images = self.generate_images(project["id"])
+            try:
+                images = self.generate_images(project["id"])
+            except Exception as image_exc:
+                images = self._create_task_placeholder_images(project["id"], str(image_exc))
             cover = next((asset for asset in images["assets"] if asset["asset_type"] == "cover" and asset["selected"]), None)
             inline_assets = [asset for asset in images["assets"] if asset["asset_type"] == "inline" and asset["selected"]]
             layout_blocks = [
@@ -1387,6 +1575,48 @@ class ContentService:
                 failure_stage = "任务类型未开放" if task["task_type"] == TASK_TYPE_XIAOHONGSHU_RESERVED else stage
                 self._finish_task_failure(task_id, run_id, failure_stage, str(exc), current)
         return self.get_task(task_id), True
+
+    def _create_task_placeholder_images(self, project_id: int, reason: str) -> dict[str, Any]:
+        generated_assets = []
+        prompt = f"本地兜底图：图片模型调用失败，任务继续执行。失败原因：{reason[:240]}"
+        for asset_type in ("cover", "inline"):
+            filename = f"{asset_type}-task-fallback-{project_id}.svg"
+            relative_path = Path("uploads") / filename
+            file_path = self.upload_dir / filename
+            label = "Cover fallback" if asset_type == "cover" else "Inline fallback"
+            file_path.write_bytes(
+                (
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"675\" viewBox=\"0 0 1200 675\">"
+                    "<rect width=\"1200\" height=\"675\" fill=\"#f5f7fb\"/>"
+                    "<rect x=\"80\" y=\"80\" width=\"1040\" height=\"515\" rx=\"28\" fill=\"#ffffff\" stroke=\"#d9e2ef\" stroke-width=\"4\"/>"
+                    "<circle cx=\"600\" cy=\"285\" r=\"72\" fill=\"#3861f6\" opacity=\"0.12\"/>"
+                    "<path d=\"M548 332h104M600 280v104\" stroke=\"#3861f6\" stroke-width=\"18\" stroke-linecap=\"round\"/>"
+                    f"<text x=\"600\" y=\"455\" text-anchor=\"middle\" font-family=\"Arial, sans-serif\" font-size=\"42\" fill=\"#17233d\">{label}</text>"
+                    "</svg>"
+                ).encode("utf-8")
+            )
+            if asset_type == "cover":
+                self.db.execute(
+                    "UPDATE media_assets SET selected = 0 WHERE project_id = ? AND asset_type = 'cover'",
+                    (project_id,),
+                )
+            asset_id = self.db.execute(
+                """
+                INSERT INTO media_assets (project_id, asset_type, url, local_path, prompt, selected)
+                VALUES (?, ?, ?, ?, ?, 1)
+                """,
+                (project_id, asset_type, f"/uploads/{filename}", str(relative_path), prompt),
+            )
+            asset = self.db.fetch_one("SELECT * FROM media_assets WHERE id = ?", (asset_id,))
+            if asset:
+                generated_assets.append(asset)
+        self._set_stage(project_id, "images")
+        self.autosave(project_id, stage="images", restore_stage="layout")
+        return {
+            "project": self.get_project(project_id),
+            "assets": self.get_media_assets(project_id),
+            "generated_assets": generated_assets,
+        }
 
     def _claim_task_execution(
         self,
@@ -2133,6 +2363,38 @@ class ContentService:
             raise RuntimeError("请选择一个已授权的平台账号")
         return self.get_account(int(account["id"]))
 
+    def _layout_title_from_blocks(self, blocks: list[dict[str, Any]]) -> str:
+        markdown_block = next(
+            (
+                block
+                for block in blocks
+                if str(block.get("section_type", "")).strip() == "markdown"
+            ),
+            None,
+        )
+        if markdown_block:
+            title = self._markdown_title(str(markdown_block.get("content") or ""))
+            if title:
+                return title
+        title_block = next(
+            (
+                block
+                for block in blocks
+                if str(block.get("section_type", "")).strip() == "title"
+                and str(block.get("content") or "").strip()
+            ),
+            None,
+        )
+        return str(title_block.get("content") or "").strip() if title_block else ""
+
+    @staticmethod
+    def _markdown_title(markdown: str) -> str:
+        for raw_line in markdown.splitlines():
+            line = raw_line.strip()
+            if line.startswith("# "):
+                return line[2:].strip()
+        return ""
+
     def _build_wechat_publish_payload(self, project: dict[str, Any], account_name: str) -> dict[str, Any]:
         assets = {int(asset["id"]): asset for asset in project["media_assets"]}
         cover = next(
@@ -2143,33 +2405,169 @@ class ContentService:
             ),
             None,
         )
-        if not cover:
-            raise RuntimeError("请先选择一张公众号封面图")
+        markdown_block = next(
+            (
+                block
+                for block in project["layout_blocks"]
+                if block["section_type"] == "markdown" and str(block["content"] or "").strip()
+            ),
+            None,
+        )
+        if markdown_block:
+            return self._build_markdown_wechat_publish_payload(
+                project,
+                account_name,
+                str(markdown_block["content"]),
+                assets,
+                None,
+            )
+
         blocks = []
+        pending_intro_image_paths: list[str] = []
         for block in project["layout_blocks"]:
-            if block["section_type"] == "title":
+            section_type = str(block["section_type"] or "").strip()
+            if section_type == "title":
                 continue
             asset = assets.get(int(block["media_asset_id"])) if block.get("media_asset_id") else None
+            image_path = ""
+            if asset:
+                if asset["asset_type"] == "cover":
+                    cover = cover or asset
+                else:
+                    image_path = str(self._media_file_path(asset))
+            image_paths: list[str] = []
+            if section_type == "intro" and image_path:
+                pending_intro_image_paths.append(image_path)
+            else:
+                if section_type == "body" and pending_intro_image_paths:
+                    image_paths.extend(pending_intro_image_paths)
+                    pending_intro_image_paths = []
+                if image_path:
+                    image_paths.append(image_path)
             blocks.append(
                 {
-                    "type": block["section_type"],
+                    "type": section_type,
                     "content": block["content"],
-                    "image_path": str(self._media_file_path(asset)) if asset else "",
+                    "image_path": image_paths[0] if image_paths else "",
+                    "image_paths": image_paths,
                 }
             )
         if not blocks:
             blocks = [
-                {"type": block["type"], "content": block["content"], "image_path": ""}
+                {"type": block["type"], "content": block["content"], "image_path": "", "image_paths": []}
                 for block in project["article_blocks"]
             ]
         digest = next((block["content"] for block in project["article_blocks"] if block["type"] == "intro"), "")
+        cover_path = str(self._media_file_path(cover)) if cover else ""
         return {
             "title": project["title"],
             "author": account_name,
             "digest": digest[:120],
-            "cover_path": str(self._media_file_path(cover)),
+            "cover_path": cover_path,
+            "cover_candidate_path": cover_path,
             "blocks": blocks,
         }
+
+    def _build_markdown_wechat_publish_payload(
+        self,
+        project: dict[str, Any],
+        account_name: str,
+        markdown: str,
+        assets: dict[int, dict[str, Any]],
+        fallback_cover: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        title, cover, blocks = self._parse_markdown_layout(markdown, assets, fallback_cover)
+        if not blocks:
+            blocks = [
+                {"type": block["type"], "content": block["content"], "image_path": "", "image_paths": []}
+                for block in project["article_blocks"]
+            ]
+        digest = next((block["content"] for block in blocks if block["type"] == "intro"), "")
+        if not digest:
+            digest = next((block["content"] for block in project["article_blocks"] if block["type"] == "intro"), "")
+        cover_path = str(self._media_file_path(cover)) if cover else ""
+        return {
+            "title": title or project["title"],
+            "author": account_name,
+            "digest": digest[:120],
+            "cover_path": cover_path,
+            "cover_candidate_path": cover_path,
+            "blocks": blocks,
+        }
+
+    def _parse_markdown_layout(
+        self,
+        markdown: str,
+        assets: dict[int, dict[str, Any]],
+        fallback_cover: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any] | None, list[dict[str, Any]]]:
+        title = ""
+        cover = fallback_cover
+        blocks: list[dict[str, Any]] = []
+        pending_image_paths: list[str] = []
+
+        for raw_line in markdown.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            image_sources = [match.strip() for match in MARKDOWN_IMAGE_RE.findall(line)]
+            line_without_images = MARKDOWN_IMAGE_RE.sub("", line).strip()
+            for image_source in image_sources:
+                asset_match = re.fullmatch(r"asset:(\d+)", image_source)
+                if asset_match:
+                    asset = assets.get(int(asset_match.group(1)))
+                    if not asset:
+                        continue
+                    if asset["asset_type"] == "cover":
+                        cover = asset
+                        continue
+                    image_path = str(self._media_file_path(asset))
+                else:
+                    image_path = image_source
+                if blocks and not line_without_images:
+                    blocks[-1].setdefault("image_paths", []).append(image_path)
+                    if not blocks[-1].get("image_path"):
+                        blocks[-1]["image_path"] = image_path
+                else:
+                    pending_image_paths.append(image_path)
+
+            if not line_without_images:
+                continue
+
+            block_type, content = self._markdown_line_to_block(line_without_images)
+            if not content:
+                continue
+            if block_type == "title":
+                title = content
+                continue
+            blocks.append(
+                {
+                    "type": block_type,
+                    "content": content,
+                    "image_path": pending_image_paths[0] if pending_image_paths else "",
+                    "image_paths": pending_image_paths,
+                }
+            )
+            pending_image_paths = []
+
+        return title, cover, blocks
+
+    @staticmethod
+    def _markdown_line_to_block(line: str) -> tuple[str, str]:
+        if line.startswith("# "):
+            return "title", line[2:].strip()
+        if line.startswith("### "):
+            return "heading", line[4:].strip()
+        if line.startswith("## "):
+            return "heading", line[3:].strip()
+        if line.startswith(">"):
+            return "intro", line.lstrip(">").strip()
+        if line.startswith("- ") or line.startswith("* "):
+            return "body", f"• {line[2:].strip()}"
+        if re.match(r"^\d+\.\s+", line):
+            return "body", re.sub(r"^\d+\.\s+", "", line).strip()
+        return "body", line.strip()
 
     def _media_file_path(self, asset: dict[str, Any]) -> Path:
         path = Path(str(asset["local_path"]))

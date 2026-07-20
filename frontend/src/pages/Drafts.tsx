@@ -319,28 +319,6 @@ export default function Drafts() {
     }
   }
 
-  async function resumePublishJob() {
-    if (!currentPublishJob) return;
-    const request = beginPublishRequest(currentPublishJob.project_id);
-    setPublishingAction('publish');
-    try {
-      const job = await api.resumePublishJob(currentPublishJob.id);
-      if (!acceptPublishJob(job, request)) return;
-      await waitForPublishJob(
-        job,
-        () => isPublishRequestCurrent(request),
-        (nextJob) => acceptPublishJob(nextJob, request),
-      );
-    } catch (error) {
-      if (!isPublishRequestCurrent(request)) return;
-      const text = error instanceof Error ? error.message : '继续发布失败';
-      setPublishPollingError(text);
-      message.error(text);
-    } finally {
-      if (isPublishRequestCurrent(request)) setPublishingAction('');
-    }
-  }
-
   async function refreshPublishJob() {
     if (!currentPublishJob) return;
     const request = beginPublishRequest(currentPublishJob.project_id);
@@ -430,15 +408,14 @@ export default function Drafts() {
               className="block-gap"
               showIcon
               type={currentPublishJob.status === 'failed' ? 'error' : currentPublishJob.status === 'awaiting_confirmation' ? 'warning' : ['platform_draft', 'published'].includes(currentPublishJob.status) ? 'success' : 'info'}
-              message={currentPublishJob.status === 'platform_draft' ? '平台草稿已创建' : currentPublishJob.status === 'published' ? '平台发布已完成' : currentPublishJob.status === 'awaiting_confirmation' ? '等待运营人员确认' : currentPublishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
+              message={currentPublishJob.status === 'platform_draft' ? '平台草稿已创建' : currentPublishJob.status === 'published' ? '平台发布已完成' : currentPublishJob.status === 'awaiting_confirmation' ? '平台要求二次安全确认' : currentPublishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
               description={(
                 <Space direction="vertical" size={4}>
                   <span>发布任务 ID：{currentPublishJob.id}</span>
                   {currentPublishJob.status === 'platform_draft' && <span>平台草稿 ID：{currentPublishJob.platform_draft_id || '-'}</span>}
                   {currentPublishJob.status === 'published' && <span>平台发布 ID：{currentPublishJob.platform_publish_id || '-'}</span>}
                   {currentPublishJob.platform_url && <a href={currentPublishJob.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
-                  {currentPublishJob.status === 'awaiting_confirmation' && <span>请由运营人员使用微信扫描平台弹出的确认二维码，完成后点击继续确认发布。</span>}
-                  {currentPublishJob.status === 'awaiting_confirmation' && <Button type="primary" loading={publishingAction === 'publish'} disabled={publishAccountsLoading} onClick={resumePublishJob}>继续确认发布</Button>}
+                  {currentPublishJob.status === 'awaiting_confirmation' && <span>当前版本不会发起二次扫码，请重新发布或同步到平台草稿箱后在平台后台处理。</span>}
                   {currentPublishJob.status === 'failed' && <span>失败阶段：{currentPublishJob.failure_stage || '-'}<br />失败原因：{currentPublishJob.failure_reason || '-'}</span>}
                   {currentPublishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} disabled={publishAccountsLoading} onClick={retryPublishJob}>重试</Button>}
                 </Space>

@@ -1,0 +1,1064 @@
+import { Alert, Button, Card, Col, Empty, Form, Image, Input, Modal, Popconfirm, Row, Select, Space, Spin, Steps, message } from 'antd';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { api, assetUrl } from '@/services/api';
+import type { ArticleBlock, ContentProject, CreatorStep, LayoutBlock, MediaAsset, PlatformAccount, PublishAction, PublishJob, TopicDirection } from '@/types';
+
+const { TextArea } = Input;
+
+function backendStage(step: CreatorStep) {
+  return step === 'image' ? 'images' : step;
+}
+
+function frontendStage(stage = 'title'): CreatorStep {
+  return stage === 'images' ? 'image' : (stage as CreatorStep);
+}
+
+function isIntroBlock(block: ArticleBlock, index: number) {
+  return index === 0 || block.block_type === 'intro' || block.type === 'intro' || block.label === '引言';
+}
+
+const markdownAssetPattern = /!\[[^\]]*]\(asset:(\d+)\)/g;
+
+function markdownBlockContent(blocks: LayoutBlock[]) {
+  return blocks.find((block) => block.section_type === 'markdown')?.content || '';
+}
+
+function extractMarkdownTitle(markdown: string, fallback: string) {
+  const titleLine = markdown.split('\n').find((line) => line.trim().startsWith('# '));
+  return titleLine?.trim().slice(2).trim() || fallback;
+}
+
+function markdownImageTag(asset: MediaAsset, label: string) {
+  return `![${label}](asset:${asset.id})`;
+}
+
+function selectedCoverFromAssets(assets: MediaAsset[]) {
+  return assets.find((asset) => asset.asset_type === 'cover' && Number(asset.selected) === 1);
+}
+
+function inlineAssetsForLayout(assets: MediaAsset[]) {
+  const inline = assets.filter((asset) => asset.asset_type === 'inline');
+  const selected = inline.filter((asset) => Number(asset.selected) === 1);
+  return selected.length ? selected : inline;
+}
+
+function buildDefaultLayoutMarkdown(title: string, blocks: ArticleBlock[], assets: MediaAsset[]) {
+  const parts: string[] = [];
+  const cover = selectedCoverFromAssets(assets);
+  const inline = inlineAssetsForLayout(assets);
+  let bodyIndex = 0;
+
+  if (title.trim()) parts.push(`# ${title.trim()}`);
+  if (cover) parts.push(markdownImageTag(cover, '封面图'));
+
+  blocks.forEach((block, index) => {
+    const content = block.content.trim();
+    if (!content) return;
+    if (isIntroBlock(block, index)) {
+      parts.push(`> ${content}`);
+      return;
+    }
+    parts.push(content);
+    const image = inline[bodyIndex];
+    if (image) parts.push(markdownImageTag(image, `正文配图 ${bodyIndex + 1}`));
+    bodyIndex += 1;
+  });
+
+  return parts.join('\n\n');
+}
+
+function removeAssetFromMarkdown(markdown: string, assetId: number) {
+  const pattern = new RegExp(`!\\[[^\\]]*\\]\\(asset:${assetId}\\)`, 'g');
+  return markdown
+    .split('\n')
+    .map((line) => line.replace(pattern, '').trimEnd())
+    .filter((line, index, lines) => line.trim() || lines[index - 1]?.trim())
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+const publishTerminalStatuses = ['platform_draft', 'published', 'awaiting_confirmation', 'failed'];
+const maxPublishPollFailures = 2;
+
+async function waitForPublishJob(
+  initialJob: PublishJob,
+  isCurrent: () => boolean,
+  onJob: (job: PublishJob) => void,
+) {
+  let job = initialJob;
+  let consecutiveFailures = 0;
+  while (!publishTerminalStatuses.includes(job.status)) {
+    await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    if (!isCurrent()) return null;
+    try {
+      const nextJob = await api.getPublishJob(job.id);
+      if (!isCurrent()) return null;
+      if (nextJob.project_id !== initialJob.project_id) throw new Error('发布任务归属与当前项目不一致');
+      job = nextJob;
+      consecutiveFailures = 0;
+      onJob(job);
+    } catch (error) {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= maxPublishPollFailures) throw error;
+    }
+  }
+  return job;
+}
+
+export default function Creator() {
+  const [step, setStep] = useState<CreatorStep>('title');
+  const [projectId, setProjectId] = useState<number | null>(null);
+  const [selectedTitle, setSelectedTitle] = useState('');
+  const [titleDirection, setTitleDirection] = useState('');
+  const [topicPrompt, setTopicPrompt] = useState('');
+  const [topicDirections, setTopicDirections] = useState<TopicDirection[]>([]);
+  const [articleBlocks, setArticleBlocks] = useState<ArticleBlock[]>([]);
+  const [mediaAssets, setMediaAssets] = useState<MediaAsset[]>([]);
+  const [layoutBlocks, setLayoutBlocks] = useState<LayoutBlock[]>([]);
+  const [layoutMarkdown, setLayoutMarkdown] = useState('');
+  const [layoutImageSelections, setLayoutImageSelections] = useState<Record<number, number | null | undefined>>({});
+  const [publishOpen, setPublishOpen] = useState(false);
+  const [publishAccounts, setPublishAccounts] = useState<PlatformAccount[]>([]);
+  const [publishAccountsLoading, setPublishAccountsLoading] = useState(false);
+  const [publishJob, setPublishJob] = useState<PublishJob | null>(null);
+  const [publishingAction, setPublishingAction] = useState<PublishAction | ''>('');
+  const [publishPollingError, setPublishPollingError] = useState('');
+  const [refreshingPublishJob, setRefreshingPublishJob] = useState(false);
+  const [publishForm] = Form.useForm();
+  const [loading, setLoading] = useState('');
+  const [imageLoadingType, setImageLoadingType] = useState('');
+  const activeProjectIdRef = useRef<number | null>(null);
+  const publishModalProjectIdRef = useRef<number | null>(null);
+  const publishAccountsProjectIdRef = useRef<number | null>(null);
+  const publishRequestGenerationRef = useRef(0);
+  const publishAccountsRequestGenerationRef = useRef(0);
+  const layoutEditorRef = useRef<HTMLTextAreaElement | null>(null);
+  const currentPublishJob = publishJob?.project_id === projectId ? publishJob : null;
+  const currentPublishJobActive = Boolean(
+    currentPublishJob && !publishTerminalStatuses.includes(currentPublishJob.status),
+  );
+
+  function invalidatePublishRequest() {
+    publishRequestGenerationRef.current += 1;
+    setPublishingAction('');
+    setRefreshingPublishJob(false);
+  }
+
+  function invalidatePublishAccountsRequest() {
+    publishAccountsRequestGenerationRef.current += 1;
+    setPublishAccountsLoading(false);
+  }
+
+  function beginPublishRequest(targetProjectId: number) {
+    const generation = publishRequestGenerationRef.current + 1;
+    publishRequestGenerationRef.current = generation;
+    setPublishingAction('');
+    setRefreshingPublishJob(false);
+    setPublishPollingError('');
+    return { projectId: targetProjectId, generation };
+  }
+
+  function isPublishRequestCurrent(request: { projectId: number; generation: number }) {
+    return activeProjectIdRef.current === request.projectId
+      && publishModalProjectIdRef.current === request.projectId
+      && publishRequestGenerationRef.current === request.generation;
+  }
+
+  function beginPublishAccountsRequest(targetProjectId: number) {
+    const generation = publishAccountsRequestGenerationRef.current + 1;
+    publishAccountsRequestGenerationRef.current = generation;
+    setPublishAccountsLoading(true);
+    return { projectId: targetProjectId, generation };
+  }
+
+  function isPublishAccountsRequestCurrent(request: { projectId: number; generation: number }) {
+    return activeProjectIdRef.current === request.projectId
+      && publishModalProjectIdRef.current === request.projectId
+      && publishAccountsRequestGenerationRef.current === request.generation;
+  }
+
+  function acceptPublishJob(job: PublishJob, request: { projectId: number; generation: number }) {
+    if (!isPublishRequestCurrent(request)) return false;
+    if (job.project_id !== request.projectId) throw new Error('发布任务归属与当前项目不一致');
+    setPublishJob(job);
+    return true;
+  }
+
+  function applyProject(project?: ContentProject) {
+    if (!project) return;
+    const projectChanged = activeProjectIdRef.current !== project.id;
+    if (projectChanged) {
+      activeProjectIdRef.current = project.id;
+      publishModalProjectIdRef.current = null;
+      publishAccountsProjectIdRef.current = null;
+      invalidatePublishRequest();
+      invalidatePublishAccountsRequest();
+      setPublishAccounts([]);
+      setPublishJob(null);
+      setPublishPollingError('');
+      setLayoutMarkdown('');
+    }
+    const nextArticleBlocks = project.article_blocks || [];
+    const nextMediaAssets = project.media_assets || [];
+    const nextLayoutBlocks = project.layout_blocks || [];
+    setProjectId(project.id);
+    setSelectedTitle(project.title || '');
+    setTitleDirection(project.title_direction || '');
+    setArticleBlocks(nextArticleBlocks);
+    setMediaAssets(nextMediaAssets);
+    setLayoutBlocks(nextLayoutBlocks);
+    const savedMarkdown = markdownBlockContent(nextLayoutBlocks);
+    if (savedMarkdown) {
+      setLayoutMarkdown(savedMarkdown);
+    } else if (frontendStage(project.current_stage || '') === 'layout') {
+      setLayoutMarkdown(buildDefaultLayoutMarkdown(project.title || '', nextArticleBlocks, nextMediaAssets));
+    } else if (projectChanged) {
+      setLayoutMarkdown('');
+    }
+    if (project.current_stage) setStep(frontendStage(project.current_stage));
+  }
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const projectIdFromQuery = Number(params.get('project_id'));
+    const stageFromQuery = params.get('stage');
+    if (!projectIdFromQuery) return;
+    api.getProject(projectIdFromQuery)
+      .then((project) => {
+        applyProject(project);
+        if (stageFromQuery) setStep(frontendStage(stageFromQuery));
+      })
+      .catch((error) => message.error(error instanceof Error ? error.message : '恢复草稿失败'));
+  }, []);
+
+  async function saveStage(nextStep: CreatorStep) {
+    if (!projectId) return;
+    const data = await api.updateStage(projectId, backendStage(nextStep));
+    applyProject(data.project);
+    setArticleBlocks(data.article_blocks || []);
+    setMediaAssets(data.media_assets || []);
+    setLayoutBlocks(data.layout_blocks || []);
+  }
+
+  async function goStep(nextStep: CreatorStep) {
+    try {
+      if (projectId && step === 'article') await saveArticle();
+      setStep(nextStep);
+      closePublishModal();
+      if (projectId) await saveStage(nextStep);
+      setStep(nextStep);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '切换失败');
+    }
+  }
+
+  async function generateTopics() {
+    if (!topicPrompt.trim()) {
+      message.warning('请先输入想写的内容');
+      return;
+    }
+    setLoading('topics');
+    try {
+      const data = await api.topicRecommendations(topicPrompt.trim());
+      setTopicDirections(data.directions || []);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '生成选题失败');
+    } finally {
+      setLoading('');
+    }
+  }
+
+  async function confirmTitle(title: string, direction: string) {
+    setSelectedTitle(title);
+    setTitleDirection(direction);
+    setStep('article');
+    setLoading('article');
+    try {
+      const project = await api.createProject({ title, title_direction: direction, platform: '微信公众号' });
+      applyProject(project);
+      const article = await api.generateArticle(project.id);
+      applyProject(article.project);
+      setArticleBlocks(article.blocks || article.project.article_blocks || []);
+      setStep('article');
+    } catch (error) {
+      setStep('title');
+      message.error(error instanceof Error ? error.message : '生成文章失败');
+    } finally {
+      setLoading('');
+    }
+  }
+
+  async function saveArticle() {
+    if (!projectId || !articleBlocks.length) return;
+    const blocks = articleBlocks.map((block, index) => ({
+      block_type: index === 0 ? 'intro' : 'body',
+      label: index === 0 ? '引言' : '正文',
+      content: block.content,
+      sort_order: index + 1,
+    }));
+    const data = await api.saveArticle(projectId, blocks);
+    applyProject(data.project);
+    setArticleBlocks(data.blocks || []);
+  }
+
+  async function enterImageStep() {
+    if (!projectId) {
+      message.warning('请先确认标题');
+      return;
+    }
+    setStep('image');
+    setLoading('images');
+    setImageLoadingType('all');
+    try {
+      await saveArticle();
+      if (!mediaAssets.length) {
+        const data = await api.generateImages(projectId);
+        applyProject(data.project);
+        setMediaAssets(data.assets || []);
+      } else {
+        await saveStage('image');
+      }
+      setStep('image');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '生成图片失败');
+    } finally {
+      setLoading('');
+      setImageLoadingType('');
+    }
+  }
+
+  async function generateImage(type: 'cover' | 'inline') {
+    if (!projectId) {
+      message.warning('请先确认标题');
+      return;
+    }
+    setLoading('images');
+    setImageLoadingType(type);
+    try {
+      const data = await api.generateImages(projectId, type);
+      applyProject(data.project);
+      setMediaAssets(data.assets || []);
+      setStep('image');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '生成图片失败');
+    } finally {
+      setLoading('');
+      setImageLoadingType('');
+    }
+  }
+
+  async function selectImage(asset: MediaAsset) {
+    if (!projectId) return;
+    const nextAssets = mediaAssets.map((item) => {
+      if (asset.asset_type === 'cover' && item.asset_type === 'cover') {
+        return { ...item, selected: item.id === asset.id ? 1 : 0 };
+      }
+      if (item.id === asset.id) return { ...item, selected: Number(item.selected) === 1 ? 0 : 1 };
+      return item;
+    });
+    setMediaAssets(nextAssets);
+    try {
+      const ids = nextAssets.filter((item) => Number(item.selected) === 1).map((item) => item.id);
+      const data = await api.selectMedia(projectId, ids);
+      applyProject(data.project);
+      setMediaAssets(data.assets || []);
+      setStep('image');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '选择图片失败');
+    }
+  }
+
+  async function deleteImage(asset: MediaAsset) {
+    if (!projectId) return;
+    try {
+      const data = await api.deleteMedia(projectId, asset.id);
+      applyProject(data.project);
+      setMediaAssets(data.assets || []);
+      setLayoutBlocks(data.project.layout_blocks || []);
+      setLayoutMarkdown((prev) => removeAssetFromMarkdown(prev, asset.id));
+      setLayoutImageSelections((prev) => {
+        const next = { ...prev };
+        Object.entries(next).forEach(([key, value]) => {
+          if (value === asset.id) delete next[Number(key)];
+        });
+        return next;
+      });
+      message.success('图片已删除');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除图片失败');
+    }
+  }
+
+  const selectedCover = useMemo(
+    () => selectedCoverFromAssets(mediaAssets),
+    [mediaAssets],
+  );
+
+  const inlineAssets = useMemo(() => mediaAssets.filter((asset) => asset.asset_type === 'inline'), [mediaAssets]);
+
+  function layoutImageForBlock(index: number, bodyIndex: number) {
+    if (Object.prototype.hasOwnProperty.call(layoutImageSelections, index)) {
+      const configured = layoutImageSelections[index];
+      return configured ? inlineAssets.find((asset) => asset.id === configured) : undefined;
+    }
+    const selected = inlineAssets.filter((asset) => Number(asset.selected) === 1);
+    return selected[bodyIndex] || inlineAssets[bodyIndex];
+  }
+
+  async function clearCoverFromLayout() {
+    if (!projectId) return;
+    const selectedInlineIds = mediaAssets
+      .filter((asset) => asset.asset_type === 'inline' && Number(asset.selected) === 1)
+      .map((asset) => asset.id);
+    try {
+      const data = await api.selectMedia(projectId, selectedInlineIds);
+      applyProject(data.project);
+      setMediaAssets(data.assets || []);
+      message.success('已不显示封面图');
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '移除封面图失败');
+    }
+  }
+
+  function clearParagraphImage(index: number) {
+    setLayoutImageSelections((prev) => ({ ...prev, [index]: null }));
+  }
+
+  function defaultLayoutMarkdown() {
+    return buildDefaultLayoutMarkdown(selectedTitle, articleBlocks, mediaAssets);
+  }
+
+  function ensureLayoutMarkdown() {
+    const savedMarkdown = markdownBlockContent(layoutBlocks);
+    const nextMarkdown = layoutMarkdown.trim() || savedMarkdown || defaultLayoutMarkdown();
+    setLayoutMarkdown(nextMarkdown);
+    return nextMarkdown;
+  }
+
+  async function enterLayoutStep() {
+    ensureLayoutMarkdown();
+    await goStep('layout');
+  }
+
+  async function handleStepChange(index: number) {
+    const nextStep = ['title', 'article', 'image', 'layout'][index] as CreatorStep;
+    if (nextStep === 'layout') ensureLayoutMarkdown();
+    await goStep(nextStep);
+  }
+
+  function insertMarkdown(before: string, after = '', fallback = '') {
+    const editor = layoutEditorRef.current;
+    if (!editor) {
+      setLayoutMarkdown((prev) => `${prev}${prev ? '\n\n' : ''}${before}${fallback}${after}`);
+      return;
+    }
+    const start = editor.selectionStart ?? layoutMarkdown.length;
+    const end = editor.selectionEnd ?? layoutMarkdown.length;
+    const selectedText = layoutMarkdown.slice(start, end) || fallback;
+    const next = `${layoutMarkdown.slice(0, start)}${before}${selectedText}${after}${layoutMarkdown.slice(end)}`;
+    setLayoutMarkdown(next);
+    window.requestAnimationFrame(() => {
+      editor.focus();
+      const cursor = start + before.length + selectedText.length;
+      editor.setSelectionRange(cursor, cursor);
+    });
+  }
+
+  function insertMarkdownLine(prefix: string, fallback: string) {
+    const editor = layoutEditorRef.current;
+    const start = editor?.selectionStart ?? layoutMarkdown.length;
+    const lineStart = layoutMarkdown.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+    const next = `${layoutMarkdown.slice(0, lineStart)}${prefix}${layoutMarkdown.slice(lineStart) || fallback}`;
+    setLayoutMarkdown(next);
+    window.requestAnimationFrame(() => {
+      editor?.focus();
+      editor?.setSelectionRange(lineStart + prefix.length, lineStart + prefix.length);
+    });
+  }
+
+  function insertMarkdownImage(assetId: number) {
+    const asset = mediaAssets.find((item) => item.id === assetId);
+    if (!asset) return;
+    const label = asset.asset_type === 'cover' ? '封面图' : `正文配图 ${inlineAssets.findIndex((item) => item.id === asset.id) + 1 || ''}`.trim();
+    insertMarkdown('', '', markdownImageTag(asset, label));
+  }
+
+  async function saveLayout() {
+    if (!projectId) {
+      message.warning('请先完成内容创作');
+      return;
+    }
+    const markdown = layoutMarkdown.trim() || defaultLayoutMarkdown();
+    const nextTitle = extractMarkdownTitle(markdown, selectedTitle);
+    const blocks: LayoutBlock[] = [
+      { section_type: 'title', content: nextTitle, media_asset_id: selectedCover?.id || null, sort_order: 1 },
+      { section_type: 'markdown', content: markdown, media_asset_id: null, sort_order: 2 },
+    ];
+    const data = await api.saveLayout(projectId, blocks);
+    setSelectedTitle(nextTitle);
+    setLayoutMarkdown(markdown);
+    applyProject(data.project);
+    setLayoutBlocks(data.layout_blocks || []);
+  }
+
+  function commitPublishAccounts(
+    targetProjectId: number,
+    accounts: PlatformAccount[],
+    preferredAccountId?: number,
+    fallbackToFirst = false,
+  ) {
+    const currentId = publishForm.getFieldValue('account_id');
+    let nextAccountId = accounts.some((account) => account.id === currentId)
+      ? currentId
+      : accounts[0]?.id;
+    if (preferredAccountId !== undefined) {
+      nextAccountId = accounts.some((account) => account.id === preferredAccountId)
+        ? preferredAccountId
+        : undefined;
+    } else if (fallbackToFirst) {
+      nextAccountId = accounts[0]?.id;
+    }
+    publishAccountsProjectIdRef.current = targetProjectId;
+    setPublishAccounts(accounts);
+    publishForm.setFieldValue('account_id', nextAccountId);
+  }
+
+  async function loadPublishAccounts() {
+    const data = await api.accounts(new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' }));
+    return (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
+  }
+
+  async function restorePublishJob(targetProjectId: number) {
+    const request = beginPublishRequest(targetProjectId);
+    const accountsRequest = beginPublishAccountsRequest(targetProjectId);
+    const accountsPromise = loadPublishAccounts().then(
+      (accounts) => ({ ok: true as const, accounts }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
+    let existing: PublishJob | null | undefined;
+    let pollingPromise: Promise<void> = Promise.resolve();
+    try {
+      const resource = await api.projectPublishJob(targetProjectId);
+      if (!isPublishRequestCurrent(request)) return;
+      existing = resource.job;
+      if (!existing) {
+        setPublishJob(null);
+      } else if (acceptPublishJob(existing, request)) {
+        pollingPromise = waitForPublishJob(
+          existing,
+          () => isPublishRequestCurrent(request),
+          (job) => acceptPublishJob(job, request),
+        ).then(() => undefined).catch((error) => {
+          if (!isPublishRequestCurrent(request)) return;
+          const text = error instanceof Error ? error.message : '恢复发布状态失败';
+          setPublishPollingError(text);
+          message.error(text);
+        });
+      }
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '恢复发布状态失败';
+      setPublishPollingError(text);
+      message.error(text);
+    }
+
+    const accountsResult = await accountsPromise;
+    if (isPublishAccountsRequestCurrent(accountsRequest)) {
+      if (accountsResult.ok) {
+        commitPublishAccounts(
+          targetProjectId,
+          accountsResult.accounts,
+          existing?.account_id,
+          existing === null,
+        );
+      } else {
+        message.error(accountsResult.error instanceof Error ? accountsResult.error.message : '加载授权账号失败');
+      }
+      setPublishAccountsLoading(false);
+    }
+    await pollingPromise;
+  }
+
+  async function refreshPublishAccounts() {
+    const targetProjectId = publishModalProjectIdRef.current;
+    if (!targetProjectId) return;
+    const request = beginPublishAccountsRequest(targetProjectId);
+    try {
+      const accounts = await loadPublishAccounts();
+      if (!isPublishAccountsRequestCurrent(request)) return;
+      commitPublishAccounts(
+        targetProjectId,
+        accounts,
+        currentPublishJob?.account_id,
+        !currentPublishJob,
+      );
+    } catch (error) {
+      if (!isPublishAccountsRequestCurrent(request)) return;
+      message.error(error instanceof Error ? error.message : '加载授权账号失败');
+    } finally {
+      if (isPublishAccountsRequestCurrent(request)) setPublishAccountsLoading(false);
+    }
+  }
+
+  async function openPublishModal() {
+    try {
+      await saveLayout();
+      const currentProjectId = activeProjectIdRef.current;
+      if (publishModalProjectIdRef.current !== currentProjectId) {
+        publishModalProjectIdRef.current = currentProjectId;
+        publishAccountsProjectIdRef.current = null;
+        invalidatePublishRequest();
+        invalidatePublishAccountsRequest();
+        setPublishAccounts([]);
+        setPublishJob(null);
+        setPublishPollingError('');
+        publishForm.resetFields();
+      }
+      setPublishOpen(true);
+      if (currentProjectId) await restorePublishJob(currentProjectId);
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '保存排版失败');
+    }
+  }
+
+  async function runPublishAction(action: PublishAction) {
+    if (!projectId) return;
+    const targetProjectId = projectId;
+    const request = beginPublishRequest(targetProjectId);
+    const values = await publishForm.validateFields() as { account_id: number };
+    if (!isPublishRequestCurrent(request)) return;
+    if (publishAccountsProjectIdRef.current !== targetProjectId) {
+      message.error('所选账号不属于当前项目，请刷新账号');
+      return;
+    }
+    const account = publishAccounts.find((item) => item.id === values.account_id);
+    if (!account) {
+      message.error('所选账号不存在或授权状态已变化，请刷新账号');
+      return;
+    }
+    setPublishingAction(action);
+    let acceptedJob = false;
+    try {
+      const created = await api.createPublishJob({
+        project_id: targetProjectId,
+        account_id: account.id,
+        action,
+      });
+      acceptedJob = acceptPublishJob(created, request);
+      if (!acceptedJob) return;
+      await waitForPublishJob(
+        created,
+        () => isPublishRequestCurrent(request),
+        (job) => acceptPublishJob(job, request),
+      );
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '发布失败';
+      if (acceptedJob) setPublishPollingError(text);
+      message.error(text);
+    } finally {
+      if (isPublishRequestCurrent(request)) setPublishingAction('');
+    }
+  }
+
+  async function retryPublishJob() {
+    if (!currentPublishJob) return;
+    const targetProjectId = currentPublishJob.project_id;
+    const request = beginPublishRequest(targetProjectId);
+    setPublishingAction(currentPublishJob.action);
+    try {
+      const job = await api.retryPublishJob(currentPublishJob.id);
+      if (!acceptPublishJob(job, request)) return;
+      await waitForPublishJob(
+        job,
+        () => isPublishRequestCurrent(request),
+        (nextJob) => acceptPublishJob(nextJob, request),
+      );
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '重试失败';
+      setPublishPollingError(text);
+      message.error(text);
+    } finally {
+      if (isPublishRequestCurrent(request)) setPublishingAction('');
+    }
+  }
+
+  async function refreshPublishJob() {
+    if (!currentPublishJob) return;
+    const request = beginPublishRequest(currentPublishJob.project_id);
+    setRefreshingPublishJob(true);
+    try {
+      const job = await api.getPublishJob(currentPublishJob.id);
+      if (!acceptPublishJob(job, request)) return;
+      await waitForPublishJob(
+        job,
+        () => isPublishRequestCurrent(request),
+        (nextJob) => acceptPublishJob(nextJob, request),
+      );
+    } catch (error) {
+      if (!isPublishRequestCurrent(request)) return;
+      const text = error instanceof Error ? error.message : '刷新发布状态失败';
+      setPublishPollingError(text);
+      message.error(text);
+    } finally {
+      if (isPublishRequestCurrent(request)) setRefreshingPublishJob(false);
+    }
+  }
+
+  function closePublishModal() {
+    invalidatePublishRequest();
+    invalidatePublishAccountsRequest();
+    publishModalProjectIdRef.current = null;
+    publishAccountsProjectIdRef.current = null;
+    setPublishAccounts([]);
+    publishForm.resetFields();
+    setPublishOpen(false);
+  }
+
+  return (
+    <>
+      <Steps
+        className="creator-stepper"
+        current={['title', 'article', 'image', 'layout'].indexOf(step)}
+        items={['标题确认', '生成文章', '生成图片', '文章排版'].map((title) => ({ title }))}
+        onChange={handleStepChange}
+      />
+      <div className="draft-tip">每一步都会实时自动保存到草稿箱，可从草稿恢复到对应步骤继续创作。</div>
+      {step === 'title' && (
+        <Card className="panel creator-chat" title="和 AI 说明你想写什么">
+          <div className="chat-body">
+            {!topicPrompt && !topicDirections.length && loading !== 'topics' && (
+              <div className="chat-message assistant">
+                <strong>AI 助手</strong>
+                <p>告诉我你想写什么内容、目标客户是谁、产品卖点是什么、希望读者看完做什么。我会先给你推荐选题方向和标题。</p>
+              </div>
+            )}
+            {topicPrompt && <div className="chat-message user"><strong>你</strong><p>{topicPrompt}</p></div>}
+            {loading === 'topics' ? (
+              <div className="chat-message assistant">
+                <Spin size="small" />
+                <p>正在生成选题方向和标题...</p>
+              </div>
+            ) : topicDirections.length ? (
+              <div className="chat-message assistant wide">
+                <strong>AI 推荐选题</strong>
+                {topicDirections.map((direction) => (
+                  <section className="topic-direction-card" key={direction.direction}>
+                    <h3>{direction.direction}</h3>
+                    <p className="muted">{direction.subtitle}</p>
+                    <div className="title-suggestions">
+                      {(direction.titles || []).map((title) => (
+                        <Button key={title} className="suggestion-card" onClick={() => confirmTitle(title, direction.direction)}>
+                          <span>推荐标题</span>
+                          <strong>{title}</strong>
+                        </Button>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            ) : (
+              null
+            )}
+          </div>
+          <Space.Compact className="chat-input-bar">
+            <Input value={topicPrompt} onChange={(event) => setTopicPrompt(event.target.value)} placeholder="例如：写给本地餐饮老板，介绍暑期套餐如何提升到店复购" />
+            <Button type="primary" loading={loading === 'topics'} onClick={generateTopics}>发送</Button>
+          </Space.Compact>
+        </Card>
+      )}
+      {step === 'article' && (
+        <Card className="panel" title="公众号文章创作" extra={<span className="status info">{articleBlocks.length ? '草稿已自动保存' : '等待生成文章'}</span>}>
+          <Form layout="vertical">
+            <Form.Item label="已确认标题">
+              <Input value={selectedTitle} onChange={(event) => setSelectedTitle(event.target.value)} />
+            </Form.Item>
+          </Form>
+          {loading === 'article' ? (
+            <Spin tip="AI 正在生成文章段落..." />
+          ) : articleBlocks.length ? (
+            <div className="article-sections">
+              {articleBlocks.map((block, index) => (
+                <div className="article-segment" key={index}>
+                  <label>{index === 0 ? '引言' : `正文 ${index}`}</label>
+                  <TextArea
+                    value={block.content}
+                    onChange={(event) => setArticleBlocks((prev) => prev.map((item, itemIndex) => itemIndex === index ? { ...item, content: event.target.value } : item))}
+                  />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Empty description="确认标题后，系统会自动生成公众号文章段落。" />
+          )}
+          <Space className="block-gap" style={{ width: '100%' }}>
+            <Button onClick={() => goStep('title')}>上一步</Button>
+            <Button type="primary" block disabled={!articleBlocks.length} onClick={enterImageStep}>文章完成，进入生成图片</Button>
+          </Space>
+        </Card>
+      )}
+      {step === 'image' && (
+        <Card className="panel" title="图片生成" extra={<span className="muted">基于已确认标题和文章内容统一生成封面图和正文配图。</span>}>
+          <ImageGallery title="公众号封面图" type="cover" assets={mediaAssets} loading={imageLoadingType} onGenerate={generateImage} onSelect={selectImage} onDelete={deleteImage} />
+          <ImageGallery title="正文配图" type="inline" assets={mediaAssets} loading={imageLoadingType} onGenerate={generateImage} onSelect={selectImage} onDelete={deleteImage} />
+          <Space className="block-gap" style={{ width: '100%' }}>
+            <Button onClick={() => goStep('article')}>上一步</Button>
+            <Button type="primary" block onClick={enterLayoutStep}>图片完成，进入文章排版</Button>
+          </Space>
+        </Card>
+      )}
+      {step === 'layout' && (
+        <Row gutter={16} align="top">
+          <Col xs={24} xl={10}>
+            <Card className="panel" title="编辑排版">
+              <div className="markdown-layout-editor">
+                <div className="markdown-toolbar">
+                  <Button onClick={() => insertMarkdownLine('# ', '标题')}>H1</Button>
+                  <Button onClick={() => insertMarkdownLine('## ', '小标题')}>H2</Button>
+                  <Button onClick={() => insertMarkdownLine('### ', '三级标题')}>H3</Button>
+                  <Button onClick={() => insertMarkdown('**', '**', '加粗文字')}>B</Button>
+                  <Button onClick={() => insertMarkdown('*', '*', '斜体文字')}>I</Button>
+                  <Button onClick={() => insertMarkdownLine('> ', '引用内容')}>引用</Button>
+                  <Button onClick={() => insertMarkdownLine('- ', '列表项')}>列表</Button>
+                  <Button onClick={() => insertMarkdown('\n\n---\n\n')}>分割线</Button>
+                </div>
+                <Select
+                  className="markdown-image-picker"
+                  placeholder="插入生成图片"
+                  value={undefined}
+                  onChange={insertMarkdownImage}
+                  options={mediaAssets.map((asset, index) => ({
+                    value: asset.id,
+                    label: `${asset.asset_type === 'cover' ? '封面图' : '正文配图'} ${index + 1}`,
+                  }))}
+                />
+                <textarea
+                  ref={layoutEditorRef}
+                  aria-label="Markdown 排版内容"
+                  className="markdown-textarea"
+                  value={layoutMarkdown}
+                  onChange={(event) => setLayoutMarkdown(event.target.value)}
+                  onPaste={(event) => {
+                    if (Array.from(event.clipboardData.files).some((file) => file.type.startsWith('image/'))) {
+                      message.info('请先在生成图片步骤生成图片，再通过“插入生成图片”加入排版。');
+                    }
+                  }}
+                  placeholder="# 输入文章标题&#10;&#10;> 输入引言&#10;&#10;输入正文，也可以插入 ![正文配图](asset:图片ID)"
+                />
+              </div>
+              <Space className="block-gap" style={{ width: '100%' }}>
+                <Button onClick={() => goStep('image')}>上一步</Button>
+                <Button type="primary" block onClick={openPublishModal}>发布</Button>
+              </Space>
+            </Card>
+          </Col>
+          <Col xs={24} xl={14}>
+            <Card className="panel" title="排版预览">
+              <MarkdownPreview markdown={layoutMarkdown} assets={mediaAssets} fallbackTitle={selectedTitle} />
+            </Card>
+          </Col>
+        </Row>
+      )}
+      <Modal title="发布配置" open={publishOpen} onCancel={closePublishModal} footer={null}>
+        <Form form={publishForm} layout="vertical">
+          <Form.Item label="选择账号" name="account_id" rules={[{ required: true, message: '请选择已授权公众号账号' }]}>
+            <Select
+              disabled={Boolean(currentPublishJob)}
+              loading={publishAccountsLoading}
+              placeholder={publishAccounts.length ? '请选择已授权公众号账号' : '暂无已授权公众号账号，请先到账号矩阵登录'}
+              options={publishAccounts.map((account) => ({ value: account.id, label: account.name }))}
+            />
+          </Form.Item>
+          {currentPublishJob && (
+            <Alert
+              className="block-gap"
+              showIcon
+              type={currentPublishJob.status === 'failed' ? 'error' : currentPublishJob.status === 'awaiting_confirmation' ? 'warning' : ['platform_draft', 'published'].includes(currentPublishJob.status) ? 'success' : 'info'}
+              message={currentPublishJob.status === 'platform_draft' ? '平台草稿已创建' : currentPublishJob.status === 'published' ? '平台发布已完成' : currentPublishJob.status === 'awaiting_confirmation' ? '平台要求二次安全确认' : currentPublishJob.status === 'failed' ? '平台发布失败' : '平台正在处理'}
+              description={(
+                <Space direction="vertical" size={4}>
+                  <span>发布任务 ID：{currentPublishJob.id}</span>
+                  {currentPublishJob.status === 'platform_draft' && <span>平台草稿 ID：{currentPublishJob.platform_draft_id || '-'}</span>}
+                  {currentPublishJob.status === 'published' && <span>平台发布 ID：{currentPublishJob.platform_publish_id || '-'}</span>}
+                  {currentPublishJob.platform_url && <a href={currentPublishJob.platform_url} target="_blank" rel="noreferrer">查看平台结果</a>}
+                  {currentPublishJob.status === 'awaiting_confirmation' && <span>当前版本不会发起二次扫码，请重新发布或同步到平台草稿箱后在平台后台处理。</span>}
+                  {currentPublishJob.status === 'failed' && <span>失败阶段：{currentPublishJob.failure_stage || '-'}<br />失败原因：{currentPublishJob.failure_reason || '-'}</span>}
+                  {currentPublishJob.status === 'failed' && <Button loading={Boolean(publishingAction)} disabled={publishAccountsLoading} onClick={retryPublishJob}>重试</Button>}
+                </Space>
+              )}
+            />
+          )}
+          {currentPublishJob && publishPollingError && (
+            <Alert
+              className="block-gap"
+              showIcon
+              type="warning"
+              message="发布状态刷新失败"
+              description={(
+                <Space direction="vertical" size={4}>
+                  <span>{publishPollingError}</span>
+                  <Button loading={refreshingPublishJob} disabled={publishAccountsLoading} onClick={refreshPublishJob}>刷新发布状态</Button>
+                </Space>
+              )}
+            />
+          )}
+          <Space wrap>
+            <Button
+              loading={publishingAction === 'draft'}
+              disabled={!publishAccounts.length || publishAccountsLoading || Boolean(publishingAction) || Boolean(currentPublishJob && !['platform_draft', 'published'].includes(currentPublishJob.status))}
+              onClick={() => runPublishAction('draft')}
+            >
+              同步到平台草稿箱
+            </Button>
+            <Button
+              type="primary"
+              loading={publishingAction === 'publish'}
+              disabled={!publishAccounts.length || publishAccountsLoading || Boolean(publishingAction) || Boolean(currentPublishJob && !['platform_draft', 'published'].includes(currentPublishJob.status))}
+              onClick={() => runPublishAction('publish')}
+            >
+              一键发布
+            </Button>
+            <Button
+              disabled={publishAccountsLoading || Boolean(publishingAction) || refreshingPublishJob || currentPublishJobActive}
+              loading={publishAccountsLoading}
+              onClick={refreshPublishAccounts}
+            >
+              刷新账号
+            </Button>
+            <Button onClick={closePublishModal}>取消</Button>
+          </Space>
+        </Form>
+      </Modal>
+    </>
+  );
+}
+
+function ImageGallery({
+  title,
+  type,
+  assets,
+  loading,
+  onGenerate,
+  onSelect,
+  onDelete,
+}: {
+  title: string;
+  type: 'cover' | 'inline';
+  assets: MediaAsset[];
+  loading: string;
+  onGenerate: (type: 'cover' | 'inline') => void;
+  onSelect: (asset: MediaAsset) => void;
+  onDelete: (asset: MediaAsset) => void;
+}) {
+  const typed = assets.filter((asset) => asset.asset_type === type);
+  const isLoading = loading === type || loading === 'all';
+  return (
+    <div className="image-gallery">
+      <div className="panel-header">
+        <h3>{title}</h3>
+        <Button onClick={() => onGenerate(type)}>继续生图</Button>
+      </div>
+      <Image.PreviewGroup>
+        <div className="image-options">
+          {typed.map((asset, index) => (
+            <div className={`image-option ${Number(asset.selected) === 1 ? 'active' : ''}`} key={asset.id}>
+              <Image src={assetUrl(asset.url)} alt={`${title} ${index + 1}`} />
+              <Popconfirm
+                title="删除这张图片？"
+                okText="删除"
+                cancelText="取消"
+                onConfirm={(event) => {
+                  event?.stopPropagation();
+                  onDelete(asset);
+                }}
+              >
+                <Button
+                  aria-label="删除图片"
+                  className="image-delete-icon"
+                  type="text"
+                  onClick={(event) => event.stopPropagation()}
+                >
+                  ×
+                </Button>
+              </Popconfirm>
+              <Button className="image-select-button" onClick={() => onSelect(asset)}>
+                {Number(asset.selected) === 1 ? '已选择' : '选择'}
+              </Button>
+              {Number(asset.selected) === 1 && <span className="check-mark">✓</span>}
+            </div>
+          ))}
+          {isLoading && <div className="loading-option"><Spin /><strong>图片正在生成中</strong><span>请稍候，精彩内容即将呈现</span></div>}
+          {!typed.length && !isLoading && <Empty description={`暂无${title}`} />}
+        </div>
+      </Image.PreviewGroup>
+    </div>
+  );
+}
+
+function MarkdownPreview({
+  markdown,
+  assets,
+  fallbackTitle,
+}: {
+  markdown: string;
+  assets: MediaAsset[];
+  fallbackTitle: string;
+}) {
+  const assetsById = new Map(assets.map((asset) => [asset.id, asset]));
+  const lines = markdown.trim() ? markdown.split('\n') : [`# ${fallbackTitle || '未确认标题'}`];
+  const rendered = lines
+    .map((line, index) => renderMarkdownLine(line, index, assetsById))
+    .filter(Boolean);
+
+  if (!rendered.length) return <Empty description="暂无排版内容" />;
+  return <div className="wechat-preview markdown-preview">{rendered}</div>;
+}
+
+function renderMarkdownLine(line: string, index: number, assetsById: Map<number, MediaAsset>) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  const imageMatches = Array.from(trimmed.matchAll(markdownAssetPattern));
+  const text = trimmed.replace(markdownAssetPattern, '').trim();
+  const images = imageMatches
+    .map((match) => assetsById.get(Number(match[1])))
+    .filter((asset): asset is MediaAsset => Boolean(asset));
+
+  const contentNode = renderMarkdownText(text, index);
+  return (
+    <div className="markdown-preview-row" key={`${index}-${trimmed}`}>
+      {contentNode}
+      <Image.PreviewGroup>
+        {images.map((asset) => (
+          <Image
+            className={asset.asset_type === 'cover' ? 'preview-cover-img' : 'preview-inline-img'}
+            src={assetUrl(asset.url)}
+            alt={asset.asset_type === 'cover' ? '封面图' : '正文配图'}
+            key={asset.id}
+          />
+        ))}
+      </Image.PreviewGroup>
+    </div>
+  );
+}
+
+function renderMarkdownText(text: string, index: number) {
+  if (!text) return null;
+  if (text.startsWith('# ')) return <h1>{stripInlineMarkdown(text.slice(2))}</h1>;
+  if (text.startsWith('## ')) return <h2>{stripInlineMarkdown(text.slice(3))}</h2>;
+  if (text.startsWith('### ')) return <h3>{stripInlineMarkdown(text.slice(4))}</h3>;
+  if (text.startsWith('>')) return <blockquote>{stripInlineMarkdown(text.slice(1).trim())}</blockquote>;
+  if (text === '---') return <hr />;
+  if (text.startsWith('- ') || text.startsWith('* ')) return <p className="markdown-list-item">{stripInlineMarkdown(text.slice(2))}</p>;
+  if (/^\d+\.\s+/.test(text)) return <p className="markdown-list-item">{stripInlineMarkdown(text.replace(/^\d+\.\s+/, ''))}</p>;
+  return <p key={index}>{stripInlineMarkdown(text)}</p>;
+}
+
+function stripInlineMarkdown(text: string) {
+  return text
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/`([^`]+)`/g, '$1');
+}

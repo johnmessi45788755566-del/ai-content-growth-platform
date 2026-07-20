@@ -87,6 +87,8 @@ export interface ScheduledTask {
   weekly_day?: number | null;
   failure_stage?: string;
   failure_reason?: string;
+  content_project_id?: number | null;
+  publish_package_id?: number | null;
   runs?: TaskRun[];
   content_project?: ContentProject;
   publish_job?: PublishJob;

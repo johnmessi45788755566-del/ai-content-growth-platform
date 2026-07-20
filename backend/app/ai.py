@@ -178,6 +178,8 @@ def _raise_for_status(response: httpx.Response, message: str) -> None:
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
         body = response.text.strip()
+        if "AccountOverdueError" in body:
+            raise AIResponseError("图片模型账户欠费或余额不足，请在火山方舟充值后重试失败任务") from exc
         detail = f"{message}：HTTP {response.status_code}"
         if body:
             detail = f"{detail}，返回：{body[:1000]}"

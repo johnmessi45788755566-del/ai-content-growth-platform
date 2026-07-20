@@ -178,7 +178,64 @@ afterEach(() => {
 });
 
 describe('Creator publishing', () => {
-  it('loads and resumes an existing publish job when the publish area is reopened', async () => {
+  it('seeds the markdown layout editor with generated images from the image step', async () => {
+    const restoredProject = {
+      ...project(1, '图片传递标题'),
+      article_blocks: [
+        { block_type: 'intro', label: '引言', content: '引言内容' },
+        { block_type: 'body', label: '正文', content: '正文一' },
+        { block_type: 'body', label: '正文', content: '正文二' },
+      ],
+      media_assets: [
+        { id: 5, asset_type: 'cover', url: '/cover.svg', selected: 1 },
+        { id: 6, asset_type: 'inline', url: '/inline.svg', selected: 1 },
+      ],
+      layout_blocks: [],
+    };
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(restoredProject);
+
+    render(<Creator />);
+
+    const editor = await screen.findByLabelText('Markdown 排版内容') as HTMLTextAreaElement;
+    expect(editor.value).toContain('# 图片传递标题');
+    expect(editor.value).toContain('![封面图](asset:5)');
+    expect(editor.value).toContain('> 引言内容');
+    expect(editor.value).toContain('正文一');
+    expect(editor.value).toContain('![正文配图 1](asset:6)');
+  });
+
+  it('previews multiple markdown images on the same line', async () => {
+    const restoredProject = {
+      ...project(1, '一行多图标题'),
+      media_assets: [
+        { id: 6, asset_type: 'inline', url: '/inline-1.svg', selected: 1 },
+        { id: 7, asset_type: 'inline', url: '/inline-2.svg', selected: 1 },
+        { id: 8, asset_type: 'inline', url: '/inline-3.svg', selected: 1 },
+      ],
+      layout_blocks: [
+        {
+          id: 1,
+          project_id: 1,
+          section_type: 'markdown',
+          content: '# 一行多图标题\n\n![图1](asset:6) ![图2](asset:7) ![图3](asset:8)',
+          media_asset_id: null,
+          sort_order: 1,
+        },
+      ],
+    };
+    window.history.replaceState({}, '', '/creator?project_id=1&stage=layout');
+    api.getProject.mockResolvedValue(restoredProject);
+
+    render(<Creator />);
+
+    await screen.findByLabelText('Markdown 排版内容');
+    expect(screen.getByAltText('图1').getAttribute('src')).toBe('/inline-1.svg');
+    expect(screen.getByAltText('图2').getAttribute('src')).toBe('/inline-2.svg');
+    expect(screen.getByAltText('图3').getAttribute('src')).toBe('/inline-3.svg');
+  });
+
+  it('loads an existing awaiting-confirmation publish job without second-scan resume', async () => {
     const restoredProject = project(1, '恢复发布项目');
     const waiting = publishJob({
       id: 80,
@@ -194,28 +251,18 @@ describe('Creator publishing', () => {
     api.saveLayout.mockResolvedValue({ project: restoredProject, layout_blocks: [] });
     api.accounts.mockResolvedValue({ accounts: [authorizedAccount, boundAccount, ...unavailableAccounts] });
     api.projectPublishJob.mockResolvedValue({ job: waiting });
-    api.resumePublishJob.mockResolvedValue(publishJob({
-      id: 80,
-      project_id: 1,
-      action: 'publish',
-      status: 'published',
-      platform_draft_id: '',
-      platform_publish_id: 'publish-80',
-    }));
-
     render(<Creator />);
 
     await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
     clickButton('发布');
-    await screen.findByText('等待运营人员确认');
+    await screen.findByText('平台要求二次安全确认');
     expect(api.projectPublishJob).toHaveBeenCalledWith(1);
     expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0);
     expect(api.currentPublishJob).not.toHaveBeenCalled();
-
-    clickButton('继续确认发布');
-    await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(80));
     expect(api.createPublishJob).not.toHaveBeenCalled();
-    await screen.findByText('平台发布已完成');
+    expect(api.resumePublishJob).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain('当前版本不会发起二次扫码');
+    expect(screen.queryByText('继续确认发布')).toBeNull();
   });
 
   it('keeps an existing job when account restore fails and refreshes accounts independently', async () => {
@@ -241,7 +288,7 @@ describe('Creator publishing', () => {
 
     await waitFor(() => expect(api.getProject).toHaveBeenCalledWith(1));
     clickButton('发布');
-    await screen.findByText('等待运营人员确认');
+    await screen.findByText('平台要求二次安全确认');
     expect(document.body.textContent).toContain('发布任务 ID：85');
     expect(screen.queryByText('发布状态刷新失败')).toBeNull();
 
@@ -249,7 +296,7 @@ describe('Creator publishing', () => {
     await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0));
     expect(document.body.textContent).toContain('发布任务 ID：85');
-    expect(screen.queryByText('继续确认发布')).not.toBeNull();
+    expect(screen.queryByText('继续确认发布')).toBeNull();
   });
 
   it('maps the two publish buttons to draft and publish for an authorized WeChat account only', async () => {
@@ -267,7 +314,8 @@ describe('Creator publishing', () => {
     clickButton('发布');
     await waitFor(() => expect(api.accounts).toHaveBeenCalled());
 
-    const accountSelect = screen.getByRole('combobox');
+    const accountSelect = document.querySelector('#account_id') as HTMLElement;
+    expect(accountSelect).not.toBeNull();
     fireEvent.mouseDown(accountSelect);
     expect(screen.queryAllByText(authorizedAccount.name).length).toBeGreaterThan(0);
     expect(screen.queryByText(unavailableAccounts[0].name)).toBeNull();
@@ -506,7 +554,7 @@ describe('Draft publishing', () => {
 
     await screen.findByText(restoredDraft.title);
     clickButton('发布');
-    await screen.findByText('等待运营人员确认');
+    await screen.findByText('平台要求二次安全确认');
     expect(document.body.textContent).toContain('发布任务 ID：87');
     expect(screen.queryByText('发布状态刷新失败')).toBeNull();
 
@@ -514,10 +562,10 @@ describe('Draft publishing', () => {
     await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getAllByText(boundAccount.name).length).toBeGreaterThan(0));
     expect(document.body.textContent).toContain('发布任务 ID：87');
-    expect(screen.queryByText('继续确认发布')).not.toBeNull();
+    expect(screen.queryByText('继续确认发布')).toBeNull();
   });
 
-  it('only offers publishing after layout and supports failed retry through confirmation resume', async () => {
+  it('only offers publishing after layout and shows awaiting confirmation without second-scan resume', async () => {
     api.drafts.mockResolvedValue({
       drafts: [
         { id: 1, project_id: 1, title: '正文草稿', stage: '生成文章', restore_stage: 'article', platform: '微信公众号', updated_at: '2026-07-14' },
@@ -526,7 +574,6 @@ describe('Draft publishing', () => {
     });
     api.createPublishJob.mockResolvedValue(publishJob({ project_id: 2, action: 'publish', status: 'failed', platform_draft_id: '', platform_url: '', failure_stage: '发布文章', failure_reason: '平台拒绝' }));
     api.retryPublishJob.mockResolvedValue(publishJob({ project_id: 2, action: 'publish', status: 'awaiting_confirmation', platform_draft_id: '', platform_url: '', requires_confirmation: true }));
-    api.resumePublishJob.mockResolvedValue(publishJob({ project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'publish-88' }));
 
     render(<Drafts />);
 
@@ -544,11 +591,9 @@ describe('Draft publishing', () => {
 
     clickButton('重试');
     await waitFor(() => expect(api.retryPublishJob).toHaveBeenCalledWith(81));
-    expect(document.body.textContent).toContain('扫描平台弹出的确认二维码');
-
-    clickButton('继续确认发布');
-    await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(81));
-    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-88'));
+    expect(document.body.textContent).toContain('当前版本不会发起二次扫码');
+    expect(screen.queryByText('继续确认发布')).toBeNull();
+    expect(api.resumePublishJob).not.toHaveBeenCalled();
   });
 
   it('does not let account refresh cancel a deferred publish response', async () => {
@@ -675,7 +720,7 @@ describe('Draft publishing', () => {
     await screen.findByText('平台发布已完成');
   });
 
-  it('retains a polling job and recovers awaiting confirmation through status refresh', async () => {
+  it('retains a polling job and shows awaiting confirmation through status refresh', async () => {
     api.drafts.mockResolvedValue({
       drafts: [
         { id: 2, project_id: 2, title: '轮询草稿', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
@@ -686,7 +731,6 @@ describe('Draft publishing', () => {
       .mockRejectedValueOnce(new Error('临时网络失败'))
       .mockRejectedValueOnce(new Error('临时网络失败'))
       .mockResolvedValueOnce(publishJob({ id: 83, project_id: 2, action: 'publish', status: 'awaiting_confirmation', platform_draft_id: '', requires_confirmation: true }));
-    api.resumePublishJob.mockResolvedValue(publishJob({ id: 83, project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'publish-83' }));
 
     render(<Drafts />);
 
@@ -699,23 +743,19 @@ describe('Draft publishing', () => {
     expect(document.body.textContent).toContain('发布任务 ID：83');
     expect(screen.queryByText('刷新发布状态')).not.toBeNull();
     clickButton('刷新发布状态');
-    await waitFor(() => expect(screen.queryByText('继续确认发布')).not.toBeNull());
-    clickButton('继续确认发布');
-    await waitFor(() => expect(document.body.textContent).toContain('平台发布 ID：publish-83'));
+    await screen.findByText('平台要求二次安全确认');
+    expect(document.body.textContent).toContain('当前版本不会发起二次扫码');
+    expect(screen.queryByText('继续确认发布')).toBeNull();
+    expect(api.resumePublishJob).not.toHaveBeenCalled();
   }, 8_000);
 
-  it('releases refresh loading when a newer resume fails before the old refresh finishes', async () => {
-    const staleRefresh = deferred<PublishJob>();
+  it('shows an awaiting-confirmation job without a second-scan action', async () => {
     api.drafts.mockResolvedValue({
       drafts: [
         { id: 2, project_id: 2, title: '确认竞态草稿', stage: '文章排版', restore_stage: 'layout', platform: '微信公众号', updated_at: '2026-07-14' },
       ],
     });
     api.createPublishJob.mockResolvedValue(publishJob({ id: 84, project_id: 2, action: 'publish', status: 'awaiting_confirmation', platform_draft_id: '', requires_confirmation: true }));
-    api.resumePublishJob
-      .mockRejectedValueOnce(new Error('首次继续失败'))
-      .mockRejectedValueOnce(new Error('新代次继续失败'));
-    api.getPublishJob.mockImplementation(() => staleRefresh.promise);
 
     render(<Drafts />);
 
@@ -723,22 +763,32 @@ describe('Draft publishing', () => {
     clickButton('发布');
     await waitFor(() => expect(api.accounts).toHaveBeenCalled());
     clickButton('一键发布');
-    await waitFor(() => expect(screen.queryByText('继续确认发布')).not.toBeNull());
-    clickButton('继续确认发布');
-    await waitFor(() => expect(screen.queryByText('首次继续失败')).not.toBeNull());
-
-    clickButton('刷新发布状态');
-    await waitFor(() => expect(api.getPublishJob).toHaveBeenCalledWith(84));
-    clickButton('继续确认发布');
-    await waitFor(() => expect(screen.queryByText('新代次继续失败')).not.toBeNull());
-    staleRefresh.resolve(publishJob({ id: 84, project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'stale-result' }));
-
-    await waitFor(() => expectButtonReady('刷新发布状态'));
-    expect(screen.queryByText('平台发布 ID：stale-result')).toBeNull();
+    await screen.findByText('平台要求二次安全确认');
+    expect(screen.queryByText('刷新发布状态')).toBeNull();
+    expect(screen.queryByText('继续确认发布')).toBeNull();
+    expect(document.body.textContent).toContain('当前版本不会发起二次扫码');
+    expect(api.resumePublishJob).not.toHaveBeenCalled();
   });
 });
 
 describe('Task publishing results', () => {
+  it('orders tasks by execution time from newest to oldest', async () => {
+    api.tasks.mockResolvedValue({
+      tasks: [
+        scheduledTask(1, { topic: '7月15日任务', execute_time: '2026-07-15 09:30', next_run_at: '2026-07-15 09:30' }),
+        scheduledTask(2, { topic: '7月17日任务', execute_time: '2026-07-17 09:30', next_run_at: '2026-07-17 09:30' }),
+        scheduledTask(3, { topic: '7月16日任务', execute_time: '2026-07-16 09:30', next_run_at: '2026-07-16 09:30' }),
+      ],
+    });
+
+    render(<Tasks />);
+
+    await screen.findByText('7月17日任务');
+    const pageText = document.body.textContent || '';
+    expect(pageText.indexOf('7月17日任务')).toBeLessThan(pageText.indexOf('7月16日任务'));
+    expect(pageText.indexOf('7月16日任务')).toBeLessThan(pageText.indexOf('7月15日任务'));
+  });
+
   it('keeps task loading active across the StrictMode effect remount', async () => {
     api.tasks.mockResolvedValue({
       tasks: [scheduledTask(3, { topic: '严格模式任务', status: '待执行' })],
@@ -782,7 +832,7 @@ describe('Task publishing results', () => {
     expect(screen.getByText('最新筛选任务')).not.toBeNull();
   });
 
-  it('renders hydrated publish jobs and refreshes the task row after resume', async () => {
+  it('renders hydrated publish jobs without second-scan resume', async () => {
     const published = scheduledTask(1, {
       topic: '已发布任务',
       status: '已发布',
@@ -792,26 +842,15 @@ describe('Task publishing results', () => {
       topic: '待确认任务',
       publish_job: publishJob({ id: 92, project_id: 2, action: 'publish', status: 'awaiting_confirmation', platform_draft_id: '', platform_url: '', requires_confirmation: true }),
     });
-    const resumedJob = publishJob({ id: 92, project_id: 2, action: 'publish', status: 'published', platform_draft_id: '', platform_publish_id: 'publish-92' });
-    const resumed = scheduledTask(2, {
-      topic: '待确认任务',
-      status: '已发布',
-      publish_job: resumedJob,
-    });
-    api.tasks.mockResolvedValueOnce({ tasks: [published, waiting] }).mockResolvedValue({ tasks: [published, resumed] });
-    api.task.mockResolvedValue(resumed);
-    api.resumePublishJob.mockResolvedValue(resumedJob);
+    api.tasks.mockResolvedValue({ tasks: [published, waiting] });
 
     render(<Tasks />);
 
     await waitFor(() => expect(screen.queryByText('发布 ID：publish-91')).not.toBeNull());
     expect(screen.queryAllByText('待人工确认').length).toBeGreaterThan(0);
-    clickButton('继续确认发布');
-
-    await waitFor(() => expect(api.resumePublishJob).toHaveBeenCalledWith(92));
-    expect(api.task).toHaveBeenCalledWith(2);
-    await waitFor(() => expect(api.tasks.mock.calls.length).toBeGreaterThanOrEqual(2));
-    expect(screen.queryByText('发布 ID：publish-92')).not.toBeNull();
+    expect(screen.queryAllByText('平台要求二次安全确认').length).toBeGreaterThan(0);
+    expect(screen.queryByText('继续确认发布')).toBeNull();
+    expect(api.resumePublishJob).not.toHaveBeenCalled();
   });
 
   it('retries a failed hydrated publish job instead of rerunning the scheduled task', async () => {

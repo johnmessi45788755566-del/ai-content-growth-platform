@@ -339,6 +339,13 @@ def create_app(
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.delete("/api/content-projects/{project_id}/media-assets/{asset_id}")
+    def delete_media_asset(project_id: int, asset_id: int) -> dict[str, Any]:
+        try:
+            return service.delete_media_asset(project_id, asset_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.patch("/api/content-projects/{project_id}/stage")
     def update_stage(project_id: int, payload: StageUpdateRequest) -> dict[str, Any]:
         try:
@@ -481,6 +488,17 @@ def create_app(
     @app.post("/api/tasks/retry")
     def retry_tasks(payload: TaskRetryRequest | None = None) -> dict[str, Any]:
         return service.retry_failed_tasks(payload.task_ids if payload else None)
+
+    @app.post("/api/tasks/{task_id}/sync-draft")
+    def sync_failed_task_to_platform_draft(task_id: int) -> dict[str, Any]:
+        try:
+            return service.sync_failed_task_to_platform_draft(task_id)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except TaskConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/publish-jobs")
     def create_publish_job(payload: PublishJobRequest) -> dict[str, Any]:
