@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "max dev",
+    "dev": "PORT=5173 max dev",
     "build": "max build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

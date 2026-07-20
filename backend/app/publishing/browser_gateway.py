@@ -1186,6 +1186,344 @@ class ChromeCDPBrowserGateway:
         path.chmod(0o600)
         return str(path)
 
+    def install_page_monitor(self, session: BrowserSession, label: str = "") -> None:
+        if not self._trace_path:
+            return
+        expression = """
+        (() => {
+          /* codex-publish-monitor:install */
+          const limit = (items, count = 80) => {
+            while (items.length > count) items.shift();
+          };
+          const redactedUrl = (value) => {
+            try {
+              const url = new URL(String(value || ''), location.href);
+              return `${url.origin}${url.pathname}`;
+            } catch (_) {
+              return String(value || '').split('?')[0].slice(0, 400);
+            }
+          };
+          const textOf = (value) => {
+            try {
+              if (value instanceof Error) return value.stack || value.message || String(value);
+              if (typeof value === 'string') return value;
+              return JSON.stringify(value);
+            } catch (_) {
+              return String(value);
+            }
+          };
+          const trace = window.__codexPublishTrace || {
+            requests: [],
+            console: [],
+            errors: [],
+            installedAt: new Date().toISOString()
+          };
+          window.__codexPublishTrace = trace;
+          const pushRequest = (item) => {
+            trace.requests.push({
+              ts: new Date().toISOString(),
+              ...item,
+              url: redactedUrl(item.url)
+            });
+            limit(trace.requests, 120);
+          };
+          const pushConsole = (level, args) => {
+            trace.console.push({
+              ts: new Date().toISOString(),
+              level,
+              message: args.map(textOf).join(' ').slice(0, 1200)
+            });
+            limit(trace.console, 120);
+          };
+          const pushError = (item) => {
+            trace.errors.push({
+              ts: new Date().toISOString(),
+              message: textOf(item.message || item.reason || item.error || item).slice(0, 1200),
+              source: String(item.filename || item.source || '').split('?')[0],
+              line: item.lineno || 0,
+              column: item.colno || 0
+            });
+            limit(trace.errors, 120);
+          };
+          if (!window.__codexPublishTraceConsoleWrapped) {
+            window.__codexPublishTraceConsoleWrapped = true;
+            ['log', 'warn', 'error'].forEach((level) => {
+              const original = console[level];
+              console[level] = function(...args) {
+                pushConsole(level, args);
+                return original.apply(this, args);
+              };
+            });
+          }
+          if (!window.__codexPublishTraceErrorWrapped) {
+            window.__codexPublishTraceErrorWrapped = true;
+            window.addEventListener('error', (event) => pushError(event));
+            window.addEventListener('unhandledrejection', (event) => pushError(event));
+          }
+          if (!window.__codexPublishTraceFetchWrapped && window.fetch) {
+            window.__codexPublishTraceFetchWrapped = true;
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = function(input, init) {
+              const started = Date.now();
+              const url = input && input.url ? input.url : input;
+              const method = (init && init.method) || (input && input.method) || 'GET';
+              return originalFetch(input, init).then((response) => {
+                pushRequest({
+                  kind: 'fetch',
+                  method: String(method).toUpperCase(),
+                  url,
+                  status: response.status,
+                  ok: response.ok,
+                  duration_ms: Date.now() - started
+                });
+                return response;
+              }, (error) => {
+                pushRequest({
+                  kind: 'fetch',
+                  method: String(method).toUpperCase(),
+                  url,
+                  error: textOf(error),
+                  duration_ms: Date.now() - started
+                });
+                throw error;
+              });
+            };
+          }
+          if (!window.__codexPublishTraceXHRWrapped && window.XMLHttpRequest) {
+            window.__codexPublishTraceXHRWrapped = true;
+            const originalOpen = XMLHttpRequest.prototype.open;
+            const originalSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+              this.__codexPublishTrace = { method, url };
+              return originalOpen.call(this, method, url, ...rest);
+            };
+            XMLHttpRequest.prototype.send = function(...args) {
+              const started = Date.now();
+              const meta = this.__codexPublishTrace || {};
+              this.addEventListener('loadend', () => {
+                pushRequest({
+                  kind: 'xhr',
+                  method: String(meta.method || 'GET').toUpperCase(),
+                  url: meta.url || '',
+                  status: this.status,
+                  ok: this.status >= 200 && this.status < 400,
+                  duration_ms: Date.now() - started
+                });
+              });
+              this.addEventListener('error', () => {
+                pushRequest({
+                  kind: 'xhr',
+                  method: String(meta.method || 'GET').toUpperCase(),
+                  url: meta.url || '',
+                  error: 'xhr error',
+                  duration_ms: Date.now() - started
+                });
+              });
+              return originalSend.apply(this, args);
+            };
+          }
+          if (!window.__codexPublishTraceBeaconWrapped && navigator.sendBeacon) {
+            window.__codexPublishTraceBeaconWrapped = true;
+            const originalBeacon = navigator.sendBeacon.bind(navigator);
+            navigator.sendBeacon = function(url, data) {
+              const started = Date.now();
+              try {
+                const ok = originalBeacon(url, data);
+                pushRequest({
+                  kind: 'sendBeacon',
+                  method: 'POST',
+                  url,
+                  status: ok ? 0 : -1,
+                  ok,
+                  duration_ms: Date.now() - started
+                });
+                return ok;
+              } catch (error) {
+                pushRequest({
+                  kind: 'sendBeacon',
+                  method: 'POST',
+                  url,
+                  error: textOf(error),
+                  duration_ms: Date.now() - started
+                });
+                throw error;
+              }
+            };
+          }
+          return {
+            ok: true,
+            installed: true,
+            counts: {
+              requests: trace.requests.length,
+              console: trace.console.length,
+              errors: trace.errors.length
+            }
+          };
+        })()
+        """
+        try:
+            result = self.evaluate(session, expression)
+            self._trace("monitor.installed", label=label, result=result)
+        except Exception as exc:
+            self._trace("monitor.install_failed", label=label, error=str(exc))
+
+    def capture_debug_state(
+        self,
+        session: BrowserSession,
+        label: str,
+        include_screenshot: bool = True,
+    ) -> None:
+        if not self._trace_path:
+            return
+        self.install_page_monitor(session, label)
+        expression = """
+        (() => {
+          /* codex-publish-monitor:snapshot */
+          const compactText = (value) => String(value || '').normalize('NFKC').replace(/\\s+/g, ' ').trim();
+          const visible = (node) => {
+            if (!node || !node.getClientRects || !node.getClientRects().length) return false;
+            const style = getComputedStyle(node);
+            return style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) !== 0;
+          };
+          const rectOf = (node) => {
+            const rect = node.getBoundingClientRect();
+            return {
+              x: Math.round(rect.x),
+              y: Math.round(rect.y),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            };
+          };
+          const describe = (node) => ({
+            tag: node.tagName ? node.tagName.toLowerCase() : '',
+            id: node.id || '',
+            className: typeof node.className === 'string' ? node.className : '',
+            text: compactText(node.innerText || node.textContent).slice(0, 240),
+            disabled: !!node.disabled || node.getAttribute('aria-disabled') === 'true',
+            rect: rectOf(node)
+          });
+          const redactedUrl = (value) => {
+            try {
+              const url = new URL(String(value || ''), location.href);
+              return `${url.origin}${url.pathname}`;
+            } catch (_) {
+              return String(value || '').split('?')[0].slice(0, 400);
+            }
+          };
+          const visibleList = (selector, max = 80) => [...document.querySelectorAll(selector)].filter(visible).slice(0, max);
+          const buttons = visibleList('button,a,[role="button"],.weui-desktop-btn,.pop-opr__button', 100).map(describe);
+          const dialogs = visibleList('.weui-desktop-dialog,.weui-desktop-dialog__wrp,[role="dialog"],.pop-opr__group,.weui-desktop-mask', 30).map(describe);
+          const coverArea = document.querySelector('.js_cover_area,.js_cover_preview_square,.select-cover__preview,.cover_appmsg_item');
+          const coverCandidates = visibleList('.appmsg_content_img_item,.appmsg_content_img_list li,.img_crop_panel li,[class*="appmsg_content_img"] li', 60).map((node) => ({
+            ...describe(node),
+            selected: /(^|\\s)selected(\\s|$)/.test(node.className || '') || !!node.querySelector('.selected,[class*="selected"]')
+          }));
+          const editorNodes = [...document.querySelectorAll('.ProseMirror[contenteditable="true"],#ueditor_0,[contenteditable="true"].js_editor,[contenteditable="true"]')].filter(visible);
+          const editorText = compactText(editorNodes.map((node) => node.innerText || node.textContent).join('\\n'));
+          const activeElement = document.activeElement ? describe(document.activeElement) : null;
+          return {
+            ok: true,
+            url: redactedUrl(location.href),
+            title: document.title,
+            readyState: document.readyState,
+            viewport: {
+              innerWidth: window.innerWidth,
+              innerHeight: window.innerHeight,
+              scrollX: Math.round(window.scrollX),
+              scrollY: Math.round(window.scrollY)
+            },
+            activeElement,
+            buttons,
+            dialogs,
+            cover: {
+              areaText: coverArea ? compactText(coverArea.innerText || coverArea.textContent).slice(0, 240) : '',
+              menuOpen: visibleList('.pop-opr__group,.js_cover_opr', 10).length,
+              pickerOpen: visibleList('.weui-desktop-dialog_img-picker,.img_crop_panel,.appmsg_content_img_container', 20).length,
+              editDialogOpen: visibleList('mp-image-product-dialog,.img_crop_panel,.weui-desktop-dialog__wrp', 20).some((node) => compactText(node.innerText || node.textContent).includes('确认')),
+              selectedCount: coverCandidates.filter((item) => item.selected).length,
+              candidateCount: coverCandidates.length,
+              candidates: coverCandidates
+            },
+            editor: {
+              contentEditableCount: editorNodes.length,
+              imageCount: editorNodes.reduce((count, node) => count + node.querySelectorAll('img').length, 0),
+              textLength: editorText.length,
+              textSample: editorText.slice(0, 500)
+            },
+            trace: window.__codexPublishTrace || { requests: [], console: [], errors: [] },
+            resources: (performance.getEntriesByType ? performance.getEntriesByType('resource') : []).slice(-80).map((entry) => ({
+              name: redactedUrl(entry.name),
+              initiatorType: entry.initiatorType || '',
+              duration: Math.round(entry.duration || 0),
+              transferSize: entry.transferSize || 0,
+              encodedBodySize: entry.encodedBodySize || 0,
+              decodedBodySize: entry.decodedBodySize || 0
+            }))
+          };
+        })()
+        """
+        try:
+            state = self.evaluate(session, expression)
+            safe_state = self._safe_trace_payload(state)
+            self._trace("monitor.snapshot", label=label, state=safe_state)
+            self._write_trace_json_artifact(label, safe_state)
+            if include_screenshot:
+                self._capture_trace_screenshot(session, label)
+        except Exception as exc:
+            self._trace("monitor.snapshot_failed", label=label, error=str(exc))
+
+    def _trace_artifact_dir(self) -> Path | None:
+        if not self._trace_path:
+            return None
+        path = self._trace_path.with_suffix("")
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _trace_filename_part(value: str) -> str:
+        cleaned = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in str(value or "").strip()
+        ).strip("_")
+        return (cleaned or "snapshot")[:80]
+
+    def _trace_artifact_path(self, label: str, suffix: str) -> Path | None:
+        directory = self._trace_artifact_dir()
+        if not directory:
+            return None
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        return directory / f"{timestamp}-{self._trace_filename_part(label)}{suffix}"
+
+    def _write_trace_json_artifact(self, label: str, state: Any) -> None:
+        path = self._trace_artifact_path(label, "-state.json")
+        if not path:
+            return
+        try:
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            path.chmod(0o600)
+            self._trace("monitor.snapshot_file", label=label, path=str(path))
+        except OSError as exc:
+            self._trace("monitor.snapshot_file_failed", label=label, error=str(exc))
+
+    def _capture_trace_screenshot(self, session: BrowserSession, label: str) -> None:
+        path = self._trace_artifact_path(label, ".png")
+        if not path:
+            return
+        try:
+            result = self._cdp_call(
+                session,
+                "Page.captureScreenshot",
+                {"format": "png", "fromSurface": True},
+            )
+            data = str(result.get("data") or "")
+            if not data:
+                raise WeChatPublishingError("微信页面截图为空")
+            path.write_bytes(base64.b64decode(data))
+            path.chmod(0o600)
+            self._trace("monitor.screenshot", label=label, path=str(path))
+        except Exception as exc:
+            self._trace("monitor.screenshot_failed", label=label, error=str(exc))
+
     def close(self, session: BrowserSession) -> None:
         self._sessions.pop(session.session_id, None)
         with self._lock:
@@ -1307,9 +1645,11 @@ class ChromeCDPBrowserGateway:
                 )
             )
             self.navigate(session, editor_url)
-            return
-        self._click_first(session, NEW_ARTICLE_SELECTORS, "新建图文入口")
+        else:
+            self._click_first(session, NEW_ARTICLE_SELECTORS, "新建图文入口")
         self._wait_for_document(session)
+        self.install_page_monitor(session, "open_article_editor")
+        self.capture_debug_state(session, "open_article_editor", include_screenshot=False)
 
     def fill_article(self, session: BrowserSession, payload: Mapping[str, Any]) -> None:
         self.fill_article_content(session, payload)
@@ -1327,29 +1667,36 @@ class ChromeCDPBrowserGateway:
             self._set_value(session, DIGEST_SELECTORS, digest, "摘要", required=False)
 
         self._set_editor_html(session, self._article_body_html(payload))
+        self.capture_debug_state(session, "after_fill_article_content", include_screenshot=False)
 
     def upload_article_assets(
         self, session: BrowserSession, payload: Mapping[str, Any]
     ) -> None:
-        cover_path = str(payload.get("cover_path") or "").strip()
-        if cover_path:
-            article_image_paths = self._article_image_paths(
-                payload, include_cover_candidate=True
-            )
-            self._trace(
-                "upload.cover_from_article_image_picker_primary",
-                article_image_count=len(article_image_paths),
-                cover_candidate_in_body=bool(self._cover_candidate_path(payload)),
-            )
-            if not article_image_paths:
-                raise WeChatPublishingError(
-                    "微信发布需要封面，但正文没有可用于从正文选择封面的图片；请在排版中插入一张图片，或先同步到平台草稿箱"
+        self.capture_debug_state(session, "before_upload_article_assets", include_screenshot=False)
+        try:
+            cover_path = str(payload.get("cover_path") or "").strip()
+            if cover_path:
+                article_image_paths = self._article_image_paths(
+                    payload, include_cover_candidate=True
                 )
-            self._set_cover_from_article_image_picker(
-                session,
-                cover_path,
-                "",
-            )
+                self._trace(
+                    "upload.cover_from_article_image_picker_primary",
+                    article_image_count=len(article_image_paths),
+                    cover_candidate_in_body=bool(self._cover_candidate_path(payload)),
+                )
+                if not article_image_paths:
+                    raise WeChatPublishingError(
+                        "微信发布需要封面，但正文没有可用于从正文选择封面的图片；请在排版中插入一张图片，或先同步到平台草稿箱"
+                    )
+                self._set_cover_from_article_image_picker(
+                    session,
+                    cover_path,
+                    "",
+                )
+        except Exception:
+            self.capture_debug_state(session, "upload_article_assets_failed", include_screenshot=True)
+            raise
+        self.capture_debug_state(session, "after_upload_article_assets", include_screenshot=True)
 
     @staticmethod
     def _is_cover_upload_input_missing_error(exc: Exception) -> bool:
@@ -1455,13 +1802,21 @@ class ChromeCDPBrowserGateway:
         )
 
     def click_save_draft(self, session: BrowserSession) -> None:
+        self.capture_debug_state(session, "before_click_save_draft", include_screenshot=True)
         if not self._click_first(session, SAVE_DRAFT_SELECTORS, "保存草稿按钮", required=False):
             self._click_by_text(session, SAVE_DRAFT_TEXTS, "保存草稿按钮")
+        self.capture_debug_state(session, "after_click_save_draft", include_screenshot=True)
 
     def click_publish(self, session: BrowserSession) -> None:
+        self.capture_debug_state(session, "before_click_publish", include_screenshot=True)
         self._click_first(session, PUBLISH_SELECTORS, "发表按钮")
+        self.capture_debug_state(session, "after_click_publish_button", include_screenshot=True)
         time.sleep(0.8)
-        self._click_first(session, PUBLISH_CONFIRM_SELECTORS, "发表确认按钮", required=False)
+        confirmed = self._click_first(session, PUBLISH_CONFIRM_SELECTORS, "发表确认按钮", required=False)
+        if confirmed:
+            self.capture_debug_state(session, "after_click_publish_confirm", include_screenshot=True)
+        else:
+            self.capture_debug_state(session, "after_click_publish_confirm_missing", include_screenshot=True)
 
     def capture_baseline(
         self, session: BrowserSession, title: str, action: str

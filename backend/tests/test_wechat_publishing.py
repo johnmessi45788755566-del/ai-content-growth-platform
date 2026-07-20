@@ -28,6 +28,7 @@ class FakeWeChatGateway:
         self.filled_payload = None
         self.retained = {}
         self.cancelled = []
+        self.snapshots = []
 
     def open_profile(self, profile_path, url):
         self.actions.append(("open_profile", profile_path, url))
@@ -103,6 +104,10 @@ class FakeWeChatGateway:
 
     def close(self, session):
         self.closed_sessions.append(session)
+
+    def capture_debug_state(self, session, label, include_screenshot=True):
+        self.actions.append(("capture_debug_state", label, include_screenshot))
+        self.snapshots.append((label, include_screenshot))
 
 
 def execute_baseline_state_collector(state_setup: str):
@@ -295,6 +300,28 @@ def test_wechat_browser_publisher_returns_verified_publish_receipt(tmp_path: Pat
     assert "token" not in str(result.response).lower()
     assert gateway.actions.index("capture_baseline") < gateway.actions.index("click_publish")
     assert gateway.actions[-1] == "verify_publish_or_confirmation"
+    assert len(gateway.closed_sessions) == 1
+
+
+def test_wechat_browser_publisher_captures_failure_snapshot_before_closing_session(
+    tmp_path: Path,
+):
+    class FailingPublishGateway(FakeWeChatGateway):
+        def click_publish(self, session):
+            super().click_publish(session)
+            raise WeChatPublishingError("微信发布按钮失败")
+
+    gateway = FailingPublishGateway(published_outcome())
+
+    with pytest.raises(WeChatPublishingError, match="微信发布按钮失败"):
+        WeChatBrowserPublisher(gateway=gateway).publish(
+            article_payload(tmp_path), browser_account(tmp_path), action="publish"
+        )
+
+    assert ("capture_debug_state", "wechat_publish_error", True) in gateway.actions
+    assert gateway.actions.index(
+        ("capture_debug_state", "wechat_publish_error", True)
+    ) < len(gateway.actions)
     assert len(gateway.closed_sessions) == 1
 
 
@@ -2536,6 +2563,86 @@ def test_screenshots_are_collision_safe_and_private(tmp_path: Path):
     finally:
         first.unlink(missing_ok=True)
         second.unlink(missing_ok=True)
+
+
+class PublishMonitorGateway(ChromeCDPBrowserGateway):
+    def _cdp_call(self, session, method, params=None):
+        if method == "Runtime.evaluate":
+            expression = str((params or {}).get("expression") or "")
+            if "codex-publish-monitor:install" in expression:
+                return {"result": {"value": {"ok": True, "installed": True}}}
+            if "codex-publish-monitor:snapshot" in expression:
+                return {
+                    "result": {
+                        "value": {
+                            "ok": True,
+                            "url": "https://mp.weixin.qq.com/cgi-bin/appmsg?token=secret-token",
+                            "title": "公众号",
+                            "readyState": "complete",
+                            "buttons": [
+                                {
+                                    "text": "保存为草稿",
+                                    "disabled": False,
+                                    "rect": {"x": 10, "y": 20, "width": 80, "height": 32},
+                                }
+                            ],
+                            "cover": {
+                                "pickerOpen": True,
+                                "selectedCount": 0,
+                                "candidateCount": 2,
+                            },
+                            "editor": {"imageCount": 2, "textLength": 120},
+                            "trace": {
+                                "requests": [
+                                    {
+                                        "kind": "fetch",
+                                        "url": "https://mp.weixin.qq.com/cgi-bin/save?token=secret-token",
+                                        "status": 500,
+                                    }
+                                ],
+                                "console": [{"level": "error", "message": "boom"}],
+                                "errors": [{"message": "bad"}],
+                            },
+                        }
+                    }
+                }
+            return {"result": {"value": {"ok": True}}}
+        if method == "Page.captureScreenshot":
+            return {"data": "cG5n"}
+        raise AssertionError(method)
+
+
+def test_publish_monitor_captures_page_state_and_private_screenshot(tmp_path: Path):
+    gateway = PublishMonitorGateway()
+    session = browser_session(tmp_path)
+    trace_path = tmp_path / "publish-job-1.jsonl"
+    gateway.set_trace_context(1, str(trace_path))
+
+    gateway.install_page_monitor(session, "编辑封面")
+    gateway.capture_debug_state(session, "编辑封面确认后")
+    gateway.clear_trace_context()
+
+    events = [
+        json.loads(line)
+        for line in trace_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(event["event"] == "monitor.installed" for event in events)
+    snapshot = next(event for event in events if event["event"] == "monitor.snapshot")
+    assert snapshot["label"] == "编辑封面确认后"
+    assert snapshot["state"]["url"] == "https://mp.weixin.qq.com/cgi-bin/appmsg"
+    assert (
+        snapshot["state"]["trace"]["requests"][0]["url"]
+        == "https://mp.weixin.qq.com/cgi-bin/save"
+    )
+
+    screenshot = next(event for event in events if event["event"] == "monitor.screenshot")
+    screenshot_path = Path(screenshot["path"])
+    assert screenshot_path.is_file()
+    assert screenshot_path.stat().st_mode & 0o777 == 0o600
+    assert screenshot_path.read_bytes() == b"png"
+    assert "secret-token" not in trace_path.read_text(encoding="utf-8")
+    assert "cG5n" not in trace_path.read_text(encoding="utf-8")
 
 
 class FakeTimer:

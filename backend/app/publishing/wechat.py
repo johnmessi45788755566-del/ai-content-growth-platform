@@ -115,8 +115,12 @@ class WeChatBrowserPublisher:
             preserve_session = result.requires_confirmation
             return result
         except WeChatPublishingError:
+            if session is not None:
+                self._capture_failure_snapshot(session, "wechat_publish_error")
             raise
         except Exception as exc:
+            if session is not None:
+                self._capture_failure_snapshot(session, "wechat_publish_unexpected_error")
             raise WeChatPublishingError(f"微信公众号浏览器发布失败：{exc}") from exc
         finally:
             if session is not None and not preserve_session:
@@ -141,8 +145,12 @@ class WeChatBrowserPublisher:
             preserve_session = result.requires_confirmation
             return result
         except WeChatPublishingError:
+            if session is not None:
+                self._capture_failure_snapshot(session, "wechat_resume_error")
             raise
         except Exception as exc:
+            if session is not None:
+                self._capture_failure_snapshot(session, "wechat_resume_unexpected_error")
             raise WeChatPublishingError(f"恢复微信公众号扫码确认失败：{exc}") from exc
         finally:
             if session is not None and not preserve_session:
@@ -160,6 +168,15 @@ class WeChatBrowserPublisher:
         self.gateway.bind_confirmation_expiry(
             self._resume_handle(job_context), callback
         )
+
+    def _capture_failure_snapshot(self, session: Any, label: str) -> None:
+        capture = getattr(self.gateway, "capture_debug_state", None)
+        if not callable(capture):
+            return
+        try:
+            capture(session, label)
+        except Exception:
+            pass
 
     def _result(
         self,
