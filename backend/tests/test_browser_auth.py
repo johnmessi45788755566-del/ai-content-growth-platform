@@ -411,6 +411,192 @@ def test_xiaohongshu_login_monitor_marks_current_window_preflight_verified(tmp_p
     assert playwright.stopped is True
 
 
+def test_xiaohongshu_login_monitor_exports_storage_state_for_reusable_auth(tmp_path, monkeypatch):
+    class Page:
+        def __init__(self):
+            self.url = "https://creator.xiaohongshu.com/new/home"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return "找房子的派大星" if "document.querySelector" in expression else self.url
+
+    class Context:
+        def __init__(self):
+            self.closed = False
+            self.storage_state_paths = []
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+                {"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"},
+            ]
+
+        def storage_state(self, path):
+            self.storage_state_paths.append(path)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"cookies": self.cookies(), "origins": []}, handle)
+
+        def close(self):
+            self.closed = True
+
+    class Playwright:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    captured = {}
+    manager = BrowserAuthManager(tmp_path / "profiles", timeout_seconds=1)
+    context = Context()
+    playwright = Playwright()
+    session_id = "xhs-session"
+    with manager._lock:
+        manager.sessions[session_id] = {
+            "session_id": session_id,
+            "platform": "小红书",
+            "status": "waiting",
+            "message": "等待扫码",
+            "login_url": "https://creator.xiaohongshu.com/new/home",
+            "profile_path": str(tmp_path / "profiles" / "小红书" / "profile"),
+            "account": None,
+            "error": "",
+            "process": None,
+            "port": None,
+            "context": context,
+            "playwright": playwright,
+            "page": Page(),
+        }
+
+    def on_success(payload):
+        captured.update(payload)
+        return {"id": 7, "platform": "小红书", "name": payload["account_name"]}
+
+    manager._monitor_xiaohongshu_patchright(session_id, "", on_success)
+
+    assert captured["storage_state_path"].endswith(".json")
+    assert context.storage_state_paths == [captured["storage_state_path"]]
+    assert (tmp_path / "profiles").joinpath("小红书").exists()
+
+
+def test_xiaohongshu_login_monitor_rejects_storage_state_that_cannot_reopen_publish_page(tmp_path):
+    class Page:
+        def __init__(self, url="https://creator.xiaohongshu.com/new/home"):
+            self.url = url
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return "找房子的派大星" if "document.querySelector" in expression else self.url
+
+    class LoginContext:
+        def __init__(self):
+            self.closed = False
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+                {"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"},
+            ]
+
+        def storage_state(self, path):
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"cookies": self.cookies(), "origins": []}, handle)
+
+        def close(self):
+            self.closed = True
+
+    class ReopenContext:
+        def __init__(self):
+            self.page = Page("https://creator.xiaohongshu.com/login?redirectReason=401")
+            self.page.goto = lambda url, **kwargs: setattr(
+                self.page,
+                "url",
+                "https://creator.xiaohongshu.com/login?redirectReason=401",
+            )
+            self.page.evaluate = lambda expression: self.page.url
+            self.closed = False
+
+        def new_page(self):
+            return self.page
+
+        def cookies(self):
+            return []
+
+        def close(self):
+            self.closed = True
+
+    class Browser:
+        def __init__(self):
+            self.reopen_context = ReopenContext()
+            self.closed = False
+
+        def new_context(self, **kwargs):
+            return self.reopen_context
+
+        def close(self):
+            self.closed = True
+
+    class Chromium:
+        def __init__(self):
+            self.browser = Browser()
+
+        def launch(self, **kwargs):
+            return self.browser
+
+    class Playwright:
+        def __init__(self):
+            self.chromium = Chromium()
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    captured = {}
+    manager = BrowserAuthManager(tmp_path / "profiles", timeout_seconds=1)
+    context = LoginContext()
+    playwright = Playwright()
+    session_id = "xhs-session"
+    with manager._lock:
+        manager.sessions[session_id] = {
+            "session_id": session_id,
+            "platform": "小红书",
+            "status": "waiting",
+            "message": "等待扫码",
+            "login_url": "https://creator.xiaohongshu.com/new/home",
+            "profile_path": str(tmp_path / "profiles" / "小红书" / "profile"),
+            "account": None,
+            "error": "",
+            "process": None,
+            "port": None,
+            "context": context,
+            "playwright": playwright,
+            "page": Page(),
+        }
+
+    manager._monitor_xiaohongshu_patchright(
+        session_id,
+        "",
+        lambda payload: captured.update(payload) or payload,
+    )
+
+    status = manager.get_status(session_id)
+    assert status["status"] == "failed"
+    assert "发布页登录态未通过" in status["error"]
+    assert captured == {}
+    assert playwright.chromium.browser.reopen_context.closed is True
+    assert playwright.chromium.browser.closed is True
+
+
 def test_xiaohongshu_login_monitor_accepts_login_page_after_cookie_lands(
     tmp_path, monkeypatch
 ):

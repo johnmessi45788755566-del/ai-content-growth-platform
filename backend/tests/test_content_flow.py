@@ -40,6 +40,34 @@ class FakeAIClient:
         )
 
 
+class InlineFailingImageAIClient(FakeAIClient):
+    def generate_image(self, prompt: str, image_type: str):
+        if image_type == "inline":
+            raise RuntimeError("图片模型 inline 调用超时")
+        return super().generate_image(prompt, image_type)
+
+
+class PlatformAwareArticleAIClient(FakeAIClient):
+    def __init__(self):
+        self.article_calls = []
+
+    def generate_article(self, title: str, direction: str, platform: str = "微信公众号"):
+        self.article_calls.append(
+            {"title": title, "direction": direction, "platform": platform}
+        )
+        return super().generate_article(title, direction)
+
+
+class CompressingXiaohongshuAIClient(PlatformAwareArticleAIClient):
+    def generate_article(self, title: str, direction: str, platform: str = "微信公众号"):
+        self.article_calls.append(
+            {"title": title, "direction": direction, "platform": platform}
+        )
+        if len(self.article_calls) == 1:
+            return [{"type": "body", "label": "正文", "content": "房" * 1200}]
+        return [{"type": "body", "label": "正文", "content": "房" * 980}]
+
+
 class FakePlatformPublisher:
     def publish(self, payload, account, action):
         return PublishResult(
@@ -152,6 +180,96 @@ def test_content_creation_flow_persists_article_images_draft_and_publish_package
     assert package["status"] == "platform_draft"
     assert package["platform_draft_id"] == "draft-media-id"
     assert package["platform"] == "微信公众号"
+
+
+def test_generate_images_writes_per_asset_generation_log(tmp_path):
+    service = make_service(tmp_path)
+    project = service.create_project("图片日志测试")
+    service.generate_article(project["id"])
+
+    service.generate_images(project["id"])
+
+    logs = sorted((tmp_path / "logs" / "tasks").glob("image-generation-*.jsonl"))
+    assert logs
+    records = [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()]
+    assert [(record["event"], record["asset_type"]) for record in records] == [
+        ("image_generate_start", "cover"),
+        ("image_generate_success", "cover"),
+        ("image_generate_start", "inline"),
+        ("image_generate_success", "inline"),
+    ]
+    assert all(record["project_id"] == project["id"] for record in records)
+    assert all("prompt" not in record for record in records)
+    assert records[1]["filename"] == "cover.svg"
+    assert records[3]["filename"] == "inline.svg"
+
+
+def test_generate_images_logs_inline_failure_after_cover_success(tmp_path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=InlineFailingImageAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    project = service.create_project("inline 失败日志测试")
+    service.generate_article(project["id"])
+
+    with pytest.raises(RuntimeError, match="inline 调用超时"):
+        service.generate_images(project["id"])
+
+    records = [
+        json.loads(line)
+        for line in sorted((tmp_path / "logs" / "tasks").glob("image-generation-*.jsonl"))[
+            0
+        ].read_text(encoding="utf-8").splitlines()
+    ]
+    assert [(record["event"], record["asset_type"]) for record in records] == [
+        ("image_generate_start", "cover"),
+        ("image_generate_success", "cover"),
+        ("image_generate_start", "inline"),
+        ("image_generate_failed", "inline"),
+    ]
+    assert records[-1]["error"] == "图片模型 inline 调用超时"
+
+
+def test_xiaohongshu_article_generation_uses_platform_prompt_with_hard_length_limit(tmp_path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    ai_client = PlatformAwareArticleAIClient()
+    service = ContentService(
+        db=db,
+        ai_client=ai_client,
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    project = service.create_project("第一次租房如何避坑", platform="小红书")
+
+    service.generate_article(project["id"])
+
+    assert ai_client.article_calls[-1]["platform"] == "小红书"
+    assert "不可超过1000字" in ai_client.article_calls[-1]["direction"]
+    assert "硬性条件" in ai_client.article_calls[-1]["direction"]
+
+
+def test_xiaohongshu_article_generation_rewrites_once_when_note_exceeds_limit(tmp_path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    ai_client = CompressingXiaohongshuAIClient()
+    service = ContentService(
+        db=db,
+        ai_client=ai_client,
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    project = service.create_project("第一次租房如何避坑", platform="小红书")
+
+    article = service.generate_article(project["id"])
+
+    assert len(ai_client.article_calls) == 2
+    assert "压缩改写" in ai_client.article_calls[-1]["direction"]
+    assert sum(len(block["content"]) for block in article["blocks"]) == 980
 
 
 def test_xiaohongshu_publish_job_uses_note_payload_and_success_receipt(tmp_path):

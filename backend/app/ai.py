@@ -63,10 +63,28 @@ class OpenAICompatibleClient:
             if item.get("titles")
         ]
 
-    def generate_article(self, title: str, direction: str) -> list[dict[str, str]]:
-        payload = self._chat_json(
-            system="你是微信公众号爆款文章写作专家。只输出 JSON。",
-            user=(
+    def generate_article(
+        self, title: str, direction: str, platform: str = "微信公众号"
+    ) -> list[dict[str, str]]:
+        normalized_platform = str(platform or "微信公众号")
+        if normalized_platform == "小红书":
+            system = "你是资深小红书图文笔记创作者。只输出 JSON。"
+            user = (
+                "根据标题和标题方向生成小红书图文笔记正文。"
+                "文章必须围绕标题本身，不要强行套用固定产品、固定行业或固定受众。"
+                "正文总字数不可超过1000字，这是硬性条件。"
+                "使用短段落、口语化、有经验分享感的表达，不要输出 Markdown 标题层级，"
+                "不要输出“以下是正文”等说明性文字。"
+                "必须分成 4 个段落模块：第一段 type 为 intro，label 为 引言；其余三段 type 为 body，label 统一为 正文。"
+                '返回格式：{"blocks":[{"type":"intro","label":"引言","content":""},'
+                '{"type":"body","label":"正文","content":""},'
+                '{"type":"body","label":"正文","content":""},'
+                '{"type":"body","label":"正文","content":""}]}。\n'
+                f"标题：{title}\n标题方向：{direction}"
+            )
+        else:
+            system = "你是微信公众号爆款文章写作专家。只输出 JSON。"
+            user = (
                 "根据标题和标题方向生成公众号文章正文。"
                 "文章必须围绕标题本身，不要强行套用固定产品、固定行业或固定受众。"
                 "如果标题或方向里包含明确产品、客户和转化目标，就自然承接；否则以观点表达和读者行动引导为主。"
@@ -76,7 +94,10 @@ class OpenAICompatibleClient:
                 '{"type":"body","label":"正文","content":""},'
                 '{"type":"body","label":"正文","content":""}]}。\n'
                 f"标题：{title}\n标题方向：{direction}"
-            ),
+            )
+        payload = self._chat_json(
+            system=system,
+            user=user,
         )
         blocks = payload.get("blocks", [])
         return [

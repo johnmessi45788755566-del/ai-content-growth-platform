@@ -40,8 +40,11 @@ class FakeLocator:
         if "填写标题" in self.selector:
             self.page.title = value
 
-    def click(self):
-        self.page.actions.append(("locator_click", self.selector))
+    def click(self, **kwargs):
+        if kwargs:
+            self.page.actions.append(("locator_click", self.selector, kwargs))
+        else:
+            self.page.actions.append(("locator_click", self.selector))
         if "发布" in self.selector:
             self.page.url = "https://creator.xiaohongshu.com/publish/success?note=1"
         elif "暂存离开" in self.selector:
@@ -105,9 +108,74 @@ class FakePage:
         self.actions.append(("page_close",))
 
 
+class UploadEntryLocator(FakeLocator):
+    def count(self):
+        if "input" in self.selector and (
+            "file" in self.selector or "upload-input" in self.selector
+        ):
+            return 1 if self.page.upload_input_available else 0
+        if "上传图片" in self.selector or "upload-button" in self.selector:
+            return 1
+        return super().count()
+
+    def wait_for(self, **kwargs):
+        if (
+            "input" in self.selector
+            and ("file" in self.selector or "upload-input" in self.selector)
+            and not self.page.upload_input_available
+        ):
+            raise TimeoutError("file input is not attached before upload entry click")
+        super().wait_for(**kwargs)
+
+    def click(self):
+        super().click()
+        if "上传图片" in self.selector or "upload-button" in self.selector:
+            self.page.upload_input_available = True
+
+
+class UploadEntryPage(FakePage):
+    def __init__(self):
+        super().__init__()
+        self.upload_input_available = False
+
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return UploadEntryLocator(self, selector)
+
+
+class ClosedShadowPublishLocator(FakeLocator):
+    def count(self):
+        if self.selector.startswith("button:has-text"):
+            return 0
+        if self.selector.startswith("xhs-publish-btn"):
+            return 1
+        return super().count()
+
+    def bounding_box(self):
+        if self.selector.startswith("xhs-publish-btn"):
+            return {"x": 600, "y": 650, "width": 260, "height": 44}
+        return None
+
+    def click(self, **kwargs):
+        super().click(**kwargs)
+        if not self.selector.startswith("xhs-publish-btn"):
+            return
+        position = kwargs.get("position") or {}
+        if float(position.get("x") or 0) > 130:
+            self.page.url = "https://creator.xiaohongshu.com/publish/success?note=1"
+        else:
+            self.page.url = "https://creator.xiaohongshu.com/new/home"
+
+
+class ClosedShadowPublishPage(FakePage):
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return ClosedShadowPublishLocator(self, selector)
+
+
 class FakeContext:
-    def __init__(self, cookie_value="valid"):
-        self.page = FakePage()
+    def __init__(self, cookie_value="valid", page=None):
+        self.page = page or FakePage()
         self.pages = []
         self.closed = False
         self.cookie_value = cookie_value
@@ -127,9 +195,18 @@ class FakeChromium:
     def __init__(self, context):
         self.context = context
         self.launch_calls = []
+        self.new_context_calls = []
 
     def launch_persistent_context(self, user_data_dir, **kwargs):
         self.launch_calls.append((user_data_dir, kwargs))
+        return self.context
+
+    def launch(self, **kwargs):
+        self.launch_calls.append(("launch", kwargs))
+        return self
+
+    def new_context(self, **kwargs):
+        self.new_context_calls.append(kwargs)
         return self.context
 
 
@@ -143,13 +220,16 @@ class FakePlaywright:
         self.stopped = True
 
 
-def fake_account(profile_path: Path):
-    return {
+def fake_account(profile_path: Path, storage_state_path: Path | None = None):
+    account = {
         "platform": "小红书",
         "auth_status": "已授权",
         "profile_path": str(profile_path),
         "name": "找房子的派大星",
     }
+    if storage_state_path is not None:
+        account["storage_state_path"] = str(storage_state_path)
+    return account
 
 
 def fake_payload(image_path: Path, note="小红书正文"):
@@ -210,6 +290,66 @@ def test_patchright_publisher_clicks_draft_with_locator_and_never_publish_button
     assert not any("dispatchMouseEvent" in str(action) or "cdp_mouse" in str(action) for action in actions)
 
 
+def test_patchright_publisher_clicks_closed_shadow_publish_host_when_button_is_hidden(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = ClosedShadowPublishPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "publish")
+
+    assert result.status == "published"
+    assert any(
+        action[0] == "locator_click"
+        and action[1] == 'xhs-publish-btn[submit-text="发布"]'
+        and action[2]["position"]["x"] > 130
+        for action in page.actions
+        if len(action) == 3
+    )
+
+
+def test_patchright_publisher_clicks_closed_shadow_draft_host_when_button_is_hidden(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = ClosedShadowPublishPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "draft")
+
+    assert result.status == "platform_draft"
+    assert any(
+        action[0] == "locator_click"
+        and action[1] == 'xhs-publish-btn[save-text="暂存离开"]'
+        and action[2]["position"]["x"] < 130
+        for action in page.actions
+        if len(action) == 3
+    )
+
+
+def test_patchright_publisher_prefers_storage_state_context_over_persistent_profile(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    storage_state = tmp_path / "xhs-state.json"
+    storage_state.write_text("{}", encoding="utf-8")
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    playwright = FakePlaywright()
+
+    result = make_publisher(playwright).publish(
+        fake_payload(image),
+        fake_account(profile, storage_state),
+        "draft",
+    )
+
+    assert result.status == "platform_draft"
+    assert playwright.chromium.new_context_calls[0]["storage_state"] == str(storage_state)
+    assert not any(call[0] == str(profile) for call in playwright.chromium.launch_calls)
+
+
 def test_patchright_publisher_uploads_images_with_set_input_files(tmp_path: Path):
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -221,6 +361,51 @@ def test_patchright_publisher_uploads_images_with_set_input_files(tmp_path: Path
 
     assert playwright.context.page.files == [str(image.resolve())]
     assert any(action[0] == "set_input_files" for action in playwright.context.page.actions)
+
+
+def test_patchright_publisher_waits_three_seconds_and_traces_render_state_before_upload(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    playwright = FakePlaywright()
+    trace_path = tmp_path / "publish-job.jsonl"
+    publisher = make_publisher(playwright)
+    publisher.set_trace_context(88, str(trace_path))
+
+    publisher.publish(fake_payload(image), fake_account(profile), "publish")
+
+    actions = playwright.context.page.actions
+    wait_index = actions.index(("wait_for_timeout", 3000))
+    first_upload_lookup = next(
+        index
+        for index, action in enumerate(actions)
+        if action == ("locator", 'input[type="file"][accept*="image"]')
+    )
+    assert wait_index < first_upload_lookup
+    events = [line for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any('"event": "xhs.render.wait_start"' in line for line in events)
+    assert any('"event": "xhs.render.ready"' in line for line in events)
+
+
+def test_patchright_publisher_clicks_upload_image_entry_before_setting_files(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = UploadEntryPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "publish")
+
+    actions = page.actions
+    click_index = actions.index(("locator_click", 'button:has-text("上传图片")'))
+    set_files_index = next(
+        index for index, action in enumerate(actions) if action[0] == "set_input_files"
+    )
+    assert result.status == "published"
+    assert click_index < set_files_index
+    assert page.files == [str(image.resolve())]
 
 
 def test_patchright_publisher_rejects_over_limit_note_before_opening_browser(tmp_path: Path):

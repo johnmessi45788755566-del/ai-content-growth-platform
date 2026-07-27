@@ -185,6 +185,26 @@ class FakeMultiPlatformPublisher(FakePlatformPublisher):
         return super().publish(payload, account, action)
 
 
+class XhsPreflightPassingPublisher(FakeMultiPlatformPublisher):
+    def __init__(self):
+        super().__init__()
+        self.verify_accounts = []
+
+    def verify_login(self, account):
+        self.verify_accounts.append(account)
+        return {"verified": True}
+
+
+class XhsPreflightDetailFailingPublisher(FakeMultiPlatformPublisher):
+    def __init__(self):
+        super().__init__()
+        self.verify_accounts = []
+
+    def verify_login(self, account):
+        self.verify_accounts.append(account)
+        raise RuntimeError("Patchright 启动失败：Profile 被占用")
+
+
 class FailingPlatformPublisher:
     def publish(self, payload, account, action):
         raise RuntimeError("微信接口错误 40164：IP 不在白名单")
@@ -2274,6 +2294,7 @@ def test_public_account_endpoints_use_safe_whitelist_but_sync_receives_private_r
         "taboo",
         "preference",
         "auth_method",
+        "has_storage_state",
         "last_sync_at",
         "created_at",
         "updated_at",
@@ -2542,7 +2563,7 @@ def test_task_publishing_allows_xiaohongshu_publish_and_draft_execution(tmp_path
     assert [call[2] for call in publisher.calls] == ["publish", "draft"]
 
 
-def test_xiaohongshu_task_fails_before_browser_when_account_is_offline(tmp_path: Path):
+def test_xiaohongshu_task_saves_workbench_draft_before_offline_publish_check(tmp_path: Path):
     publisher = FakeMultiPlatformPublisher()
     app = create_app(
         database_path=tmp_path / "content.db",
@@ -2575,16 +2596,132 @@ def test_xiaohongshu_task_fails_before_browser_when_account_is_offline(tmp_path:
         },
     ).json()
 
-    executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    service = app.state.content_service
+    executed = service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
     account = client.get(f"/api/accounts/{xhs_id}").json()
 
     assert executed["status"] == "失败"
-    assert executed["failure_stage"] == "检查账号"
+    assert executed["failure_stage"] == "发布文章"
     assert "账号离线，请重新扫码登录" in executed["failure_reason"]
+    assert executed["content_project_id"]
     assert executed["publish_job_id"] is None
+    assert executed["content_project"]["current_stage"] == "layout"
+    draft = service.db.fetch_one(
+        "SELECT stage, restore_stage FROM draft_snapshots WHERE project_id = ?",
+        (executed["content_project_id"],),
+    )
+    assert draft == {"stage": "排版已完成，待发布", "restore_stage": "layout"}
+    assets = service.db.fetch_all(
+        "SELECT asset_type FROM media_assets WHERE project_id = ? ORDER BY id",
+        (executed["content_project_id"],),
+    )
+    assert [asset["asset_type"] for asset in assets] == ["cover", "inline"]
     assert publisher.calls == []
     assert account["login_status"] == "离线"
     assert account["sync_error"] == "平台登录态已失效，请重新扫码登录"
+
+
+def test_xiaohongshu_offline_matrix_status_recovers_after_publish_preflight(tmp_path: Path):
+    publisher = XhsPreflightPassingPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    xhs_id = add_authorized_account(app.state.content_service, "找房子的派大星", platform="小红书")
+    profile = tmp_path / "xhs-profile"
+    profile.mkdir()
+    app.state.content_service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '离线', sync_status = '同步失败',
+            sync_error = '小红书发布页登录态未通过，请重新扫码登录',
+            profile_path = ?
+        WHERE id = ?
+        """,
+        (str(profile), xhs_id),
+    )
+    task = client.post(
+        "/api/tasks",
+        json={
+            "platform": "小红书",
+            "account_id": xhs_id,
+            "account_name": "找房子的派大星",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "小红书图文生成",
+            "topic": "预检恢复在线后继续发布",
+            "publish_action": "publish",
+        },
+    ).json()
+
+    executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    account = client.get(f"/api/accounts/{xhs_id}").json()
+
+    assert executed["status"] == "已发布"
+    assert account["login_status"] == "在线"
+    assert account["sync_status"] == "待同步"
+    assert account["sync_error"] == ""
+    assert publisher.verify_accounts[0]["id"] == xhs_id
+
+
+def test_xiaohongshu_offline_preflight_failure_keeps_diagnostic_reason(tmp_path: Path):
+    publisher = XhsPreflightDetailFailingPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    xhs_id = add_authorized_account(app.state.content_service, "找房子的派大星", platform="小红书")
+    profile = tmp_path / "xhs-profile"
+    profile.mkdir()
+    app.state.content_service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '离线', sync_status = '同步失败',
+            sync_error = '小红书发布页登录态未通过，请重新扫码登录',
+            profile_path = ?
+        WHERE id = ?
+        """,
+        (str(profile), xhs_id),
+    )
+    task = client.post(
+        "/api/tasks",
+        json={
+            "platform": "小红书",
+            "account_id": xhs_id,
+            "account_name": "找房子的派大星",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "小红书图文生成",
+            "topic": "预检失败要保留原因",
+            "publish_action": "publish",
+        },
+    ).json()
+
+    executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    logs = sorted((tmp_path / "logs" / "auth").glob("xiaohongshu-preflight-*.jsonl"))
+
+    assert executed["status"] == "失败"
+    assert executed["failure_stage"] == "发布文章"
+    assert "发布页预检失败：Patchright 启动失败：Profile 被占用" in executed["failure_reason"]
+    assert executed["content_project_id"]
+    assert executed["publish_job_id"] is None
+    draft = app.state.content_service.db.fetch_one(
+        "SELECT stage, restore_stage FROM draft_snapshots WHERE project_id = ?",
+        (executed["content_project_id"],),
+    )
+    assert draft == {"stage": "排版已完成，待发布", "restore_stage": "layout"}
+    assert publisher.verify_accounts[0]["id"] == xhs_id
+    assert logs
+    records = [json.loads(line) for line in logs[0].read_text(encoding="utf-8").splitlines()]
+    assert [record["event"] for record in records] == ["preflight_start", "preflight_failed"]
+    assert records[-1]["profile_suffix"] == "-profile"
+    assert records[-1]["error"] == "Patchright 启动失败：Profile 被占用"
 
 
 def test_accounts_api_returns_login_status_for_matrix_display(tmp_path: Path):
@@ -2727,6 +2864,36 @@ def test_xiaohongshu_auth_completion_skips_second_preflight_after_login_window_v
 
     assert account["login_status"] == "在线"
     assert publisher.verify_accounts == []
+
+
+def test_xiaohongshu_auth_completion_stores_storage_state_without_public_path(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+    storage_state = tmp_path / "xhs-storage-state.json"
+    storage_state.write_text("{}", encoding="utf-8")
+
+    account = service._complete_account_auth(
+        {
+            "platform": "小红书",
+            "account_name": "找房子的派大星",
+            "external_id": "xhs-user-id",
+            "profile_path": str(tmp_path / "xhs-profile"),
+            "storage_state_path": str(storage_state),
+            "login_url": "https://creator.xiaohongshu.com/publish/publish?from=homepage&target=image",
+            "publish_preflight_verified": True,
+        }
+    )
+    private = service.get_account(account["id"])
+
+    assert private["storage_state_path"] == str(storage_state)
+    assert account["has_storage_state"] is True
+    assert "storage_state_path" not in account
 
 
 def test_xiaohongshu_account_sync_writes_rows_used_by_analytics(tmp_path: Path):
@@ -4933,6 +5100,32 @@ def test_due_task_generates_title_from_topic_account_and_creation_requirements(t
     assert "AI记账" in ai_client.topic_prompts[-1]
     assert "AI记账助手" in ai_client.topic_prompts[-1]
     assert "面向小微企业老板，加入老板熬夜对账的例子。" in ai_client.topic_prompts[-1]
+
+
+def test_xiaohongshu_task_title_prompt_uses_xiaohongshu_platform_language(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    ai_client = FakeAIClient()
+    service = ContentService(db=db, ai_client=ai_client, upload_dir=tmp_path / "uploads")
+    account_id = add_authorized_account(service, "找房子的派大星", platform="小红书")
+    task = service.create_task(
+        {
+            "platform": "小红书",
+            "account_id": account_id,
+            "account_name": "找房子的派大星",
+            "execute_time": "2026-07-08 09:30",
+            "task_type": "小红书图文生成",
+            "topic": "第一次租房避坑",
+            "article_requirements": "控制正文篇幅。",
+        }
+    )
+
+    service._recommend_task_title(task)
+
+    prompt = ai_client.topic_prompts[-1]
+    assert "适合小红书图文笔记的标题建议" in prompt
+    assert "适合公众号图文" not in prompt
+    assert "正文不可超过1000字" in prompt
 
 
 def test_repeating_tasks_reschedule_daily_and_weekly(tmp_path: Path):

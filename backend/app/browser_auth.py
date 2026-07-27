@@ -223,6 +223,9 @@ class BrowserAuthManager:
                 if session["status"] != "waiting":
                     return
                 session["profile_path"] = str(profile_path)
+                session["storage_state_path"] = str(
+                    self._xiaohongshu_storage_state_path(profile_path, session_id)
+                )
                 session["message"] = "正在打开小红书登录窗口"
             self._trace_xiaohongshu_auth(session, "worker_start")
             playwright = self._start_xiaohongshu_playwright()
@@ -489,6 +492,19 @@ class BrowserAuthManager:
                         self._fail(session_id, message)
                         self._close_patchright_context(context, playwright)
                         return
+                    storage_state_path = self._export_xiaohongshu_storage_state(session, context)
+                    try:
+                        login_url = self._verify_xiaohongshu_storage_state(
+                            session,
+                            playwright,
+                            storage_state_path,
+                        ) or login_url
+                    except RuntimeError as exc:
+                        message = self._xiaohongshu_preflight_error(exc)
+                        self._trace_xiaohongshu_auth(session, "auth_failed", error=message)
+                        self._fail(session_id, message)
+                        self._close_patchright_context(context, playwright)
+                        return
                     self._trace_xiaohongshu_auth(session, "publish_preflight_success", login_url=login_url)
                     identity = self._detect_xiaohongshu_patchright_identity(context, page)
                     self._trace_xiaohongshu_auth(session, "account_write_start")
@@ -498,6 +514,7 @@ class BrowserAuthManager:
                             "account_name": identity.get("account_name") or requested_name or self._fallback_account_name("小红书", identity.get("external_id", "")),
                             "external_id": identity.get("external_id", ""),
                             "profile_path": session["profile_path"],
+                            "storage_state_path": storage_state_path,
                             "login_url": login_url,
                             "publish_preflight_verified": True,
                             "sync_data": None,
@@ -644,6 +661,89 @@ class BrowserAuthManager:
         with suppress(Exception):
             return str(page.evaluate("location.href") or "")
         return ""
+
+    def _export_xiaohongshu_storage_state(
+        self, session: dict[str, Any], context: Any
+    ) -> str:
+        raw_path = str(session.get("storage_state_path") or "").strip()
+        if not raw_path:
+            raw_path = str(
+                self._xiaohongshu_storage_state_path(
+                    Path(str(session.get("profile_path") or "")),
+                    str(session.get("session_id") or uuid.uuid4().hex),
+                )
+            )
+        path = Path(raw_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        storage_state = getattr(context, "storage_state", None)
+        if callable(storage_state):
+            storage_state(path=str(path))
+            self._trace_xiaohongshu_auth(
+                session,
+                "storage_state_exported",
+                storage_state_suffix=path.name[-12:],
+            )
+            return str(path)
+        return ""
+
+    def _verify_xiaohongshu_storage_state(
+        self,
+        session: dict[str, Any],
+        playwright: Any,
+        storage_state_path: str,
+    ) -> str:
+        if not storage_state_path:
+            return ""
+        launcher = getattr(playwright, "chromium", None)
+        launch = getattr(launcher, "launch", None)
+        if not callable(launch):
+            return ""
+        browser = None
+        context = None
+        page = None
+        try:
+            browser = launch(
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            context = browser.new_context(
+                storage_state=storage_state_path,
+                viewport={"width": 1200, "height": 707},
+            )
+            page = context.new_page()
+            page.goto(XIAOHONGSHU_IMAGE_PUBLISH_URL, wait_until="domcontentloaded", timeout=60000)
+            with suppress(Exception):
+                page.wait_for_url("**/publish/publish**", timeout=15000)
+            current_url = self._patchright_page_url(page)
+            parsed = urllib.parse.urlparse(current_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            if parsed.path.startswith("/login") or query.get("redirectReason") == ["401"]:
+                raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+            if (
+                parsed.netloc != "creator.xiaohongshu.com"
+                or not parsed.path.startswith("/publish/publish")
+                or not self._patchright_xiaohongshu_authenticated(context, page)
+            ):
+                raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+            self._trace_xiaohongshu_auth(
+                session,
+                "storage_state_reopen_success",
+                login_url=current_url,
+            )
+            return current_url
+        finally:
+            if context is not None:
+                with suppress(Exception):
+                    context.close()
+            if browser is not None:
+                with suppress(Exception):
+                    browser.close()
+
+    def _xiaohongshu_storage_state_path(
+        self, profile_path: Path, session_id: str
+    ) -> Path:
+        directory = profile_path.parent if profile_path.name else self.profiles_dir / "小红书"
+        return directory / f"{session_id}-storage-state.json"
 
     @staticmethod
     def _xiaohongshu_preflight_error(exc: Exception) -> str:
@@ -1040,6 +1140,8 @@ class BrowserAuthManager:
             "auth_status",
             "monitor_status",
             "sync_status",
+            "has_storage_state",
+            "storage_state_updated_at",
             "last_sync_at",
             "last_synced_at",
         )

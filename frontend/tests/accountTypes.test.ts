@@ -19,6 +19,8 @@ type PublicPlatformAccountKey =
   | 'taboo'
   | 'preference'
   | 'auth_method'
+  | 'has_storage_state'
+  | 'storage_state_updated_at'
   | 'last_sync_at'
   | 'created_at'
   | 'updated_at';
@@ -43,6 +45,8 @@ describe('PlatformAccount public contract', () => {
       | 'monitor_status'
       | 'sync_status'
       | 'sync_error'
+      | 'has_storage_state'
+      | 'storage_state_updated_at'
       | 'last_sync_at';
     type NonAuthAccountKey = Exclude<keyof AuthAccount, AuthAccountKey>;
     const hasNoUnexpectedAuthKeys: NonAuthAccountKey extends never ? true : false = true;

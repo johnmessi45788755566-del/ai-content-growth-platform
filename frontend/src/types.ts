@@ -185,6 +185,8 @@ export interface PlatformAccount {
   taboo: string;
   preference: string;
   auth_method?: string;
+  has_storage_state?: boolean;
+  storage_state_updated_at?: string;
   last_sync_at?: string;
   created_at?: string;
   updated_at?: string;
@@ -200,6 +202,8 @@ export interface AccountAuthAccount {
   monitor_status?: string;
   sync_status?: string;
   sync_error?: string;
+  has_storage_state?: boolean;
+  storage_state_updated_at?: string;
   last_sync_at?: string;
 }
 

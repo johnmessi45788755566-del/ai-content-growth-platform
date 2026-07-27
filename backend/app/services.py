@@ -1,3 +1,4 @@
+import inspect
 import json
 import re
 import threading
@@ -40,6 +41,7 @@ WAITING_TASK_RECOVERY_JOB_STATUSES = (
     *TERMINAL_PUBLISH_JOB_STATUSES,
 )
 PLATFORMS = ["微信公众号", "视频号", "小红书", "抖音"]
+XIAOHONGSHU_MAX_NOTE_LENGTH = 1000
 MARKDOWN_ASSET_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(asset:(\d+)\)")
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
 ACCOUNT_SYNC_ERROR_SECRET_RE = re.compile(
@@ -269,9 +271,15 @@ class ContentService:
 
     def generate_article(self, project_id: int) -> dict[str, Any]:
         project = self.get_project(project_id)
-        blocks = self.ai_client.generate_article(project["title"], project["title_direction"])
+        platform = str(project.get("platform") or "微信公众号")
+        direction = self._article_direction_for_platform(project["title_direction"], platform)
+        blocks = self._generate_article_blocks(project["title"], direction, platform)
         if not blocks:
             raise RuntimeError("模型未返回文章段落")
+        if platform == "小红书" and self._article_blocks_text_length(blocks) > XIAOHONGSHU_MAX_NOTE_LENGTH:
+            blocks = self._rewrite_xiaohongshu_article_under_limit(project, blocks)
+            if self._article_blocks_text_length(blocks) > XIAOHONGSHU_MAX_NOTE_LENGTH:
+                raise RuntimeError("小红书文章正文超过1000字，请缩短后重试")
         self.db.execute("DELETE FROM article_blocks WHERE project_id = ?", (project_id,))
         params = [
             (
@@ -293,6 +301,50 @@ class ContentService:
         self._set_stage(project_id, "article")
         self.autosave(project_id, stage="article", restore_stage="images")
         return {"project": self.get_project(project_id), "blocks": self.get_article_blocks(project_id)}
+
+    def _generate_article_blocks(
+        self, title: str, direction: str, platform: str
+    ) -> list[dict[str, Any]]:
+        generator = self.ai_client.generate_article
+        try:
+            signature = inspect.signature(generator)
+        except (TypeError, ValueError):
+            return generator(title, direction)
+        if "platform" in signature.parameters:
+            return generator(title, direction, platform=platform)
+        return generator(title, direction)
+
+    @staticmethod
+    def _article_direction_for_platform(direction: str, platform: str) -> str:
+        base = str(direction or "").strip()
+        if platform != "小红书":
+            return base
+        xhs_requirements = (
+            "平台：小红书。硬性条件：文章正文不可超过1000字。"
+            "请使用小红书笔记表达，短段落、口语化、经验分享感强；"
+            "不要输出 Markdown 标题层级，不要输出“以下是正文”等说明性文字。"
+        )
+        return f"{base}\n{xhs_requirements}" if base else xhs_requirements
+
+    def _rewrite_xiaohongshu_article_under_limit(
+        self, project: dict[str, Any], blocks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        original = "\n\n".join(
+            str(block.get("content") or "").strip()
+            for block in blocks
+            if str(block.get("content") or "").strip()
+        )
+        direction = (
+            f"{self._article_direction_for_platform(project['title_direction'], '小红书')}\n"
+            "请对以下正文进行压缩改写，保留核心信息和行动引导，"
+            "压缩改写后的正文总字数不可超过1000字，这是硬性条件。\n"
+            f"原正文：{original}"
+        )
+        return self._generate_article_blocks(project["title"], direction, "小红书")
+
+    @staticmethod
+    def _article_blocks_text_length(blocks: list[dict[str, Any]]) -> int:
+        return sum(len(str(block.get("content") or "").strip()) for block in blocks)
 
     def save_article(self, project_id: int, blocks: list[dict[str, Any]]) -> dict[str, Any]:
         self.get_project(project_id)
@@ -342,7 +394,25 @@ class ContentService:
             prompts = [item for item in prompts if item[0] == asset_type]
         assets = []
         for asset_type, prompt in prompts:
-            generated = self.ai_client.generate_image(prompt, asset_type)
+            started_at = datetime.now()
+            self._trace_image_generation(
+                project["id"],
+                asset_type,
+                "image_generate_start",
+                prompt_length=len(prompt),
+            )
+            try:
+                generated = self.ai_client.generate_image(prompt, asset_type)
+            except Exception as exc:
+                self._trace_image_generation(
+                    project["id"],
+                    asset_type,
+                    "image_generate_failed",
+                    prompt_length=len(prompt),
+                    duration_ms=self._elapsed_ms(started_at),
+                    error=self._redact_account_diagnostic(self._root_exception_message(exc)),
+                )
+                raise
             relative_path = Path("uploads") / generated.filename
             file_path = self.upload_dir / generated.filename
             file_path.write_bytes(generated.content)
@@ -362,6 +432,15 @@ class ContentService:
             asset = self.db.fetch_one("SELECT * FROM media_assets WHERE id = ?", (asset_id,))
             if asset:
                 assets.append(asset)
+            self._trace_image_generation(
+                project["id"],
+                asset_type,
+                "image_generate_success",
+                duration_ms=self._elapsed_ms(started_at),
+                filename=generated.filename,
+                content_type=generated.content_type,
+                byte_count=len(generated.content),
+            )
 
         self._set_stage(project_id, "images")
         self.autosave(project_id, stage="images", restore_stage="layout")
@@ -370,6 +449,41 @@ class ContentService:
             "assets": self.get_media_assets(project_id),
             "generated_assets": assets,
         }
+
+    def _trace_image_generation(
+        self, project_id: int, asset_type: str, event: str, **fields: Any
+    ) -> None:
+        log_dir = self.upload_dir.parent / "logs" / "tasks"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "event": event,
+                "project_id": int(project_id),
+                "asset_type": asset_type,
+                **self._safe_task_log_fields(fields),
+            }
+            log_path = log_dir / f"image-generation-{datetime.now().strftime('%Y%m%d')}.jsonl"
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
+    @classmethod
+    def _safe_task_log_fields(cls, fields: dict[str, Any]) -> dict[str, Any]:
+        safe: dict[str, Any] = {}
+        for key, value in fields.items():
+            if isinstance(value, (int, float, bool)) or value is None:
+                safe[key] = value
+            elif isinstance(value, Path):
+                safe[key] = value.name
+            else:
+                safe[key] = cls._redact_account_diagnostic(str(value))
+        return safe
+
+    @staticmethod
+    def _elapsed_ms(started_at: datetime) -> int:
+        return max(0, int((datetime.now() - started_at).total_seconds() * 1000))
 
     def save_layout(self, project_id: int, blocks: list[dict[str, Any]]) -> dict[str, Any]:
         self.get_project(project_id)
@@ -608,6 +722,7 @@ class ContentService:
         name = str(result.get("account_name") or f"{normalized_platform}账号").strip()
         external_id = str(result.get("external_id") or "").strip()
         profile_path = str(result.get("profile_path") or "")
+        storage_state_path = str(result.get("storage_state_path") or "")
         login_url = str(result.get("login_url") or "")
         publish_preflight_verified = bool(result.get("publish_preflight_verified"))
         sync_data = result.get("sync_data")
@@ -654,10 +769,20 @@ class ContentService:
                 UPDATE platform_accounts
                 SET name = ?, external_id = ?, auth_status = '已授权', monitor_status = '监测中', sync_status = '待同步',
                     sync_error = '', login_status = '在线',
-                    auth_method = '真实浏览器扫码', profile_path = ?, login_url = ?, updated_at = CURRENT_TIMESTAMP
+                    auth_method = '真实浏览器扫码', profile_path = ?,
+                    storage_state_path = ?, storage_state_updated_at = CASE WHEN ? != '' THEN CURRENT_TIMESTAMP ELSE storage_state_updated_at END,
+                    login_url = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (name, external_id, profile_path, login_url, existing["id"]),
+                (
+                    name,
+                    external_id,
+                    profile_path,
+                    storage_state_path,
+                    storage_state_path,
+                    login_url,
+                    existing["id"],
+                ),
             )
             account_id = int(existing["id"])
         else:
@@ -665,10 +790,11 @@ class ContentService:
                 """
                 INSERT INTO platform_accounts (
                   platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status,
-                  role, audience, style, taboo, preference, auth_method, profile_path, login_url
+                  role, audience, style, taboo, preference, auth_method, profile_path,
+                  storage_state_path, storage_state_updated_at, login_url
                 )
                 VALUES (?, ?, ?, '未分配', '', '已授权', '在线', '监测中', '待同步', ?, ?, ?, ?, ?,
-                        '真实浏览器扫码', ?, ?)
+                        '真实浏览器扫码', ?, ?, CASE WHEN ? != '' THEN CURRENT_TIMESTAMP ELSE '' END, ?)
                 """,
                 (
                     normalized_platform,
@@ -680,6 +806,8 @@ class ContentService:
                     "避免夸大效果，避免承诺平台收益",
                     "优先使用场景化标题和可验证数据",
                     profile_path,
+                    storage_state_path,
+                    storage_state_path,
                     login_url,
                 ),
             )
@@ -743,8 +871,8 @@ class ContentService:
         accounts = self.db.fetch_all(
             f"""
             SELECT id, platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status, sync_error,
-                   role, audience, style, taboo, preference, auth_method, qr_url, profile_path, login_url,
-                   last_sync_at, created_at, updated_at
+                   role, audience, style, taboo, preference, auth_method, qr_url, profile_path,
+                   storage_state_path, storage_state_updated_at, login_url, last_sync_at, created_at, updated_at
             FROM platform_accounts
             {where}
             ORDER BY updated_at DESC, id DESC
@@ -757,8 +885,8 @@ class ContentService:
         account = self.db.fetch_one(
             """
             SELECT id, platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status, sync_error,
-                   role, audience, style, taboo, preference, auth_method, qr_url, profile_path, login_url,
-                   last_sync_at, created_at, updated_at
+                   role, audience, style, taboo, preference, auth_method, qr_url, profile_path,
+                   storage_state_path, storage_state_updated_at, login_url, last_sync_at, created_at, updated_at
             FROM platform_accounts
             WHERE id = ?
             """,
@@ -778,6 +906,9 @@ class ContentService:
             resource["sync_error"] = ContentService._redact_account_diagnostic(
                 str(resource["sync_error"])
             )
+        resource["has_storage_state"] = bool(str(account.get("storage_state_path") or "").strip())
+        if account.get("storage_state_updated_at"):
+            resource["storage_state_updated_at"] = account["storage_state_updated_at"]
         return resource
 
     @staticmethod
@@ -1615,7 +1746,6 @@ class ContentService:
                     current,
                 )
                 return self.get_task(task_id), True
-            account = self._validate_task_publish_target(task)
             stage = "生成标题"
             title_choice = self._recommend_task_title(task)
             task_title = title_choice["title"]
@@ -1668,6 +1798,8 @@ class ContentService:
             stage = "文章排版"
             self.save_layout(project["id"], layout_blocks)
             stage = "提交平台草稿" if task["publish_action"] == "draft" else "发布文章"
+            task = self.get_task(task_id)
+            account = self._validate_task_publish_target(task)
             job = self.prepare_publish_job(
                 project["id"], int(account["id"]), task["publish_action"]
             )
@@ -2013,12 +2145,22 @@ class ContentService:
             raise RuntimeError("发布作业关联的任务代次已变化")
 
     def _recommend_task_title(self, task: dict[str, Any]) -> dict[str, str]:
+        platform = str(task["platform"])
+        if platform == "小红书":
+            platform_instruction = (
+                "请结合主题约束、账号信息和创作要求，给出适合小红书图文笔记的标题建议。"
+                "后续正文不可超过1000字，这是硬性条件，标题应适配短笔记表达。"
+            )
+        else:
+            platform_instruction = (
+                "请结合主题约束、账号信息和创作要求，给出适合公众号图文的标题建议。"
+            )
         prompt = (
             "这是任务中心定时任务，请模拟内容创作第一步“标题确认”。"
-            f"平台：{task['platform']}；账号：{task['account_name']}；"
+            f"平台：{platform}；账号：{task['account_name']}；"
             f"主题约束：{task['topic']}；"
             f"创作要求：{task.get('article_requirements') or '未填写'}。"
-            "请结合主题约束、账号信息和创作要求，给出适合公众号图文的标题建议。"
+            f"{platform_instruction}"
         )
         recommendations = self.recommend_topics(prompt)
         for recommendation in recommendations:
@@ -2537,8 +2679,87 @@ class ContentService:
         if account["platform"] == "小红书":
             login_status = str(account.get("login_status") or "在线")
             if login_status != "在线":
-                raise RuntimeError("小红书账号离线，请重新扫码登录")
+                if str(account.get("profile_path") or "").strip():
+                    self._trace_xiaohongshu_publish_preflight(account, "preflight_start")
+                    try:
+                        self._verify_xiaohongshu_publish_login(account)
+                    except Exception as exc:
+                        detail = self._redact_account_diagnostic(
+                            self._root_exception_message(exc)
+                        )
+                        self._trace_xiaohongshu_publish_preflight(
+                            account,
+                            "preflight_failed",
+                            error=detail,
+                        )
+                        self.db.execute(
+                            """
+                            UPDATE platform_accounts
+                            SET login_status = '离线', sync_status = '同步失败',
+                                sync_error = ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                            """,
+                            (detail, int(account["id"])),
+                        )
+                        raise RuntimeError(f"小红书账号离线，发布页预检失败：{detail}") from exc
+                    self._trace_xiaohongshu_publish_preflight(account, "preflight_success")
+                    self._mark_account_publish_login_online(int(account["id"]))
+                    account = self.get_account(int(account["id"]))
+                else:
+                    raise RuntimeError("小红书账号离线，请重新扫码登录")
         return account
+
+    def _trace_xiaohongshu_publish_preflight(
+        self, account: dict[str, Any], event: str, **fields: Any
+    ) -> None:
+        log_dir = self.upload_dir.parent / "logs" / "auth"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "event": event,
+                "platform": "小红书",
+                "account_id": int(account.get("id") or 0),
+                "profile_suffix": self._profile_suffix(account.get("profile_path")),
+                "storage_state_suffix": self._profile_suffix(account.get("storage_state_path")),
+                "storage_state_exists": Path(str(account.get("storage_state_path") or "")).is_file(),
+                "login_status": str(account.get("login_status") or ""),
+                "sync_status": str(account.get("sync_status") or ""),
+                **{
+                    key: self._redact_account_diagnostic(str(value))
+                    for key, value in fields.items()
+                },
+            }
+            log_path = log_dir / f"xiaohongshu-preflight-{datetime.now().strftime('%Y%m%d')}.jsonl"
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
+    @staticmethod
+    def _profile_suffix(profile_path: Any) -> str:
+        value = str(profile_path or "").strip()
+        if not value:
+            return "no_profile"
+        return value[-8:]
+
+    @staticmethod
+    def _root_exception_message(exc: Exception) -> str:
+        current: BaseException = exc
+        while current.__cause__ is not None:
+            current = current.__cause__
+        return str(current) or str(exc) or "未知错误"
+
+    def _mark_account_publish_login_online(self, account_id: int) -> None:
+        self.db.execute(
+            """
+            UPDATE platform_accounts
+            SET login_status = '在线', sync_status = '待同步', sync_error = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (account_id,),
+        )
 
     def _resolve_publish_account(
         self, platform: str, account_name: str, account_id: int | None
