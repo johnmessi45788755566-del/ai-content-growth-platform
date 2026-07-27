@@ -90,8 +90,9 @@ class WeChatBrowserPublisher:
             if report_progress:
                 report_progress("filling_content")
                 self.gateway.fill_article_content(session, payload)
-                report_progress("uploading_assets")
-                self.gateway.upload_article_assets(session, payload)
+                if action == "publish":
+                    report_progress("uploading_assets")
+                    self.gateway.upload_article_assets(session, payload)
             else:
                 self.gateway.fill_article(session, payload)
             baseline = self.gateway.capture_baseline(session, payload["title"], action)
@@ -197,6 +198,17 @@ class WeChatBrowserPublisher:
             if status != "platform_draft":
                 raise WeChatPublishingError(f"微信草稿流程返回了无效状态：{status or '空'}")
             draft_id = str(outcome.get("draft_id") or "").strip()
+            signal = outcome.get("post_action_signal")
+            signal_kind = str(signal.get("kind") or "") if isinstance(signal, Mapping) else ""
+            if draft_id.startswith("manual-save:") and signal_kind == "draft_manual_save_history":
+                return PublishingResult(
+                    status=status,
+                    platform_draft_id=draft_id,
+                    platform_url=platform_url,
+                    response=self._public_success_response(
+                        "draft_created", draft_id, title, signal_kind
+                    ),
+                )
             corroboration = self._require_bound_receipt(
                 outcome, baseline, title, draft_id, "草稿 ID", "draft"
             )

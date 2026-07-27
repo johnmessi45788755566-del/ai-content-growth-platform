@@ -9,8 +9,10 @@ type PublicPlatformAccountKey =
   | 'owner'
   | 'tag'
   | 'auth_status'
+  | 'login_status'
   | 'monitor_status'
   | 'sync_status'
+  | 'sync_error'
   | 'role'
   | 'audience'
   | 'style'
@@ -37,8 +39,10 @@ describe('PlatformAccount public contract', () => {
       | 'name'
       | 'account_name'
       | 'auth_status'
+      | 'login_status'
       | 'monitor_status'
       | 'sync_status'
+      | 'sync_error'
       | 'last_sync_at';
     type NonAuthAccountKey = Exclude<keyof AuthAccount, AuthAccountKey>;
     const hasNoUnexpectedAuthKeys: NonAuthAccountKey extends never ? true : false = true;

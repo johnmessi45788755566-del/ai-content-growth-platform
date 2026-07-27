@@ -101,6 +101,16 @@ INTERRUPTED_FAILURE_REASON = (
 )
 CONFIRMATION_FAILURE_STAGE = "人工确认已失效"
 CONFIRMATION_EXPIRED_REASON = "运营者确认窗口已过期，平台操作未完成，请重试发布任务"
+EVENT_MESSAGES = {
+    "checking_login": "开始检查平台登录状态",
+    "uploading_assets": "开始上传发布素材",
+    "filling_content": "开始填写发布内容",
+    "publishing": "提交平台发布",
+    "platform_draft": "平台草稿已创建",
+    "awaiting_confirmation": "等待人工确认",
+    "published": "平台发布成功",
+    "failed": "发布失败",
+}
 
 
 class PublishCoordinator:
@@ -168,9 +178,9 @@ class PublishCoordinator:
                                 """
                                 INSERT INTO publish_jobs (
                                   project_id, account_id, platform, action, status
-                                ) VALUES (?, ?, '微信公众号', ?, 'pending')
+                                ) VALUES (?, ?, ?, ?, 'pending')
                                 """,
-                                (project["id"], account["id"], action),
+                                (project["id"], account["id"], account["platform"], action),
                             ).lastrowid
                         )
                     except sqlite3.IntegrityError as exc:
@@ -245,6 +255,62 @@ class PublishCoordinator:
             (project_id,),
         )
         return self._public_job(job) if job else None
+
+    def get_publish_monitoring(self, platform: str | None = None) -> dict[str, Any]:
+        filters = []
+        params: list[Any] = []
+        if platform:
+            filters.append("platform = ?")
+            params.append(platform)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        row = self.db.fetch_one(
+            f"""
+            SELECT
+              COUNT(*) AS total_jobs,
+              SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END) AS published_jobs,
+              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_jobs,
+              SUM(CASE WHEN status IN (
+                'pending', 'checking_login', 'uploading_assets', 'filling_content',
+                'publishing', 'awaiting_confirmation'
+              ) THEN 1 ELSE 0 END) AS in_progress_jobs,
+              AVG(CASE WHEN status IN ('platform_draft', 'published', 'failed')
+                THEN (julianday(updated_at) - julianday(created_at)) * 86400
+                ELSE NULL
+              END) AS avg_duration_seconds
+            FROM publish_jobs
+            {where}
+            """,
+            tuple(params),
+        )
+        failure_where = f"{where} AND status = 'failed'" if where else "WHERE status = 'failed'"
+        failure_rows = self.db.fetch_all(
+            f"""
+            SELECT id, project_id, account_id, platform, action, status,
+                   failure_stage, failure_reason, updated_at
+            FROM publish_jobs
+            {failure_where}
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 5
+            """,
+            tuple(params),
+        )
+        total_jobs = int(row["total_jobs"] or 0) if row else 0
+        published_jobs = int(row["published_jobs"] or 0) if row else 0
+        failed_jobs = int(row["failed_jobs"] or 0) if row else 0
+        in_progress_jobs = int(row["in_progress_jobs"] or 0) if row else 0
+        avg_duration = row["avg_duration_seconds"] if row else None
+        return {
+            "platform": platform or "全部平台",
+            "total_jobs": total_jobs,
+            "published_jobs": published_jobs,
+            "failed_jobs": failed_jobs,
+            "in_progress_jobs": in_progress_jobs,
+            "success_rate": round(published_jobs / total_jobs, 4) if total_jobs else 0,
+            "avg_duration_seconds": round(float(avg_duration), 2) if avg_duration is not None else 0,
+            "recent_failures": [
+                self._public_monitoring_failure(row) for row in failure_rows
+            ],
+        }
 
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         job = self._get_row(job_id)
@@ -436,6 +502,15 @@ class PublishCoordinator:
             conn.commit()
         if cursor.rowcount != 1:
             raise PublishJobValidationError("发布任务已失去执行权，已中止平台操作")
+        job = self._get_row(job_id)
+        self._append_event(
+            job_id,
+            str(job["platform"]),
+            status,
+            "info",
+            self._event_message(str(job["platform"]), status),
+            {"action": job["action"]},
+        )
 
     def _load_inputs(
         self, project_id: int, account_id: int, action: str
@@ -444,10 +519,16 @@ class PublishCoordinator:
             raise PublishJobValidationError("发布动作必须是 draft 或 publish")
         project = self.project_loader(project_id)
         account = self.account_loader(account_id)
-        if project["platform"] != "微信公众号" or account["platform"] != "微信公众号":
-            raise PublishJobValidationError("微信公众号以外的平台暂未开放真实发布")
+        if project["platform"] != account["platform"]:
+            raise PublishJobValidationError("内容项目平台与账号平台不一致")
+        if project["platform"] not in {"微信公众号", "小红书"}:
+            raise PublishJobValidationError(f"{project['platform']}暂未开放真实发布")
         if account["auth_status"] != "已授权":
             raise PublishJobValidationError("所选账号未授权，请重新登录")
+        if account["platform"] == "小红书":
+            login_status = str(account.get("login_status") or "在线")
+            if login_status != "在线":
+                raise PublishJobValidationError("小红书账号离线，请重新扫码登录")
         payload = self.payload_builder(project, account["name"])
         return project, account, payload
 
@@ -487,7 +568,17 @@ class PublishCoordinator:
                 (attempt_response_json, job_id, expected_status, observed_response_json),
             )
             conn.commit()
-            return attempt_token if cursor.rowcount == 1 else None
+        if cursor.rowcount == 1:
+            self._append_event(
+                job_id,
+                str(observed_job["platform"]),
+                "checking_login",
+                "info",
+                self._event_message(str(observed_job["platform"]), "checking_login"),
+                {"action": observed_job["action"]},
+            )
+            return attempt_token
+        return None
 
     def _owns_attempt(
         self, job_id: int, attempt_token: str, statuses: tuple[str, ...] | set[str]
@@ -548,6 +639,20 @@ class PublishCoordinator:
                 ),
             )
             conn.commit()
+        if cursor.rowcount == 1:
+            job = self._get_row(job_id)
+            self._append_event(
+                job_id,
+                str(job["platform"]),
+                result.status,
+                "info",
+                self._event_message(str(job["platform"]), result.status),
+                {
+                    "action": action,
+                    "platform_url": result.platform_url,
+                    "platform_id": result.platform_publish_id or result.platform_draft_id,
+                },
+            )
         if (
             cursor.rowcount == 1
             and result.status == "awaiting_confirmation"
@@ -593,7 +698,7 @@ class PublishCoordinator:
         )
         expected_response_json = self._attempt_response_json(attempt_token)
         with self.db.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 f"""
                 UPDATE publish_jobs
                 SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
@@ -613,6 +718,16 @@ class PublishCoordinator:
                 ),
             )
             conn.commit()
+        if cursor.rowcount == 1:
+            failed = self._get_row(job_id)
+            self._append_event(
+                job_id,
+                str(failed["platform"]),
+                "failed",
+                "error",
+                self._event_message(str(failed["platform"]), "failed"),
+                {"stage": stage, "reason": reason, "trace_path": trace_path},
+            )
 
     def _persist_pending_input_failure(
         self, observed_job: Mapping[str, Any], exc: Exception
@@ -621,7 +736,7 @@ class PublishCoordinator:
         reason = self._redact_sensitive_text(observed_job, reason)
         response_json = str(observed_job.get("response_json") or "{}")
         with self.db.connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 UPDATE publish_jobs
                 SET status = 'failed', platform_draft_id = '', platform_publish_id = '',
@@ -638,6 +753,16 @@ class PublishCoordinator:
                 ),
             )
             conn.commit()
+        if cursor.rowcount == 1:
+            failed = self._get_row(int(observed_job["id"]))
+            self._append_event(
+                int(observed_job["id"]),
+                str(failed["platform"]),
+                "failed",
+                "error",
+                self._event_message(str(failed["platform"]), "failed"),
+                {"stage": "加载发布输入", "reason": reason},
+            )
 
     def _get_row(self, job_id: int) -> dict[str, Any]:
         job = self.db.fetch_one("SELECT * FROM publish_jobs WHERE id = ?", (job_id,))
@@ -651,21 +776,44 @@ class PublishCoordinator:
     ) -> None:
         label = "草稿" if action == "draft" else "发布"
         parsed = urlparse(platform_url)
-        if not platform_id or parsed.scheme != "https" or parsed.hostname != "mp.weixin.qq.com":
+        if not platform_id or parsed.scheme != "https":
             raise RuntimeError(f"平台未返回可验证的{label}回执")
-        expected_event = "draft_created" if action == "draft" else "article_published"
-        expected_corroboration = (
-            {"draft_saved", "draft_api_response"}
-            if action == "draft"
-            else {"publish_success", "publish_api_response"}
-        )
-        if (
-            response.get("source") != "wechat_platform"
-            or response.get("event") != expected_event
-            or str(response.get("receipt_id") or "") != platform_id
-            or response.get("corroboration") not in expected_corroboration
-        ):
-            raise RuntimeError(f"平台返回的{label}证据字段无效或与动作不匹配")
+        if response.get("source") == "wechat_platform":
+            if parsed.hostname != "mp.weixin.qq.com":
+                raise RuntimeError(f"平台未返回可验证的{label}回执")
+            expected_event = "draft_created" if action == "draft" else "article_published"
+            expected_corroboration = (
+                {"draft_saved", "draft_api_response", "draft_manual_save_history"}
+                if action == "draft"
+                else {"publish_success", "publish_api_response"}
+            )
+            if (
+                response.get("event") != expected_event
+                or str(response.get("receipt_id") or "") != platform_id
+                or response.get("corroboration") not in expected_corroboration
+            ):
+                raise RuntimeError(f"平台返回的{label}证据字段无效或与动作不匹配")
+            return
+        if response.get("source") == "xiaohongshu_platform" and action == "publish":
+            if (
+                parsed.hostname != "creator.xiaohongshu.com"
+                or parsed.path != "/publish/success"
+                or response.get("event") != "note_published"
+                or str(response.get("receipt_id") or "") != platform_id
+                or response.get("corroboration") != "publish_success_url"
+            ):
+                raise RuntimeError("平台返回的小红书发布证据字段无效或与动作不匹配")
+            return
+        if response.get("source") == "xiaohongshu_platform" and action == "draft":
+            if (
+                parsed.hostname != "creator.xiaohongshu.com"
+                or response.get("event") != "draft_created"
+                or str(response.get("receipt_id") or "") != platform_id
+                or response.get("corroboration") != "draft_saved"
+            ):
+                raise RuntimeError("平台返回的小红书草稿证据字段无效或与动作不匹配")
+            return
+        raise RuntimeError(f"平台返回的{label}证据字段无效或与动作不匹配")
 
     @staticmethod
     def _require_job_context(response: Mapping[str, Any]) -> dict[str, Any]:
@@ -710,6 +858,7 @@ class PublishCoordinator:
             if isinstance(value, str):
                 resource[key] = self._redact_sensitive_text(job, value)
         resource["response"] = self._project_public_response(job, response)
+        resource["events"] = self._job_events(job)
         return resource
 
     def _redact_sensitive_text(self, job: Mapping[str, Any], value: str) -> str:
@@ -783,6 +932,102 @@ class PublishCoordinator:
                 )
             }
         return projected
+
+    def _job_events(self, job: Mapping[str, Any]) -> list[dict[str, Any]]:
+        rows = self.db.fetch_all(
+            """
+            SELECT id, stage, level, message, payload_json, created_at
+            FROM publish_job_events
+            WHERE job_id = ?
+            ORDER BY id
+            """,
+            (int(job["id"]),),
+        )
+        return [self._public_event(job, row) for row in rows]
+
+    def _public_event(
+        self, job: Mapping[str, Any], event: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        try:
+            payload = json.loads(str(event.get("payload_json") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        return {
+            "id": int(event["id"]),
+            "stage": str(event["stage"]),
+            "level": str(event["level"]),
+            "message": self._redact_sensitive_text(job, str(event["message"])),
+            "payload": self._public_event_payload(job, payload),
+            "created_at": str(event["created_at"]),
+        }
+
+    def _public_event_payload(self, job: Mapping[str, Any], payload: Any) -> Any:
+        if isinstance(payload, Mapping):
+            return {
+                str(key): self._public_event_payload(job, value)
+                for key, value in payload.items()
+                if not str(key).startswith("_")
+            }
+        if isinstance(payload, list):
+            return [self._public_event_payload(job, item) for item in payload]
+        if isinstance(payload, str):
+            return self._redact_sensitive_text(job, payload)
+        if payload is None or isinstance(payload, (int, float, bool)):
+            return payload
+        return str(payload)
+
+    def _append_event(
+        self,
+        job_id: int,
+        platform: str,
+        stage: str,
+        level: str,
+        message: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        try:
+            self.db.execute(
+                """
+                INSERT INTO publish_job_events (
+                  job_id, platform, stage, level, message, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    platform,
+                    stage,
+                    level,
+                    message,
+                    json.dumps(dict(payload or {}), ensure_ascii=False),
+                ),
+            )
+        except Exception:
+            return
+
+    @staticmethod
+    def _event_message(platform: str, stage: str) -> str:
+        if platform == "小红书" and stage == "platform_draft":
+            return "小红书草稿已暂存"
+        if platform == "小红书" and stage == "published":
+            return "小红书发布成功"
+        if platform == "微信公众号" and stage == "published":
+            return "微信公众号发布成功"
+        return EVENT_MESSAGES.get(stage, stage)
+
+    def _public_monitoring_failure(
+        self, row: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "project_id": int(row["project_id"]),
+            "account_id": int(row["account_id"]),
+            "platform": str(row["platform"]),
+            "action": str(row["action"]),
+            "status": str(row["status"]),
+            "failure_stage": self._redact_sensitive_text(row, str(row["failure_stage"] or "")),
+            "failure_reason": self._redact_sensitive_text(row, str(row["failure_reason"] or "")),
+            "updated_at": str(row["updated_at"]),
+        }
 
     @staticmethod
     def _publish_trace_path(job_id: int) -> str:

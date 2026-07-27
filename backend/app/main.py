@@ -21,7 +21,7 @@ from .ai import AIConfigurationError, AIResponseError, OpenAICompatibleClient
 from .browser_auth import BrowserAuthManager
 from .database import Database
 from .publishing.coordinator import PublishJobValidationError
-from .publishing.wechat import WeChatDraftPublisher
+from .publishing.router import PlatformPublisherRouter
 from .services import AccountConflictError, ContentService, NotFoundError, TaskConflictError
 
 
@@ -108,6 +108,7 @@ class PublishJobRequest(BaseModel):
 class AccountAuthRequest(BaseModel):
     platform: str = Field(min_length=1)
     account_name: str = ""
+    account_id: int | None = None
 
 
 class AccountUpdateRequest(BaseModel):
@@ -183,7 +184,7 @@ def create_app(
         ai_client=ai_client or OpenAICompatibleClient(),
         upload_dir=uploads,
         browser_auth_manager=browser_auth,
-        platform_publisher=platform_publisher or WeChatDraftPublisher(),
+        platform_publisher=platform_publisher or PlatformPublisherRouter(),
     )
 
     def run_scheduler_maintenance() -> None:
@@ -374,16 +375,32 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/accounts")
-    def list_accounts(platform: str = "", auth_status: str = "", q: str = "") -> dict[str, Any]:
+    def list_accounts(
+        platform: str = "",
+        auth_status: str = "",
+        login_status: str = "",
+        q: str = "",
+    ) -> dict[str, Any]:
         try:
-            return {"accounts": service.list_accounts(platform=platform, auth_status=auth_status, q=q)}
+            return {
+                "accounts": service.list_accounts(
+                    platform=platform,
+                    auth_status=auth_status,
+                    login_status=login_status,
+                    q=q,
+                )
+            }
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/accounts/auth/start")
     def start_account_auth(payload: AccountAuthRequest) -> dict[str, Any]:
         try:
-            return service.start_account_auth(payload.platform, payload.account_name)
+            return service.start_account_auth(
+                payload.platform,
+                payload.account_name,
+                payload.account_id,
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -525,6 +542,10 @@ def create_app(
     @app.get("/api/publish-jobs/project")
     def get_project_publish_job(project_id: int) -> dict[str, Any]:
         return {"job": service.get_project_publish_job(project_id)}
+
+    @app.get("/api/publish-jobs/monitoring")
+    def get_publish_monitoring(platform: str | None = None) -> dict[str, Any]:
+        return service.get_publish_monitoring(platform)
 
     @app.get("/api/publish-jobs/{job_id}")
     def get_publish_job(job_id: int) -> dict[str, Any]:

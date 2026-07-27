@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,6 +23,9 @@ PLATFORM_LOGIN_URLS = {
     "小红书": "https://creator.xiaohongshu.com/new/home",
     "抖音": "https://creator.douyin.com/",
 }
+XIAOHONGSHU_IMAGE_PUBLISH_URL = (
+    "https://creator.xiaohongshu.com/publish/publish?from=homepage&target=image"
+)
 
 PLATFORM_COOKIE_MARKERS = {
     "微信公众号": {"slave_sid", "bizuin"},
@@ -95,11 +99,18 @@ class BrowserAuthManager:
         profiles_dir: str | Path,
         chrome_path: str | Path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         timeout_seconds: int = 300,
+        xiaohongshu_playwright_factory: Callable[[], Any] | None = None,
+        auth_log_dir: str | Path | None = None,
     ):
         self.profiles_dir = Path(profiles_dir)
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
         self.chrome_path = Path(chrome_path)
         self.timeout_seconds = timeout_seconds
+        self.xiaohongshu_playwright_factory = xiaohongshu_playwright_factory
+        if auth_log_dir is None:
+            base_dir = self.profiles_dir.parent.parent if self.profiles_dir.parent.name == "data" else self.profiles_dir.parent
+            auth_log_dir = base_dir / "logs" / "auth"
+        self.auth_log_dir = Path(auth_log_dir)
         self.sessions: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -111,6 +122,8 @@ class BrowserAuthManager:
     ) -> dict[str, Any]:
         if platform not in PLATFORM_LOGIN_URLS:
             raise RuntimeError("暂不支持该平台登录")
+        if platform == "小红书":
+            return self._start_xiaohongshu_patchright(platform, account_name, on_success)
         if not self.chrome_path.exists():
             raise RuntimeError("未找到 Google Chrome，请先安装 Chrome")
 
@@ -157,6 +170,106 @@ class BrowserAuthManager:
             daemon=True,
         ).start()
         return self._public_session(session)
+
+    def _start_xiaohongshu_patchright(
+        self,
+        platform: str,
+        account_name: str,
+        on_success: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        session_id = uuid.uuid4().hex
+        login_url = PLATFORM_LOGIN_URLS[platform]
+        session = {
+            "session_id": session_id,
+            "platform": platform,
+            "status": "waiting",
+            "message": "正在打开小红书登录窗口",
+            "login_url": login_url,
+            "profile_path": "",
+            "account": None,
+            "error": "",
+            "process": None,
+            "port": None,
+            "playwright": None,
+            "context": None,
+            "page": None,
+            "patchright_worker_owned": True,
+        }
+        with self._lock:
+            self.sessions[session_id] = session
+        self._trace_xiaohongshu_auth(session, "auth_start", account_name=account_name.strip())
+        threading.Thread(
+            target=self._run_xiaohongshu_patchright_auth,
+            args=(session_id, platform, account_name.strip(), on_success),
+            daemon=True,
+        ).start()
+        return self._public_session(session)
+
+    def _run_xiaohongshu_patchright_auth(
+        self,
+        session_id: str,
+        platform: str,
+        requested_name: str,
+        on_success: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        profile_path = self.profiles_dir / platform / session_id
+        profile_path.mkdir(parents=True, exist_ok=True)
+        playwright = None
+        context = None
+        session = self.sessions[session_id]
+        try:
+            with self._lock:
+                session = self.sessions[session_id]
+                if session["status"] != "waiting":
+                    return
+                session["profile_path"] = str(profile_path)
+                session["message"] = "正在打开小红书登录窗口"
+            self._trace_xiaohongshu_auth(session, "worker_start")
+            playwright = self._start_xiaohongshu_playwright()
+            launcher = getattr(playwright, "chromium", None)
+            if launcher is None:
+                raise RuntimeError("Patchright 未提供 Chromium")
+            context = launcher.launch_persistent_context(
+                user_data_dir=str(profile_path),
+                headless=False,
+                viewport={"width": 1200, "height": 707},
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            page = context.new_page()
+            login_url = PLATFORM_LOGIN_URLS[platform]
+            page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+            cancelled = False
+            with self._lock:
+                session = self.sessions[session_id]
+                if session["status"] != "waiting":
+                    cancelled = True
+                else:
+                    session["login_url"] = login_url
+                    session["playwright"] = playwright
+                    session["context"] = context
+                    session["page"] = page
+                    session["message"] = "已打开小红书登录页，请完成扫码登录"
+            if cancelled:
+                self._trace_xiaohongshu_auth(session, "worker_closed")
+                self._close_patchright_context(context, playwright)
+                return
+            self._trace_xiaohongshu_auth(session, "browser_opened")
+            self._trace_xiaohongshu_auth(session, "waiting_for_scan")
+            self._monitor_xiaohongshu_patchright(session_id, requested_name, on_success)
+        except Exception as exc:
+            message = f"启动小红书登录窗口失败：{exc}"
+            self._trace_xiaohongshu_auth(session, "auth_failed", error=message)
+            self._fail(session_id, message)
+            self._close_patchright_context(context, playwright)
+
+    def _start_xiaohongshu_playwright(self) -> Any:
+        if self.xiaohongshu_playwright_factory:
+            return self.xiaohongshu_playwright_factory()
+        try:
+            from patchright.sync_api import sync_playwright
+        except ModuleNotFoundError:
+            from playwright.sync_api import sync_playwright
+        return sync_playwright().start()
 
     def sync(self, account: dict[str, Any]) -> dict[str, Any]:
         platform = str(account.get("platform") or "")
@@ -231,14 +344,33 @@ class BrowserAuthManager:
                 session["status"] = "cancelled"
                 session["message"] = "登录已取消"
             process = session["process"]
-        self._close_browser(process, session.get("port"))
+            context = session.get("context")
+            playwright = session.get("playwright")
+            worker_owned = bool(session.get("patchright_worker_owned"))
+        if worker_owned:
+            self._trace_xiaohongshu_auth(session, "cancel_requested")
+            return self._public_session(session)
+        if context is not None or playwright is not None:
+            self._close_patchright_context(context, playwright)
+        else:
+            self._close_browser(process, session.get("port"))
         return self._public_session(session)
 
     def close_all(self) -> None:
         with self._lock:
             sessions = list(self.sessions.values())
         for session in sessions:
-            self._close_browser(session["process"], session.get("port"))
+            if session.get("patchright_worker_owned"):
+                with self._lock:
+                    if session.get("status") == "waiting":
+                        session["status"] = "cancelled"
+                        session["message"] = "登录已取消"
+                self._trace_xiaohongshu_auth(session, "cancel_requested")
+                continue
+            if session.get("context") is not None or session.get("playwright") is not None:
+                self._close_patchright_context(session.get("context"), session.get("playwright"))
+            else:
+                self._close_browser(session["process"], session.get("port"))
 
     def _monitor(
         self,
@@ -263,6 +395,13 @@ class BrowserAuthManager:
                 if page and self._is_authenticated(platform, page):
                     with self._lock:
                         session["message"] = "已检测到登录成功，正在读取真实账号信息"
+                    if platform == "小红书":
+                        try:
+                            page = self._verify_xiaohongshu_publish_access(port, page)
+                        except RuntimeError as exc:
+                            self._fail(session_id, str(exc))
+                            self._close_browser(process, port)
+                            return
                     identity = self._detect_account_identity(platform, port)
                     detected_name = identity.get("account_name", "")
                     external_id = identity.get("external_id", "")
@@ -297,6 +436,255 @@ class BrowserAuthManager:
             session = self.sessions[session_id]
         self._close_browser(session["process"], session.get("port"))
 
+    def _monitor_xiaohongshu_patchright(
+        self,
+        session_id: str,
+        requested_name: str,
+        on_success: Callable[[dict[str, Any]], dict[str, Any]],
+    ) -> None:
+        deadline = time.time() + self.timeout_seconds
+        while time.time() < deadline:
+            with self._lock:
+                session = self.sessions[session_id]
+                context = session["context"]
+                page = session["page"]
+                playwright = session["playwright"]
+                if session["status"] != "waiting":
+                    if session["status"] == "cancelled":
+                        self._trace_xiaohongshu_auth(session, "worker_closed")
+                        self._close_patchright_context(context, playwright)
+                    return
+            try:
+                page = self._best_xiaohongshu_patchright_page(context, page)
+                if self._patchright_xiaohongshu_authenticated(context, page):
+                    with self._lock:
+                        session["message"] = "已检测到登录成功，正在校验发布页登录态"
+                    pages = self._patchright_context_pages(context)
+                    cookie_names = self._xiaohongshu_patchright_cookie_names(context)
+                    self._trace_xiaohongshu_auth(
+                        session,
+                        "auth_cookie_detected",
+                        cookie_count=len(cookie_names & PLATFORM_COOKIE_MARKERS["小红书"]),
+                        current_url=self._patchright_page_url(page),
+                    )
+                    self._trace_xiaohongshu_auth(
+                        session,
+                        "auth_page_candidates",
+                        page_count=len(pages),
+                        selected_url=self._patchright_page_url(page),
+                    )
+                    self._trace_xiaohongshu_auth(session, "home_login_detected")
+                    try:
+                        self._trace_xiaohongshu_auth(session, "publish_preflight_start")
+                        login_url = self._verify_xiaohongshu_patchright_publish_access(context, page)
+                    except RuntimeError as exc:
+                        message = self._xiaohongshu_preflight_error(exc)
+                        self._trace_xiaohongshu_auth(session, "auth_failed", error=message)
+                        self._fail(session_id, message)
+                        self._close_patchright_context(context, playwright)
+                        return
+                    except Exception as exc:
+                        message = self._xiaohongshu_preflight_error(exc)
+                        self._trace_xiaohongshu_auth(session, "auth_failed", error=message)
+                        self._fail(session_id, message)
+                        self._close_patchright_context(context, playwright)
+                        return
+                    self._trace_xiaohongshu_auth(session, "publish_preflight_success", login_url=login_url)
+                    identity = self._detect_xiaohongshu_patchright_identity(context, page)
+                    self._trace_xiaohongshu_auth(session, "account_write_start")
+                    account = on_success(
+                        {
+                            "platform": "小红书",
+                            "account_name": identity.get("account_name") or requested_name or self._fallback_account_name("小红书", identity.get("external_id", "")),
+                            "external_id": identity.get("external_id", ""),
+                            "profile_path": session["profile_path"],
+                            "login_url": login_url,
+                            "publish_preflight_verified": True,
+                            "sync_data": None,
+                            "sync_error": "",
+                        }
+                    )
+                    self._trace_xiaohongshu_auth(session, "account_write_success", account_id=account.get("id"))
+                    with self._lock:
+                        session["status"] = "success"
+                        session["message"] = "登录成功，账号已加入工作台"
+                        session["account"] = account
+                    self._close_patchright_context(context, playwright)
+                    self._trace_xiaohongshu_auth(session, "auth_window_closed")
+                    return
+            except RuntimeError as exc:
+                self._trace_xiaohongshu_auth(session, "auth_failed", error=str(exc))
+                self._fail(session_id, str(exc))
+                self._close_patchright_context(context, playwright)
+                return
+            except Exception as exc:
+                self._trace_xiaohongshu_auth(session, "auth_check_error", error=str(exc))
+            time.sleep(2)
+        self._fail(session_id, "登录超时，请重新发起登录")
+        with self._lock:
+            session = self.sessions[session_id]
+        self._trace_xiaohongshu_auth(session, "auth_failed", error=session.get("error") or "登录超时，请重新发起登录")
+        self._close_patchright_context(session.get("context"), session.get("playwright"))
+
+    def _verify_xiaohongshu_patchright_publish_access(self, context: Any, page: Any) -> str:
+        page = self._best_xiaohongshu_patchright_page(context, page)
+        navigation_error = ""
+        try:
+            page.goto(XIAOHONGSHU_IMAGE_PUBLISH_URL, wait_until="commit", timeout=15000)
+        except TypeError:
+            try:
+                page.goto(XIAOHONGSHU_IMAGE_PUBLISH_URL, wait_until="domcontentloaded", timeout=15000)
+            except Exception as exc:
+                navigation_error = str(exc)
+        except Exception as exc:
+            navigation_error = str(exc)
+        deadline = time.time() + 12
+        last_url = self._patchright_page_url(page)
+        while time.time() < deadline:
+            last_url = self._patchright_page_url(page) or last_url
+            parsed = urllib.parse.urlparse(last_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            if query.get("redirectReason") == ["401"]:
+                raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+            if parsed.netloc == "creator.xiaohongshu.com" and parsed.path.startswith("/publish/publish"):
+                if self._patchright_xiaohongshu_authenticated(context, page):
+                    return last_url
+            wait_for_timeout = getattr(page, "wait_for_timeout", None)
+            if callable(wait_for_timeout):
+                wait_for_timeout(1000)
+            else:
+                time.sleep(1)
+        if navigation_error:
+            raise RuntimeError(f"小红书发布页登录态未通过，请重新扫码登录：{navigation_error}")
+        raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+
+    def _patchright_xiaohongshu_authenticated(self, context: Any, page: Any) -> bool:
+        cookie_names = self._xiaohongshu_patchright_cookie_names(context)
+        if cookie_names & PLATFORM_COOKIE_MARKERS["小红书"]:
+            return True
+        page = self._best_xiaohongshu_patchright_page(context, page)
+        parsed = urllib.parse.urlparse(self._patchright_page_url(page))
+        if parsed.path.startswith("/login"):
+            return False
+        return bool(self._detect_xiaohongshu_patchright_identity(context, page).get("account_name"))
+
+    @staticmethod
+    def _xiaohongshu_patchright_cookie_names(context: Any) -> set[str]:
+        try:
+            cookies = context.cookies() or []
+        except Exception:
+            return set()
+        return {
+            str(cookie.get("name") or "")
+            for cookie in cookies
+            if str(cookie.get("name") or "").strip()
+        }
+
+    @staticmethod
+    def _patchright_context_pages(context: Any) -> list[Any]:
+        pages = getattr(context, "pages", [])
+        if callable(pages):
+            with suppress(Exception):
+                pages = pages()
+        if isinstance(pages, (list, tuple)):
+            return list(pages)
+        return []
+
+    def _best_xiaohongshu_patchright_page(self, context: Any, fallback: Any) -> Any:
+        pages = [page for page in self._patchright_context_pages(context) if page is not None]
+        if not pages:
+            return fallback
+        creator_pages = [
+            page for page in pages
+            if urllib.parse.urlparse(self._patchright_page_url(page)).netloc == "creator.xiaohongshu.com"
+        ]
+        non_login_pages = [
+            page for page in creator_pages
+            if not urllib.parse.urlparse(self._patchright_page_url(page)).path.startswith("/login")
+        ]
+        if non_login_pages:
+            return non_login_pages[-1]
+        if creator_pages:
+            return creator_pages[-1]
+        return pages[-1]
+
+    def _detect_xiaohongshu_patchright_identity(self, context: Any, page: Any) -> dict[str, str]:
+        cookies = context.cookies() or []
+        external_id = ""
+        for marker in PLATFORM_ID_COOKIES["小红书"]:
+            external_id = next((str(cookie.get("value") or "") for cookie in cookies if cookie.get("name") == marker), "")
+            if external_id:
+                break
+        account_name = ""
+        with suppress(Exception):
+            selectors = json.dumps(ACCOUNT_NAME_SELECTORS["小红书"], ensure_ascii=False)
+            account_name = str(
+                page.evaluate(
+                    f"""
+                    (() => {{
+                      const selectors = {selectors};
+                      for (const selector of selectors) {{
+                        const node = document.querySelector(selector);
+                        const text = node?.textContent?.trim();
+                        if (text && text.length <= 80) return text;
+                      }}
+                      return "";
+                    }})()
+                    """
+                )
+                or ""
+            )
+        return {"account_name": account_name, "external_id": external_id}
+
+    @staticmethod
+    def _patchright_page_url(page: Any) -> str:
+        url = str(getattr(page, "url", "") or "")
+        if url:
+            return url
+        with suppress(Exception):
+            return str(page.evaluate("location.href") or "")
+        return ""
+
+    @staticmethod
+    def _xiaohongshu_preflight_error(exc: Exception) -> str:
+        text = str(exc) or exc.__class__.__name__
+        if text.startswith("小红书发布页预检失败"):
+            return text
+        return f"小红书发布页预检失败：{text}"
+
+    def _trace_xiaohongshu_auth(self, session: dict[str, Any], event: str, **fields: Any) -> None:
+        payload: dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "event": event,
+            "session_id": str(session.get("session_id") or ""),
+            "platform": "小红书",
+        }
+        profile_path = str(session.get("profile_path") or "")
+        if profile_path:
+            payload["profile_suffix"] = Path(profile_path).name[-8:]
+        for key, value in fields.items():
+            if value is None:
+                continue
+            if key in {"profile_path", "cookie", "cookies", "token"}:
+                continue
+            payload[key] = self._safe_trace_value(value)
+        try:
+            self.auth_log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = self.auth_log_dir / f"xiaohongshu-auth-{time.strftime('%Y%m%d')}.jsonl"
+            with log_path.open("a", encoding="utf-8") as file:
+                file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
+    @staticmethod
+    def _safe_trace_value(value: Any) -> Any:
+        if isinstance(value, (int, float, bool)):
+            return value
+        text = str(value)
+        text = re.sub(r"(/[^\\s:]+){3,}", "[path]", text)
+        text = re.sub(r"([A-Za-z0-9_-]{24,})", "[redacted]", text)
+        return text[:300]
+
     def _platform_page(self, port: int, platform: str) -> dict[str, Any] | None:
         host = urllib.parse.urlparse(PLATFORM_LOGIN_URLS[platform]).netloc
         request = urllib.request.Request(f"http://127.0.0.1:{port}/json/list")
@@ -311,9 +699,31 @@ class BrowserAuthManager:
         url = page.get("url", "")
         if platform == "微信公众号" and "/cgi-bin/" in url and "token=" in url:
             return True
+        parsed = urllib.parse.urlparse(url)
+        if platform == "小红书" and parsed.path.startswith("/login"):
+            return False
         cookies = self._cdp_call(page, "Network.getAllCookies").get("cookies", [])
         cookie_names = {cookie.get("name") for cookie in cookies}
         return bool(cookie_names & PLATFORM_COOKIE_MARKERS[platform])
+
+    def _verify_xiaohongshu_publish_access(
+        self, port: int, page: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._cdp_call(page, "Page.navigate", {"url": XIAOHONGSHU_IMAGE_PUBLISH_URL})
+        deadline = time.time() + 12
+        last_url = str(page.get("url") or "")
+        while time.time() < deadline:
+            current_page = self._platform_page(port, "小红书") or page
+            last_url = str(current_page.get("url") or last_url)
+            parsed = urllib.parse.urlparse(last_url)
+            query = urllib.parse.parse_qs(parsed.query)
+            if parsed.path.startswith("/login") or query.get("redirectReason") == ["401"]:
+                raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+            if parsed.netloc == "creator.xiaohongshu.com" and parsed.path.startswith("/publish/publish"):
+                if self._is_authenticated("小红书", current_page):
+                    return current_page
+            time.sleep(1)
+        raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
 
     def _detect_account_name(self, platform: str, page: dict[str, Any]) -> str:
         selectors = json.dumps(ACCOUNT_NAME_SELECTORS[platform], ensure_ascii=False)
@@ -371,6 +781,8 @@ class BrowserAuthManager:
                     external_id = cookie_map[cookie_name]
                     break
             detected_name = self._detect_account_name(platform, page)
+            if platform == "小红书" and external_id:
+                break
             if detected_name:
                 break
             time.sleep(1)
@@ -577,6 +989,8 @@ class BrowserAuthManager:
 
     @staticmethod
     def _close_browser(process: subprocess.Popen[Any], port: int | None) -> None:
+        if process is None:
+            return
         if process.poll() is not None:
             return
         if port:
@@ -604,6 +1018,15 @@ class BrowserAuthManager:
             return
         process.kill()
         BrowserAuthManager._wait_for_browser_exit(process)
+
+    @staticmethod
+    def _close_patchright_context(context: Any, playwright: Any) -> None:
+        if context is not None:
+            with suppress(Exception):
+                context.close()
+        if playwright is not None:
+            with suppress(Exception):
+                playwright.stop()
 
     @staticmethod
     def _public_account(account: Any) -> dict[str, Any] | None:

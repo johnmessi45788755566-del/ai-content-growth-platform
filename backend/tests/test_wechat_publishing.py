@@ -244,14 +244,14 @@ def test_wechat_browser_publisher_upload_payload_reaches_gateway(tmp_path: Path)
     assert gateway.filled_payload["blocks"][1]["image_path"] == payload["blocks"][1]["image_path"]
 
 
-def test_wechat_browser_publisher_reports_progress_at_real_browser_steps(tmp_path: Path):
-    gateway = FakeWeChatGateway(draft_outcome())
+def test_wechat_browser_publisher_reports_publish_progress_at_real_browser_steps(tmp_path: Path):
+    gateway = FakeWeChatGateway(published_outcome())
     statuses = []
 
     result = WeChatBrowserPublisher(gateway=gateway).publish_with_progress(
         article_payload(tmp_path),
         browser_account(tmp_path),
-        action="draft",
+        action="publish",
         report_progress=statuses.append,
     )
 
@@ -263,9 +263,28 @@ def test_wechat_browser_publisher_reports_progress_at_real_browser_steps(tmp_pat
         "capture_baseline"
     )
     assert gateway.actions.index("capture_baseline") < gateway.actions.index(
-        "click_save_draft"
+        "click_publish"
     )
+    assert result.status == "published"
+
+
+def test_wechat_browser_publisher_skips_cover_asset_upload_for_platform_draft(tmp_path: Path):
+    gateway = FakeWeChatGateway(draft_outcome())
+    statuses = []
+
+    result = WeChatBrowserPublisher(gateway=gateway).publish_with_progress(
+        article_payload(tmp_path),
+        browser_account(tmp_path),
+        action="draft",
+        report_progress=statuses.append,
+    )
+
     assert result.status == "platform_draft"
+    assert statuses == ["filling_content", "publishing"]
+    assert "upload_article_assets" not in gateway.actions
+    assert gateway.actions.index("fill_article_content") < gateway.actions.index(
+        "capture_baseline"
+    )
 
 
 def test_wechat_browser_publisher_verifies_selected_account_before_platform_changes(tmp_path: Path):
@@ -870,6 +889,34 @@ def test_browser_gateway_accepts_only_new_title_bound_receipt_with_post_action_s
     assert outcome["post_action_signal"]["observed_after_action"] is True
 
 
+def test_browser_gateway_accepts_manual_save_history_for_platform_draft(tmp_path: Path):
+    same_url = "https://mp.weixin.qq.com/cgi-bin/appmsg"
+    gateway = ObservationGateway(
+        [
+            {"url": same_url, "receipts": [], "signals": []},
+            {
+                "url": same_url,
+                "receipts": [],
+                "signals": [
+                    {
+                        "kind": "draft_manual_save_history",
+                        "observed_after_baseline": True,
+                        "saved_at": "07-22 18:20",
+                    }
+                ],
+            },
+        ]
+    )
+    session = browser_session(tmp_path)
+
+    baseline = gateway.capture_baseline(session, "浏览器发布测试", "draft")
+    outcome = gateway.verify_draft(session, "浏览器发布测试", baseline)
+
+    assert outcome["status"] == "platform_draft"
+    assert outcome["draft_id"].startswith("manual-save:")
+    assert outcome["post_action_signal"]["kind"] == "draft_manual_save_history"
+
+
 def test_browser_gateway_rejects_empty_title_or_preexisting_receipts(tmp_path: Path):
     baseline_observation = {
         "url": "https://mp.weixin.qq.com/cgi-bin/appmsg",
@@ -1217,6 +1264,7 @@ class FakeFileChooserConnection:
         self.sent = []
         self.file_chooser_sent = False
         self.closed = False
+        self.captured_input = False
 
     def send(self, value):
         self.sent.append(json.loads(value))
@@ -1228,6 +1276,21 @@ class FakeFileChooserConnection:
         if method == "Page.setInterceptFileChooserDialog":
             return json.dumps({"id": response_id, "result": {}})
         if method == "Runtime.evaluate":
+            expression = last.get("params", {}).get("expression", "")
+            if "__codexFileInputCapture" in expression and "captured" in expression:
+                return json.dumps(
+                    {
+                        "id": response_id,
+                        "result": {"result": {"value": {"ok": self.captured_input}}},
+                    }
+                )
+            if "__codexFileInputCapture" in expression:
+                return json.dumps(
+                    {
+                        "id": response_id,
+                        "result": {"result": {"value": {"ok": True, "installed": True}}},
+                    }
+                )
             return json.dumps(
                 {
                     "id": response_id,
@@ -1253,6 +1316,10 @@ class FakeFileChooserConnection:
             return json.dumps({"id": response_id, "result": {}})
         if method == "DOM.setFileInputFiles":
             return json.dumps({"id": response_id, "result": {}})
+        if method == "DOM.getDocument":
+            return json.dumps({"id": response_id, "result": {"root": {"nodeId": 1}}})
+        if method == "DOM.querySelector":
+            return json.dumps({"id": response_id, "result": {"nodeId": 0}})
         return json.dumps({"id": response_id, "result": {}})
 
     def close(self):
@@ -1287,6 +1354,94 @@ def test_cover_upload_can_use_file_chooser_event_backend_node_id(
     } in connection.sent
     assert connection.sent[-1]["method"] == "Page.setInterceptFileChooserDialog"
     assert connection.sent[-1]["params"] == {"enabled": False}
+    assert connection.closed
+
+
+def test_generic_file_chooser_sets_multiple_files_with_backend_node_id(
+    tmp_path: Path, monkeypatch
+):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    connection = FakeFileChooserConnection()
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        lambda url, timeout: connection,
+    )
+    gateway = ChromeCDPBrowserGateway()
+
+    assert gateway.set_file_input_files_via_file_chooser(
+        browser_session(tmp_path),
+        "(() => ({ ok: true, rect: { x: 10, y: 20, width: 200, height: 80 } }))()",
+        [first, second],
+        "小红书图文图片",
+        trace_prefix="xhs.upload",
+    )
+
+    methods = [item["method"] for item in connection.sent]
+    assert methods[:4] == [
+        "Page.enable",
+        "Runtime.enable",
+        "DOM.enable",
+        "Page.setInterceptFileChooserDialog",
+    ]
+    assert {
+        "method": "DOM.setFileInputFiles",
+        "params": {"files": [str(first.resolve()), str(second.resolve())], "backendNodeId": 321},
+    } in [
+        {"method": item["method"], "params": item.get("params")}
+        for item in connection.sent
+    ]
+    assert connection.sent[-1]["method"] == "Page.setInterceptFileChooserDialog"
+    assert connection.sent[-1]["params"] == {"enabled": False}
+    assert connection.closed
+
+
+class FakeCapturedInputConnection(FakeFileChooserConnection):
+    def __init__(self):
+        super().__init__()
+        self.captured_input = True
+
+    def recv(self):
+        last = self.sent[-1]
+        method = last["method"]
+        response_id = last["id"]
+        if method == "DOM.querySelector":
+            return json.dumps({"id": response_id, "result": {"nodeId": 456}})
+        return super().recv()
+
+
+def test_generic_file_chooser_sets_files_on_captured_programmatic_input(
+    tmp_path: Path, monkeypatch
+):
+    image = tmp_path / "first.png"
+    image.write_bytes(b"first")
+    connection = FakeCapturedInputConnection()
+    monkeypatch.setattr(
+        browser_gateway_module.websocket,
+        "create_connection",
+        lambda url, timeout: connection,
+    )
+    gateway = ChromeCDPBrowserGateway()
+
+    assert gateway.set_file_input_files_via_file_chooser(
+        browser_session(tmp_path),
+        "(() => ({ ok: true, rect: { x: 10, y: 20, width: 200, height: 80 } }))()",
+        [image],
+        "小红书图文图片",
+        trace_prefix="xhs.upload",
+    )
+
+    assert {
+        "method": "DOM.setFileInputFiles",
+        "params": {"files": [str(image.resolve())], "nodeId": 456},
+    } in [
+        {"method": item["method"], "params": item.get("params")}
+        for item in connection.sent
+    ]
+    assert "Input.dispatchMouseEvent" not in [item["method"] for item in connection.sent]
     assert connection.closed
 
 
@@ -2100,7 +2255,7 @@ class StepwiseCoverPickerGateway(ChromeCDPBrowserGateway):
             raise WeChatPublishingError("unexpected legacy cover picker expression")
         return {"ok": True}
 
-    def _dispatch_mouse_click(self, session, rect):
+    def _dispatch_wechat_mouse_click(self, session, rect):
         self.actions.append("cdp:mouse-click")
         self.card_selected = True
 
@@ -2501,6 +2656,88 @@ def test_browser_close_waits_for_child_exit_after_cdp_failure(tmp_path: Path):
 
     assert process.terminate_calls == 1
     assert process.wait_calls == 1
+
+
+def test_close_session_targets_closes_matching_tabs_and_current_target(tmp_path: Path):
+    class TargetClosingGateway(ChromeCDPBrowserGateway):
+        def __init__(self):
+            super().__init__()
+            self.closed_target_ids = []
+
+        def _targets(self, port):
+            return [
+                {
+                    "id": "current-page",
+                    "type": "page",
+                    "url": "https://creator.xiaohongshu.com/publish/publish?from=homepage",
+                },
+                {
+                    "id": "matching-success",
+                    "type": "page",
+                    "url": "https://creator.xiaohongshu.com/publish/success?note=1",
+                },
+                {
+                    "id": "other-page",
+                    "type": "page",
+                    "url": "https://creator.xiaohongshu.com/new/home",
+                },
+            ]
+
+        def _cdp_call(self, session, method, params=None):
+            assert method == "Target.closeTarget"
+            self.closed_target_ids.append((params or {})["targetId"])
+            return {}
+
+    session = browser_session(tmp_path)
+    session.target_id = "current-page"
+    gateway = TargetClosingGateway()
+
+    gateway.close_session_targets(
+        session,
+        hostnames=("creator.xiaohongshu.com",),
+        paths=("/publish/publish", "/publish/success"),
+    )
+
+    assert gateway.closed_target_ids == ["matching-success", "current-page"]
+
+
+def test_close_session_targets_can_keep_current_target(tmp_path: Path):
+    class TargetClosingGateway(ChromeCDPBrowserGateway):
+        def __init__(self):
+            super().__init__()
+            self.closed_target_ids = []
+
+        def _targets(self, port):
+            return [
+                {
+                    "id": "current-page",
+                    "type": "page",
+                    "url": "https://creator.xiaohongshu.com/publish/publish?from=homepage",
+                },
+                {
+                    "id": "old-page",
+                    "type": "page",
+                    "url": "https://creator.xiaohongshu.com/publish/publish?from=homepage",
+                },
+            ]
+
+        def _cdp_call(self, session, method, params=None):
+            assert method == "Target.closeTarget"
+            self.closed_target_ids.append((params or {})["targetId"])
+            return {}
+
+    session = browser_session(tmp_path)
+    session.target_id = "current-page"
+    gateway = TargetClosingGateway()
+
+    gateway.close_session_targets(
+        session,
+        hostnames=("creator.xiaohongshu.com",),
+        paths=("/publish/publish",),
+        include_current=False,
+    )
+
+    assert gateway.closed_target_ids == ["old-page"]
 
 
 def test_wait_for_target_includes_chrome_stderr_when_process_exits():

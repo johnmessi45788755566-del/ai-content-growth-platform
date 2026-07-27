@@ -364,6 +364,79 @@ h3 {
   font-weight: 500;
 }
 
+.publish-monitor {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--panel-soft);
+}
+
+.publish-monitor-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.publish-monitor-metrics span {
+  min-height: 30px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.publish-event-section {
+  display: grid;
+  gap: 12px;
+  padding-top: 12px;
+}
+
+.publish-event-list {
+  display: grid;
+  gap: 10px;
+}
+
+.publish-event {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--blue);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.publish-event-error {
+  border-left-color: var(--red);
+}
+
+.publish-event-warning {
+  border-left-color: var(--orange);
+}
+
+.publish-event span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.publish-event strong {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.publish-event p {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.6;
+}
+
 .creator-stepper {
   margin-bottom: 12px;
 }

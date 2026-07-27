@@ -307,11 +307,11 @@ class ChromeCDPBrowserGateway:
         if exception:
             detail = exception.get("exception") or {}
             raise WeChatPublishingError(
-                str(detail.get("description") or exception.get("text") or "微信页面脚本执行失败")
+                str(detail.get("description") or exception.get("text") or "页面脚本执行失败")
             )
         result = payload.get("result") or {}
         if result.get("subtype") == "error":
-            raise WeChatPublishingError(str(result.get("description") or "微信页面脚本执行失败"))
+            raise WeChatPublishingError(str(result.get("description") or "页面脚本执行失败"))
         return result.get("value")
 
     def set_file_input(
@@ -471,6 +471,307 @@ class ChromeCDPBrowserGateway:
                 )
             self._trace("upload.failed", role=role, label=label, error=str(exc))
             raise
+
+    def set_file_input_files_via_file_chooser(
+        self,
+        session: BrowserSession,
+        trigger_expression: str,
+        file_paths: Sequence[str | Path],
+        label: str,
+        trace_prefix: str = "upload.file_chooser",
+    ) -> bool:
+        paths = [Path(path).expanduser().resolve() for path in file_paths]
+        for path in paths:
+            if not path.is_file():
+                raise WeChatPublishingError(f"{label}文件不存在：{path}")
+        connection = None
+        call_id = 0
+        chooser_backend_node_id = 0
+        input_capture_marker = f"codex-file-input-{secrets.token_hex(12)}"
+
+        def send(method: str, params: Mapping[str, Any] | None = None) -> int:
+            nonlocal call_id
+            call_id += 1
+            connection.send(
+                json.dumps({"id": call_id, "method": method, "params": dict(params or {})})
+            )
+            return call_id
+
+        def recv_until(response_id: int, timeout: float = 5) -> dict[str, Any]:
+            nonlocal chooser_backend_node_id
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                payload = json.loads(connection.recv())
+                if payload.get("method") == "Page.fileChooserOpened":
+                    params = payload.get("params") or {}
+                    chooser_backend_node_id = int(params.get("backendNodeId") or 0)
+                    self._trace(
+                        f"{trace_prefix}.file_chooser_captured",
+                        label=label,
+                        backend_node_id_found=bool(chooser_backend_node_id),
+                    )
+                    continue
+                if payload.get("id") != response_id:
+                    continue
+                if payload.get("error"):
+                    message = payload["error"].get("message") or "CDP 调用失败"
+                    raise WeChatPublishingError(f"{payload.get('method') or 'CDP'}：{message}")
+                return payload.get("result") or {}
+            raise WeChatPublishingError(f"等待{label}文件选择器超时")
+
+        def wait_for_file_chooser(timeout: float = 2) -> None:
+            nonlocal chooser_backend_node_id
+            deadline = time.time() + timeout
+            while not chooser_backend_node_id and time.time() < deadline:
+                try:
+                    payload = json.loads(connection.recv())
+                except Exception as exc:
+                    timeout_error = getattr(websocket, "WebSocketTimeoutException", None)
+                    if (timeout_error and isinstance(exc, timeout_error)) or "timed out" in str(exc).lower():
+                        self._trace(
+                            f"{trace_prefix}.file_chooser_wait_timeout",
+                            label=label,
+                            timeout=timeout,
+                        )
+                        return
+                    raise
+                if payload.get("method") == "Page.fileChooserOpened":
+                    params = payload.get("params") or {}
+                    chooser_backend_node_id = int(params.get("backendNodeId") or 0)
+                    self._trace(
+                        f"{trace_prefix}.file_chooser_captured",
+                        label=label,
+                        backend_node_id_found=bool(chooser_backend_node_id),
+                    )
+
+        def runtime_value(result: Mapping[str, Any]) -> Mapping[str, Any]:
+            runtime_result = result.get("result") if isinstance(result, Mapping) else {}
+            value = runtime_result.get("value") if isinstance(runtime_result, Mapping) else {}
+            return value if isinstance(value, Mapping) else {}
+
+        def install_input_capture() -> None:
+            marker = json.dumps(input_capture_marker)
+            result = recv_until(
+                send(
+                    "Runtime.evaluate",
+                    {
+                        "expression": f"""
+                        (() => {{
+                          const marker = {marker};
+                          const previous = window.__codexFileInputCapture;
+                          if (previous && typeof previous.restore === 'function') {{
+                            try {{ previous.restore(); }} catch (err) {{}}
+                          }}
+                          const originalClick = HTMLInputElement.prototype.click;
+                          const originalShowPicker = HTMLInputElement.prototype.showPicker;
+                          const state = {{
+                            marker,
+                            captured: false,
+                            restore() {{
+                              HTMLInputElement.prototype.click = originalClick;
+                              if (originalShowPicker) {{
+                                HTMLInputElement.prototype.showPicker = originalShowPicker;
+                              }}
+                            }},
+                          }};
+                          const mark = (input) => {{
+                            if (!(input instanceof HTMLInputElement) || input.type !== 'file') return false;
+                            input.setAttribute('data-codex-file-input-marker', marker);
+                            state.captured = true;
+                            return true;
+                          }};
+                          HTMLInputElement.prototype.click = function(...args) {{
+                            if (mark(this)) return undefined;
+                            return originalClick.apply(this, args);
+                          }};
+                          if (originalShowPicker) {{
+                            HTMLInputElement.prototype.showPicker = function(...args) {{
+                              if (mark(this)) return undefined;
+                              return originalShowPicker.apply(this, args);
+                            }};
+                          }}
+                          window.__codexFileInputCapture = state;
+                          return {{ ok: true, installed: true }};
+                        }})()
+                        """,
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                    },
+                )
+            )
+            self._trace(
+                f"{trace_prefix}.input_capture_installed",
+                label=label,
+                result=dict(runtime_value(result)),
+            )
+
+        def restore_input_capture() -> None:
+            try:
+                recv_until(
+                    send(
+                        "Runtime.evaluate",
+                        {
+                            "expression": """
+                            (() => {
+                              const state = window.__codexFileInputCapture;
+                              if (state && typeof state.restore === 'function') state.restore();
+                              delete window.__codexFileInputCapture;
+                              return { ok: true };
+                            })()
+                            """,
+                            "returnByValue": True,
+                            "awaitPromise": True,
+                        },
+                    ),
+                    timeout=2,
+                )
+            except Exception:
+                pass
+
+        def captured_file_input_node_id() -> int:
+            marker = json.dumps(input_capture_marker)
+            status = runtime_value(
+                recv_until(
+                    send(
+                        "Runtime.evaluate",
+                        {
+                            "expression": f"""
+                            (() => {{
+                              const state = window.__codexFileInputCapture;
+                              return {{
+                                ok: !!(state && state.marker === {marker} && state.captured),
+                              }};
+                            }})()
+                            """,
+                            "returnByValue": True,
+                            "awaitPromise": True,
+                        },
+                    )
+                )
+            )
+            self._trace(
+                f"{trace_prefix}.input_capture_status",
+                label=label,
+                result=dict(status),
+            )
+            if not status.get("ok"):
+                return 0
+            root = recv_until(send("DOM.getDocument", {"depth": -1, "pierce": True})).get("root") or {}
+            root_node_id = int(root.get("nodeId") or 0)
+            if not root_node_id:
+                return 0
+            result = recv_until(
+                send(
+                    "DOM.querySelector",
+                    {
+                        "nodeId": root_node_id,
+                        "selector": f'input[type="file"][data-codex-file-input-marker="{input_capture_marker}"]',
+                    },
+                )
+            )
+            return int(result.get("nodeId") or 0)
+
+        def click_rect(rect: Mapping[str, Any]) -> None:
+            width = float(rect.get("width") or 0)
+            height = float(rect.get("height") or 0)
+            if width <= 0 or height <= 0:
+                return
+            x = round(float(rect.get("x") or 0) + width / 2)
+            y = round(float(rect.get("y") or 0) + height / 2)
+            for params in (
+                {"type": "mouseMoved", "x": x, "y": y, "button": "none"},
+                {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+                {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+            ):
+                recv_until(send("Input.dispatchMouseEvent", params))
+
+        try:
+            self._trace(
+                f"{trace_prefix}.open_file_chooser",
+                label=label,
+                file_count=len(paths),
+            )
+            connection = websocket.create_connection(session.websocket_url, timeout=5)
+            recv_until(send("Page.enable"))
+            recv_until(send("Runtime.enable"))
+            recv_until(send("DOM.enable"))
+            recv_until(send("Page.setInterceptFileChooserDialog", {"enabled": True}))
+            install_input_capture()
+            trigger_result = recv_until(
+                send(
+                    "Runtime.evaluate",
+                    {
+                        "expression": trigger_expression,
+                        "returnByValue": True,
+                        "awaitPromise": True,
+                        "userGesture": True,
+                    },
+                )
+            )
+            trigger_value = runtime_value(trigger_result)
+            self._trace(
+                f"{trace_prefix}.trigger_upload",
+                label=label,
+                result=dict(trigger_value),
+            )
+            captured_node_id = captured_file_input_node_id()
+            if captured_node_id:
+                recv_until(
+                    send(
+                        "DOM.setFileInputFiles",
+                        {
+                            "files": [str(path) for path in paths],
+                            "nodeId": captured_node_id,
+                        },
+                    )
+                )
+                self._trace(
+                    f"{trace_prefix}.set_files_on_captured_input",
+                    label=label,
+                    file_count=len(paths),
+                    node_id_found=True,
+                )
+                return True
+            if not chooser_backend_node_id:
+                wait_for_file_chooser(timeout=0.5)
+            rect = trigger_value.get("rect")
+            if not chooser_backend_node_id and isinstance(rect, Mapping):
+                click_rect(rect)
+            if not chooser_backend_node_id:
+                wait_for_file_chooser(timeout=2)
+            if not chooser_backend_node_id:
+                self._trace(f"{trace_prefix}.file_chooser_not_opened", label=label)
+                return False
+            recv_until(
+                send(
+                    "DOM.setFileInputFiles",
+                    {
+                        "files": [str(path) for path in paths],
+                        "backendNodeId": chooser_backend_node_id,
+                    },
+                )
+            )
+            self._trace(
+                f"{trace_prefix}.set_files_succeeded",
+                label=label,
+                file_count=len(paths),
+                backend_node_id_found=True,
+            )
+            return True
+        except Exception as exc:
+            self._trace(f"{trace_prefix}.set_files_failed", label=label, error=str(exc))
+            return False
+        finally:
+            if connection is not None:
+                restore_input_capture()
+                try:
+                    recv_until(
+                        send("Page.setInterceptFileChooserDialog", {"enabled": False}),
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
+                connection.close()
 
     def _set_file_input_files_with_retry(
         self,
@@ -1412,6 +1713,27 @@ class ChromeCDPBrowserGateway:
           };
           const visibleList = (selector, max = 80) => [...document.querySelectorAll(selector)].filter(visible).slice(0, max);
           const buttons = visibleList('button,a,[role="button"],.weui-desktop-btn,.pop-opr__button', 100).map(describe);
+          const publishControls = [...document.querySelectorAll('xhs-publish-btn')].map((host) => {
+            const hostState = {
+              tag: host.tagName ? host.tagName.toLowerCase() : '',
+              id: host.id || '',
+              className: typeof host.className === 'string' ? host.className : '',
+              submitDisabled: host.getAttribute('submit-disabled'),
+              submitLoading: host.getAttribute('submit-loading'),
+              submitText: host.getAttribute('submit-text'),
+              saveDisabled: host.getAttribute('save-disabled'),
+              rect: rectOf(host)
+            };
+            const root = host.shadowRoot;
+            const shadowButtons = root
+              ? [...root.querySelectorAll('button,[role="button"],div,span')].filter(visible).slice(0, 20).map(describe)
+              : [];
+            return {
+              ...hostState,
+              hasShadowRoot: !!root,
+              shadowButtons
+            };
+          });
           const dialogs = visibleList('.weui-desktop-dialog,.weui-desktop-dialog__wrp,[role="dialog"],.pop-opr__group,.weui-desktop-mask', 30).map(describe);
           const coverArea = document.querySelector('.js_cover_area,.js_cover_preview_square,.select-cover__preview,.cover_appmsg_item');
           const coverCandidates = visibleList('.appmsg_content_img_item,.appmsg_content_img_list li,.img_crop_panel li,[class*="appmsg_content_img"] li', 60).map((node) => ({
@@ -1434,6 +1756,7 @@ class ChromeCDPBrowserGateway:
             },
             activeElement,
             buttons,
+            publishControls,
             dialogs,
             cover: {
               areaText: coverArea ? compactText(coverArea.innerText || coverArea.textContent).slice(0, 240) : '',
@@ -1548,6 +1871,59 @@ class ChromeCDPBrowserGateway:
                 Path(session.confirmation_screenshot).unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def close_session_targets(
+        self,
+        session: BrowserSession,
+        hostnames: Sequence[str] = (),
+        paths: Sequence[str] = (),
+        include_current: bool = True,
+    ) -> None:
+        target_ids: list[str] = []
+        try:
+            targets = self._targets(session.port)
+        except Exception as exc:
+            self._trace("tab.close_targets_list_failed", error=str(exc))
+            targets = []
+        for target in targets:
+            target_id = str(target.get("id") or "")
+            if not target_id or target.get("type") != "page":
+                continue
+            if target_id != session.target_id and self._target_url_matches(
+                str(target.get("url") or ""),
+                hostnames,
+                paths,
+            ):
+                target_ids.append(target_id)
+        if include_current and session.target_id:
+            target_ids.append(session.target_id)
+        seen: set[str] = set()
+        for target_id in target_ids:
+            if target_id in seen:
+                continue
+            seen.add(target_id)
+            try:
+                self._trace("tab.close_target", target_id=target_id)
+                self._cdp_call(session, "Target.closeTarget", {"targetId": target_id})
+            except Exception as exc:
+                self._trace(
+                    "tab.close_target_failed",
+                    target_id=target_id,
+                    error=str(exc),
+                )
+
+    @staticmethod
+    def _target_url_matches(
+        url: str,
+        hostnames: Sequence[str],
+        paths: Sequence[str],
+    ) -> bool:
+        parsed = urllib.parse.urlparse(url)
+        if hostnames and parsed.hostname not in set(hostnames):
+            return False
+        if paths and parsed.path not in set(paths):
+            return False
+        return bool(parsed.hostname)
 
     def require_authenticated(self, session: BrowserSession) -> None:
         deadline = time.time() + self.auth_timeout
@@ -1946,6 +2322,22 @@ class ChromeCDPBrowserGateway:
                         "observed_after_action": True,
                     },
                 }
+            if (
+                kind == "draft"
+                and signal
+                and signal.get("kind") == "draft_manual_save_history"
+            ):
+                baseline_id = str(baseline.get("baseline_id") or "").strip()
+                return {
+                    "status": "platform_draft",
+                    "draft_id": f"manual-save:{baseline_id}",
+                    "platform_url": platform_url,
+                    "baseline_id": baseline.get("baseline_id"),
+                    "post_action_signal": {
+                        "kind": signal.get("kind"),
+                        "observed_after_action": True,
+                    },
+                }
             if time.time() >= deadline:
                 break
             time.sleep(0.5)
@@ -2095,6 +2487,7 @@ class ChromeCDPBrowserGateway:
         state_collector = ChromeCDPBrowserGateway._baseline_state_collector_source()
         return f"""
         (() => {{
+          const observationKind = {json.dumps(kind)};
           const selectors = {json.dumps(success_selectors)};
           const attributes = {json.dumps(id_attributes)};
           const queryNames = {json.dumps(query_names)};
@@ -2150,12 +2543,21 @@ class ChromeCDPBrowserGateway:
           const successSelectors = ['.weui-desktop-toast', '.weui-desktop-tips', '[role=alert]', '.js_success', '.publish_success'];
           const successWords = {json.dumps(success_words, ensure_ascii=False)};
           const successMessage = successSelectors.some((selector) => [...document.querySelectorAll(selector)].some((node) => visible(node) && changed(node) && successWords.some((word) => (node.innerText || '').includes(word))));
+          const manualSaveHistory = observationKind === 'draft' && [...document.querySelectorAll('body *')]
+            .some((node) => {{
+              if (!visible(node) || !changed(node)) return false;
+              const text = (node.innerText || node.textContent || '').replace(/\\s+/gu, ' ').trim();
+              return text.includes('手动保存') && /(?:\\d{{2}}-\\d{{2}}\\s+\\d{{2}}:\\d{{2}}|今天|昨天|刚刚)/u.test(text);
+            }});
           const receiptMap = new Map();
           for (const receipt of receipts) {{
             if (!receipt.id) continue;
             const existing = receiptMap.get(receipt.id);
             if (!existing || (!existing.title && receipt.title)) receiptMap.set(receipt.id, receipt);
           }}
+          const signals = [];
+          if (successMessage) signals.push({{kind: {json.dumps(signal_kind)}, observed_after_baseline: true}});
+          if (manualSaveHistory) signals.push({{kind: 'draft_manual_save_history', observed_after_baseline: true}});
           return {{
             url: location.href,
             baseline_id: operation?.id || '',
@@ -2164,7 +2566,7 @@ class ChromeCDPBrowserGateway:
             baseline_complete: stateCollection.baseline_complete,
             baseline_incomplete_reasons: stateCollection.baseline_incomplete_reasons,
             receipts: [...receiptMap.values()],
-            signals: successMessage ? [{{kind: {json.dumps(signal_kind)}, observed_after_baseline: true}}] : []
+            signals
           }};
         }})()
         """
@@ -2195,7 +2597,7 @@ class ChromeCDPBrowserGateway:
     ) -> Mapping[str, Any] | None:
         old_kinds = {str(value) for value in baseline.get("signal_kinds") or []}
         expected_kinds = {
-            "draft": {"draft_saved", "draft_api_response"},
+            "draft": {"draft_saved", "draft_api_response", "draft_manual_save_history"},
             "publish": {"publish_success", "publish_api_response"},
         }.get(action, set())
         for signal in observation.get("signals") or []:
@@ -2563,7 +2965,7 @@ class ChromeCDPBrowserGateway:
                 click_rect = select_result.get("clickableRect")
                 if not isinstance(click_rect, Mapping):
                     raise WeChatPublishingError("正文候选封面图缺少可点击区域")
-                self._dispatch_mouse_click(session, click_rect)
+                self._dispatch_wechat_mouse_click(session, click_rect)
                 select_result = dict(select_result)
                 select_result["clickMethod"] = "cdp_mouse"
                 self._trace("upload.cover_picker.image_click_dispatched", result=select_result)
@@ -2710,7 +3112,7 @@ class ChromeCDPBrowserGateway:
             ):
                 click_rect = entry_result.get("clickableRect") or entry_result.get("rect")
                 if click_rect:
-                    self._dispatch_mouse_click(session, click_rect)
+                    self._dispatch_wechat_mouse_click(session, click_rect)
                     entry_result["clicked"] = True
                     entry_result["clickMethod"] = "cdp_mouse"
                     time.sleep(0.35)
@@ -3684,7 +4086,7 @@ class ChromeCDPBrowserGateway:
         if found:
             click_method = "dom"
             if role == "cover":
-                self._dispatch_mouse_click(session, result.get("rect"))
+                self._dispatch_wechat_mouse_click(session, result.get("rect"))
                 click_method = "cdp_mouse"
             self._trace(
                 "upload.trigger_dispatched",
@@ -3697,7 +4099,7 @@ class ChromeCDPBrowserGateway:
             time.sleep(0.35)
         return found
 
-    def _dispatch_mouse_click(self, session: BrowserSession, rect: Any) -> None:
+    def _dispatch_wechat_mouse_click(self, session: BrowserSession, rect: Any) -> None:
         if not isinstance(rect, Mapping):
             return
         width = float(rect.get("width") or 0)
@@ -3900,7 +4302,7 @@ class ChromeCDPBrowserGateway:
             except Exception:
                 self._refresh_target(session)
             time.sleep(0.25)
-        raise WeChatPublishingError("微信页面加载超时")
+        raise WeChatPublishingError("页面加载超时")
 
     def _current_url(self, session: BrowserSession) -> str:
         value = self.evaluate(session, "location.href")
@@ -3919,7 +4321,7 @@ class ChromeCDPBrowserGateway:
             targets = self._targets(session.port)
             target = next((item for item in targets if item.get("type") == "page" and "mp.weixin.qq.com" in str(item.get("url") or "")), None)
         if not target:
-            raise WeChatPublishingError("微信浏览器页面已关闭")
+            raise WeChatPublishingError("浏览器页面已关闭")
         session.target_id = str(target["id"])
         session.websocket_url = str(target["webSocketDebuggerUrl"])
         session.url = str(target.get("url") or session.url)
@@ -4010,7 +4412,7 @@ class ChromeCDPBrowserGateway:
         except WeChatPublishingError:
             raise
         except (OSError, ValueError, websocket.WebSocketException) as exc:
-            raise WeChatPublishingError(f"微信浏览器 CDP 会话失败：{exc}") from exc
+            raise WeChatPublishingError(f"浏览器 CDP 会话失败：{exc}") from exc
         finally:
             if connection is not None:
                 connection.close()

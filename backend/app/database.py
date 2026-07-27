@@ -96,6 +96,7 @@ class Database:
                   owner TEXT NOT NULL DEFAULT '未分配',
                   tag TEXT NOT NULL DEFAULT '',
                   auth_status TEXT NOT NULL DEFAULT '已授权',
+                  login_status TEXT NOT NULL DEFAULT '在线',
                   monitor_status TEXT NOT NULL DEFAULT '监测中',
                   sync_status TEXT NOT NULL DEFAULT '已同步',
                   sync_error TEXT NOT NULL DEFAULT '',
@@ -117,7 +118,7 @@ class Database:
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
                   account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
-                  platform TEXT NOT NULL CHECK(platform = '微信公众号'),
+                  platform TEXT NOT NULL CHECK(platform IN ('微信公众号', '小红书')),
                   action TEXT NOT NULL CHECK(action IN ('draft', 'publish')),
                   status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
                     'pending', 'checking_login', 'uploading_assets', 'filling_content',
@@ -138,7 +139,10 @@ class Database:
                       status = 'platform_draft'
                       AND (
                         length(trim(platform_draft_id)) > 0
-                        AND platform_url LIKE 'https://mp.weixin.qq.com/%'
+                        AND (
+                          (platform = '微信公众号' AND platform_url LIKE 'https://mp.weixin.qq.com/%')
+                          OR (platform = '小红书' AND platform_url LIKE 'https://creator.xiaohongshu.com/%')
+                        )
                         AND json_valid(response_json)
                         AND json_type(response_json) = 'object'
                         AND json(response_json) <> '{}'
@@ -148,7 +152,10 @@ class Database:
                       status = 'published'
                       AND (
                         length(trim(platform_publish_id)) > 0
-                        AND platform_url LIKE 'https://mp.weixin.qq.com/%'
+                        AND (
+                          (platform = '微信公众号' AND platform_url LIKE 'https://mp.weixin.qq.com/%')
+                          OR (platform = '小红书' AND platform_url LIKE 'https://creator.xiaohongshu.com/publish/success%')
+                        )
                         AND json_valid(response_json)
                         AND json_type(response_json) = 'object'
                         AND json(response_json) <> '{}'
@@ -166,6 +173,23 @@ class Database:
                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                   PRIMARY KEY (project_id, account_id, action)
                 );
+
+                CREATE TABLE IF NOT EXISTS publish_job_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  job_id INTEGER NOT NULL REFERENCES publish_jobs(id) ON DELETE CASCADE,
+                  platform TEXT NOT NULL,
+                  stage TEXT NOT NULL,
+                  level TEXT NOT NULL DEFAULT 'info' CHECK(level IN ('info', 'warning', 'error')),
+                  message TEXT NOT NULL,
+                  payload_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(payload_json)),
+                  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_publish_job_events_job_id
+                  ON publish_job_events(job_id, id);
+
+                CREATE INDEX IF NOT EXISTS idx_publish_job_events_platform_created
+                  ON publish_job_events(platform, created_at);
 
                 CREATE TABLE IF NOT EXISTS account_metric_snapshots (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,6 +292,7 @@ class Database:
                 "ALTER TABLE platform_accounts ADD COLUMN profile_path TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE platform_accounts ADD COLUMN login_url TEXT NOT NULL DEFAULT ''",
                 "ALTER TABLE platform_accounts ADD COLUMN sync_error TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE platform_accounts ADD COLUMN login_status TEXT NOT NULL DEFAULT '在线'",
                 "ALTER TABLE scheduled_tasks ADD COLUMN account_id INTEGER REFERENCES platform_accounts(id) ON DELETE SET NULL",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_action TEXT NOT NULL DEFAULT 'publish'",
                 "ALTER TABLE scheduled_tasks ADD COLUMN publish_result TEXT NOT NULL DEFAULT ''",
@@ -292,6 +317,8 @@ class Database:
             ]:
                 with suppress(sqlite3.OperationalError):
                     conn.execute(column_sql)
+
+            self._migrate_publish_jobs_platform_constraint(conn)
 
             with suppress(sqlite3.OperationalError):
                 conn.execute(
@@ -322,6 +349,11 @@ class Database:
                 """
             )
             for backfill_sql in [
+                """
+                UPDATE platform_accounts
+                SET login_status = '离线'
+                WHERE COALESCE(login_status, '') NOT IN ('在线', '离线')
+                """,
                 """
                 UPDATE task_runs
                 SET generation = (
@@ -439,16 +471,16 @@ class Database:
 
                 CREATE TRIGGER publish_jobs_platform_insert
                 BEFORE INSERT ON publish_jobs
-                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
+                WHEN COALESCE(NEW.platform, '') NOT IN ('微信公众号', '小红书')
                 BEGIN
-                  SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
+                  SELECT RAISE(ABORT, 'publish_jobs platform must be supported');
                 END;
 
                 CREATE TRIGGER publish_jobs_platform_update
                 BEFORE UPDATE OF platform ON publish_jobs
-                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
+                WHEN COALESCE(NEW.platform, '') NOT IN ('微信公众号', '小红书')
                 BEGIN
-                  SELECT RAISE(ABORT, 'publish_jobs platform must be 微信公众号');
+                  SELECT RAISE(ABORT, 'publish_jobs platform must be supported');
                 END;
 
                 CREATE TRIGGER publish_jobs_platform_refs_insert
@@ -456,14 +488,14 @@ class Database:
                 WHEN NOT EXISTS (
                   SELECT 1
                   FROM platform_accounts
-                  WHERE id = NEW.account_id AND platform = '微信公众号'
+                  WHERE id = NEW.account_id AND platform = NEW.platform
                 ) OR NOT EXISTS (
                   SELECT 1
                   FROM content_projects
-                  WHERE id = NEW.project_id AND platform = '微信公众号'
+                  WHERE id = NEW.project_id AND platform = NEW.platform
                 )
                 BEGIN
-                  SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
+                  SELECT RAISE(ABORT, 'publish_jobs account and project platform must match');
                 END;
 
                 CREATE TRIGGER publish_jobs_platform_refs_update
@@ -471,38 +503,36 @@ class Database:
                 WHEN NOT EXISTS (
                   SELECT 1
                   FROM platform_accounts
-                  WHERE id = NEW.account_id AND platform = '微信公众号'
+                  WHERE id = NEW.account_id AND platform = NEW.platform
                 ) OR NOT EXISTS (
                   SELECT 1
                   FROM content_projects
-                  WHERE id = NEW.project_id AND platform = '微信公众号'
+                  WHERE id = NEW.project_id AND platform = NEW.platform
                 )
                 BEGIN
-                  SELECT RAISE(ABORT, 'publish_jobs account and project must use 微信公众号');
+                  SELECT RAISE(ABORT, 'publish_jobs account and project platform must match');
                 END;
 
                 CREATE TRIGGER publish_jobs_account_platform_update
                 BEFORE UPDATE OF platform ON platform_accounts
-                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
-                  AND EXISTS (
+                WHEN EXISTS (
                     SELECT 1
                     FROM publish_jobs
-                    WHERE account_id = NEW.id
+                    WHERE account_id = NEW.id AND platform <> NEW.platform
                   )
                 BEGIN
-                  SELECT RAISE(ABORT, 'referenced platform account must remain 微信公众号');
+                  SELECT RAISE(ABORT, 'referenced platform account must keep publish job platform');
                 END;
 
                 CREATE TRIGGER publish_jobs_project_platform_update
                 BEFORE UPDATE OF platform ON content_projects
-                WHEN COALESCE(NEW.platform, '') <> '微信公众号'
-                  AND EXISTS (
+                WHEN EXISTS (
                     SELECT 1
                     FROM publish_jobs
-                    WHERE project_id = NEW.id
+                    WHERE project_id = NEW.id AND platform <> NEW.platform
                   )
                 BEGIN
-                  SELECT RAISE(ABORT, 'referenced content project must remain 微信公众号');
+                  SELECT RAISE(ABORT, 'referenced content project must keep publish job platform');
                 END;
 
                 CREATE TRIGGER publish_jobs_account_insert
@@ -532,14 +562,20 @@ class Database:
                 WHEN (
                   (NEW.status = 'platform_draft' AND NOT (
                     length(trim(COALESCE(NEW.platform_draft_id, ''))) > 0
-                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND (
+                      (NEW.platform = '微信公众号' AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%')
+                      OR (NEW.platform = '小红书' AND COALESCE(NEW.platform_url, '') LIKE 'https://creator.xiaohongshu.com/%')
+                    )
                     AND json_valid(COALESCE(NEW.response_json, '{}'))
                     AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
                     AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
                   ))
                   OR (NEW.status = 'published' AND NOT (
                     length(trim(COALESCE(NEW.platform_publish_id, ''))) > 0
-                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND (
+                      (NEW.platform = '微信公众号' AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%')
+                      OR (NEW.platform = '小红书' AND COALESCE(NEW.platform_url, '') LIKE 'https://creator.xiaohongshu.com/publish/success%')
+                    )
                     AND json_valid(COALESCE(NEW.response_json, '{}'))
                     AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
                     AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
@@ -555,14 +591,20 @@ class Database:
                 WHEN (
                   (NEW.status = 'platform_draft' AND NOT (
                     length(trim(COALESCE(NEW.platform_draft_id, ''))) > 0
-                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND (
+                      (NEW.platform = '微信公众号' AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%')
+                      OR (NEW.platform = '小红书' AND COALESCE(NEW.platform_url, '') LIKE 'https://creator.xiaohongshu.com/%')
+                    )
                     AND json_valid(COALESCE(NEW.response_json, '{}'))
                     AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
                     AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
                   ))
                   OR (NEW.status = 'published' AND NOT (
                     length(trim(COALESCE(NEW.platform_publish_id, ''))) > 0
-                    AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%'
+                    AND (
+                      (NEW.platform = '微信公众号' AND COALESCE(NEW.platform_url, '') LIKE 'https://mp.weixin.qq.com/%')
+                      OR (NEW.platform = '小红书' AND COALESCE(NEW.platform_url, '') LIKE 'https://creator.xiaohongshu.com/publish/success%')
+                    )
                     AND json_valid(COALESCE(NEW.response_json, '{}'))
                     AND json_type(COALESCE(NEW.response_json, '{}')) = 'object'
                     AND json(COALESCE(NEW.response_json, '{}')) <> '{}'
@@ -588,6 +630,94 @@ class Database:
                 END;
                 """
             )
+
+    def _migrate_publish_jobs_platform_constraint(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'publish_jobs'"
+        ).fetchone()
+        table_sql = str(row["sql"] if row else "")
+        if "CHECK(platform = '微信公众号')" not in table_sql:
+            return
+        conn.executescript(
+            """
+            DROP TRIGGER IF EXISTS publish_jobs_platform_insert;
+            DROP TRIGGER IF EXISTS publish_jobs_platform_update;
+            DROP TRIGGER IF EXISTS publish_jobs_platform_refs_insert;
+            DROP TRIGGER IF EXISTS publish_jobs_platform_refs_update;
+            DROP TRIGGER IF EXISTS publish_jobs_account_platform_update;
+            DROP TRIGGER IF EXISTS publish_jobs_project_platform_update;
+            DROP TRIGGER IF EXISTS publish_jobs_account_insert;
+            DROP TRIGGER IF EXISTS publish_jobs_account_update;
+            DROP TRIGGER IF EXISTS publish_jobs_result_insert;
+            DROP TRIGGER IF EXISTS publish_jobs_result_update;
+            PRAGMA foreign_keys = OFF;
+            PRAGMA legacy_alter_table = ON;
+            ALTER TABLE publish_jobs RENAME TO publish_jobs_legacy_platform_check;
+            PRAGMA legacy_alter_table = OFF;
+            CREATE TABLE publish_jobs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
+              account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+              platform TEXT NOT NULL CHECK(platform IN ('微信公众号', '小红书')),
+              action TEXT NOT NULL CHECK(action IN ('draft', 'publish')),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+                'pending', 'checking_login', 'uploading_assets', 'filling_content',
+                'platform_draft', 'publishing', 'awaiting_confirmation', 'published', 'failed'
+              )),
+              platform_draft_id TEXT NOT NULL DEFAULT '',
+              platform_publish_id TEXT NOT NULL DEFAULT '',
+              platform_url TEXT NOT NULL DEFAULT '',
+              response_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(response_json)),
+              requires_confirmation INTEGER NOT NULL DEFAULT 0 CHECK(requires_confirmation IN (0, 1)),
+              failure_stage TEXT NOT NULL DEFAULT '',
+              failure_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              CHECK(
+                status NOT IN ('platform_draft', 'published')
+                OR (
+                  status = 'platform_draft'
+                  AND (
+                    length(trim(platform_draft_id)) > 0
+                    AND (
+                      (platform = '微信公众号' AND platform_url LIKE 'https://mp.weixin.qq.com/%')
+                      OR (platform = '小红书' AND platform_url LIKE 'https://creator.xiaohongshu.com/%')
+                    )
+                    AND json_valid(response_json)
+                    AND json_type(response_json) = 'object'
+                    AND json(response_json) <> '{}'
+                  )
+                )
+                OR (
+                  status = 'published'
+                  AND (
+                    length(trim(platform_publish_id)) > 0
+                    AND (
+                      (platform = '微信公众号' AND platform_url LIKE 'https://mp.weixin.qq.com/%')
+                      OR (platform = '小红书' AND platform_url LIKE 'https://creator.xiaohongshu.com/publish/success%')
+                    )
+                    AND json_valid(response_json)
+                    AND json_type(response_json) = 'object'
+                    AND json(response_json) <> '{}'
+                  )
+                )
+              ),
+              CHECK(status <> 'awaiting_confirmation' OR requires_confirmation = 1)
+            );
+            INSERT INTO publish_jobs (
+              id, project_id, account_id, platform, action, status,
+              platform_draft_id, platform_publish_id, platform_url, response_json,
+              requires_confirmation, failure_stage, failure_reason, created_at, updated_at
+            )
+            SELECT
+              id, project_id, account_id, platform, action, status,
+              platform_draft_id, platform_publish_id, platform_url, response_json,
+              requires_confirmation, failure_stage, failure_reason, created_at, updated_at
+            FROM publish_jobs_legacy_platform_check;
+            DROP TABLE publish_jobs_legacy_platform_check;
+            PRAGMA foreign_keys = ON;
+            """
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

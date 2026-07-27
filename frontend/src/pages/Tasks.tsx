@@ -3,14 +3,15 @@ import dayjs from 'dayjs';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Detail, Platform, Status } from '@/components/Common';
 import { api } from '@/services/api';
-import type { PlatformAccount, PublishJobStatus, ScheduledTask } from '@/types';
+import type { PlatformAccount, PublishJobEvent, PublishJobStatus, PublishMonitoringSummary, ScheduledTask } from '@/types';
 import { buildTaskPayload } from '@/utils/taskPayload';
 
 const wechatTaskType = '微信公众号图文生成';
+const xiaohongshuTaskType = '小红书图文生成';
 
 const taskTypeOptions = [
   { value: wechatTaskType, label: wechatTaskType },
-  { value: '小红书图文生成', label: '小红书图文生成（V1 未开放，预留）', disabled: true },
+  { value: xiaohongshuTaskType, label: xiaohongshuTaskType },
   { value: '视频号内容发布', label: '视频号内容发布（V1 未开放，预留）', disabled: true },
   { value: '抖音内容发布', label: '抖音内容发布（V1 未开放，预留）', disabled: true },
 ];
@@ -33,8 +34,34 @@ function publishActionLabel(action?: string) {
   return action === 'draft' ? '同步到平台草稿箱' : '一键发布';
 }
 
+function formatRate(value?: number) {
+  return `${(((value || 0) * 100)).toFixed(2)}%`;
+}
+
+function formatDuration(value?: number) {
+  if (!value) return '0s';
+  if (value < 60) return `${value.toFixed(1)}s`;
+  return `${(value / 60).toFixed(1)}min`;
+}
+
+function eventStatusLabel(event: PublishJobEvent) {
+  return publishJobStatusLabels[event.stage as PublishJobStatus] || event.stage;
+}
+
 function isWechatV1Task(task: ScheduledTask) {
   return task.platform === '微信公众号' && task.task_type === wechatTaskType;
+}
+
+function isXiaohongshuV1Task(task: ScheduledTask) {
+  return task.platform === '小红书' && task.task_type === xiaohongshuTaskType;
+}
+
+function isSupportedV1Task(task: ScheduledTask) {
+  return isWechatV1Task(task) || isXiaohongshuV1Task(task);
+}
+
+function taskTypeForPlatform(platform: string) {
+  return platform === '小红书' ? xiaohongshuTaskType : wechatTaskType;
 }
 
 function taskInitialValues(task?: ScheduledTask | null) {
@@ -78,11 +105,12 @@ export default function Tasks() {
   const [accountsLoading, setAccountsLoading] = useState(false);
   const [retryingJobId, setRetryingJobId] = useState<number | null>(null);
   const [syncingDraftTaskId, setSyncingDraftTaskId] = useState<number | null>(null);
+  const [xhsMonitoring, setXhsMonitoring] = useState<PublishMonitoringSummary | null>(null);
   const taskFiltersRef = useRef({ status, platform, search });
   const taskLoadGenerationRef = useRef(0);
   const tasksMountedRef = useRef(true);
   taskFiltersRef.current = { status, platform, search };
-  const editingUnsupportedTask = Boolean(editingTask && !isWechatV1Task(editingTask));
+  const editingUnsupportedTask = Boolean(editingTask && !isSupportedV1Task(editingTask));
 
   async function loadTasks(silent = false) {
     const generation = taskLoadGenerationRef.current + 1;
@@ -113,9 +141,13 @@ export default function Tasks() {
   async function loadAccounts() {
     setAccountsLoading(true);
     try {
-      const params = new URLSearchParams({ auth_status: '已授权', platform: '微信公众号' });
+      const params = new URLSearchParams({ auth_status: '已授权' });
       const data = await api.accounts(params);
-      const authorizedAccounts = (data.accounts || []).filter((account) => account.platform === '微信公众号' && account.auth_status === '已授权');
+      const authorizedAccounts = (data.accounts || []).filter((account) => (
+        ['微信公众号', '小红书'].includes(account.platform)
+        && account.auth_status === '已授权'
+        && (account.login_status || '在线') === '在线'
+      ));
       setAccounts(authorizedAccounts);
       return authorizedAccounts;
     } catch (error) {
@@ -123,6 +155,16 @@ export default function Tasks() {
       return [];
     } finally {
       setAccountsLoading(false);
+    }
+  }
+
+  async function loadXiaohongshuMonitoring(silent = false) {
+    try {
+      const data = await api.publishMonitoring('小红书');
+      if (!tasksMountedRef.current) return;
+      setXhsMonitoring(data);
+    } catch (error) {
+      if (!silent) message.error(error instanceof Error ? error.message : '读取小红书发布监控失败');
     }
   }
 
@@ -137,7 +179,11 @@ export default function Tasks() {
 
   useEffect(() => {
     loadTasks();
-    const timer = window.setInterval(() => loadTasks(true), 10_000);
+    loadXiaohongshuMonitoring(true);
+    const timer = window.setInterval(() => {
+      loadTasks(true);
+      loadXiaohongshuMonitoring(true);
+    }, 10_000);
     return () => window.clearInterval(timer);
   }, [status, platform]);
 
@@ -150,17 +196,22 @@ export default function Tasks() {
   }
 
   async function submitTask(values: any) {
-    if (editingTask && !isWechatV1Task(editingTask)) {
+    if (editingTask && !isSupportedV1Task(editingTask)) {
       message.warning('V1 未开放当前任务类型，不能编辑提交');
-      return;
-    }
-    if (values.task_type !== wechatTaskType) {
-      message.warning('V1 仅支持微信公众号图文生成任务');
       return;
     }
     const account = accounts.find((item) => item.id === values.account_id);
     if (!account) {
-      message.warning('请先选择已授权账号');
+      message.warning('请先选择已授权且在线的账号');
+      return;
+    }
+    if ((account.login_status || '在线') !== '在线') {
+      message.warning('账号离线，请先在账号矩阵重新扫码登录');
+      return;
+    }
+    const expectedTaskType = taskTypeForPlatform(account.platform);
+    if (values.task_type !== expectedTaskType) {
+      message.warning(`${account.platform}账号只能创建${expectedTaskType}任务`);
       return;
     }
     const executionMode = values.execution_mode as 'once' | 'repeat';
@@ -266,9 +317,12 @@ export default function Tasks() {
 
   const executionMode = Form.useWatch('execution_mode', form) || 'once';
   const repeatRule = Form.useWatch('repeat_rule', form) || 'daily';
+  const selectedAccountId = Form.useWatch('account_id', form);
+  const selectedTaskType = Form.useWatch('task_type', form) || wechatTaskType;
+  const selectedAccount = accounts.find((item) => item.id === selectedAccountId);
   const accountOptions = accounts.map((item) => ({
     value: item.id,
-    label: `${item.name} / ${item.platform}`,
+    label: `${item.name} / ${item.platform} / ${item.login_status || '在线'}`,
   }));
 
   const rowSelection = useMemo(() => retryMode ? {
@@ -283,10 +337,29 @@ export default function Tasks() {
     const rightValue = Number.isFinite(rightTime) ? rightTime : -Infinity;
     return rightValue - leftValue || right.id - left.id;
   }), [tasks]);
+  const latestXhsFailure = xhsMonitoring?.recent_failures?.[0];
 
   return (
     <>
       <div className="panel task-list-panel">
+        <div className="publish-monitor">
+          <div className="panel-header">
+            <h3>小红书发布监控</h3>
+            <span className="muted">平均耗时 {formatDuration(xhsMonitoring?.avg_duration_seconds)}</span>
+          </div>
+          <div className="publish-monitor-metrics">
+            <span>总任务 {xhsMonitoring?.total_jobs ?? 0}</span>
+            <span>已发布 {xhsMonitoring?.published_jobs ?? 0}</span>
+            <span>失败 {xhsMonitoring?.failed_jobs ?? 0}</span>
+            <span>进行中 {xhsMonitoring?.in_progress_jobs ?? 0}</span>
+            <span>成功率 {formatRate(xhsMonitoring?.success_rate)}</span>
+          </div>
+          <div className="muted">
+            {latestXhsFailure
+              ? `最近失败：${latestXhsFailure.failure_stage || '-'} / ${latestXhsFailure.failure_reason || '-'}`
+              : '最近失败：无'}
+          </div>
+        </div>
         {loadError && <Alert className="block-gap" type="warning" showIcon message={loadError} />}
         <div className="toolbar">
           <Space wrap>
@@ -371,12 +444,24 @@ export default function Tasks() {
       </div>
       <Modal centered width={640} title={editingTask ? '编辑任务' : '新增任务'} open={drawerOpen} onCancel={() => setDrawerOpen(false)} footer={null}>
         <Form form={form} layout="vertical" onFinish={submitTask}>
-          {!accounts.length && <Alert className="block-gap" showIcon type="warning" message="请先在账号矩阵添加并授权账号，再创建定时任务。" />}
+          {!accounts.length && <Alert className="block-gap" showIcon type="warning" message="请先在账号矩阵添加并授权在线账号，再创建定时任务。" />}
           {editingUnsupportedTask && (
-            <Alert className="block-gap" showIcon type="warning" message="V1 仅开放已授权微信公众号账号发布，当前旧任务只能查看或删除，不能编辑提交。" />
+            <Alert className="block-gap" showIcon type="warning" message="V1 仅开放微信公众号和小红书图文任务，当前旧任务只能查看或删除，不能编辑提交。" />
           )}
-          <Form.Item label="配置账号" name="account_id" rules={[{ required: true, message: '请选择已授权账号' }]}>
-            <Select loading={accountsLoading} showSearch optionFilterProp="label" options={accountOptions} placeholder="请选择已授权账号" />
+          <Form.Item label="配置账号" name="account_id" rules={[{ required: true, message: '请选择已授权且在线的账号' }]}>
+            <Select
+              loading={accountsLoading}
+              showSearch
+              optionFilterProp="label"
+              options={accountOptions}
+              placeholder="请选择已授权且在线的账号"
+              onChange={(accountId) => {
+                const account = accounts.find((item) => item.id === accountId);
+                if (account) {
+                  form.setFieldValue('task_type', taskTypeForPlatform(account.platform));
+                }
+              }}
+            />
           </Form.Item>
           <Form.Item label="配置主题" name="topic" rules={[{ required: true, message: '请输入任务主题' }]}>
             <Input placeholder="请输入任务主题" />
@@ -389,10 +474,12 @@ export default function Tasks() {
             <Select options={taskTypeOptions} />
           </Form.Item>
           <Form.Item label="发布方式" name="publish_action" rules={[{ required: true, message: '请选择发布方式' }]}>
-            <Select options={[
-              { value: 'publish', label: '一键发布' },
-              { value: 'draft', label: '同步到平台草稿箱' },
-            ]} />
+            <Select
+              options={[
+                { value: 'draft', label: '同步到平台草稿箱' },
+                { value: 'publish', label: '一键发布' },
+              ]}
+            />
           </Form.Item>
           <Form.Item label="执行方式" name="execution_mode" rules={[{ required: true }]}>
             <Select options={[
@@ -461,6 +548,24 @@ export default function Tasks() {
                 label="同步草稿"
                 value={<Button type="primary" loading={syncingDraftTaskId === detailTask.id} onClick={() => syncTaskDraft(detailTask)}>同步到平台草稿箱</Button>}
               />
+            )}
+            {detailTask.publish_job && (
+              <div className="publish-event-section">
+                <h3>发布日志</h3>
+                {(detailTask.publish_job.events || []).length ? (
+                  <div className="publish-event-list">
+                    {(detailTask.publish_job.events || []).map((event) => (
+                      <div className={`publish-event publish-event-${event.level}`} key={event.id}>
+                        <span>{event.created_at}</span>
+                        <strong>{eventStatusLabel(event)}</strong>
+                        <p>{event.message}</p>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="muted">暂无发布日志</span>
+                )}
+              </div>
             )}
           </div>
         )}

@@ -6,17 +6,23 @@ import type { AccountAuthSession, PlatformAccount } from '@/types';
 
 const platformOptions = ['微信公众号', '视频号', '小红书', '抖音'];
 
+function loginStatusText(account: PlatformAccount) {
+  return account.login_status === '在线' ? '在线' : '离线';
+}
+
 export default function Accounts() {
   const [editForm] = Form.useForm();
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [active, setActive] = useState<PlatformAccount | null>(null);
   const [editing, setEditing] = useState<PlatformAccount | null>(null);
   const [authSession, setAuthSession] = useState<AccountAuthSession | null>(null);
+  const [authTarget, setAuthTarget] = useState<PlatformAccount | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [authOpen, setAuthOpen] = useState(false);
   const [platform, setPlatform] = useState('');
   const [authStatus, setAuthStatus] = useState('');
+  const [loginStatus, setLoginStatus] = useState('');
   const [search, setSearch] = useState('');
   const authGenerationRef = useRef(0);
   const authSessionIdRef = useRef<string | null>(null);
@@ -27,6 +33,7 @@ export default function Accounts() {
       const params = new URLSearchParams();
       if (platform) params.set('platform', platform);
       if (authStatus) params.set('auth_status', authStatus);
+      if (loginStatus) params.set('login_status', loginStatus);
       if (search) params.set('q', search);
       const data = await api.accounts(params);
       setAccounts(data.accounts || []);
@@ -39,15 +46,21 @@ export default function Accounts() {
 
   useEffect(() => {
     loadAccounts();
-  }, [platform, authStatus]);
+  }, [platform, authStatus, loginStatus]);
 
-  async function startPlatformLogin(selectedPlatform: string) {
+  async function startPlatformLogin(selectedPlatform: string, target?: PlatformAccount) {
     const generation = authGenerationRef.current + 1;
     authGenerationRef.current = generation;
     authSessionIdRef.current = null;
+    setAuthTarget(target || null);
+    setAuthSession(null);
     setAuthLoading(true);
     try {
-      const data = await api.startAccountAuth({ platform: selectedPlatform });
+      const data = await api.startAccountAuth({
+        platform: selectedPlatform,
+        account_name: target?.name,
+        account_id: target?.id,
+      });
       if (authGenerationRef.current !== generation) return;
       authSessionIdRef.current = data.session_id;
       setAuthSession(data);
@@ -77,8 +90,11 @@ export default function Accounts() {
         setAuthSession(data);
         if (data.status === 'success') {
           window.clearInterval(timer);
+          setAuthOpen(false);
+          setAuthSession(null);
+          setAuthTarget(null);
           await loadAccounts();
-          if (ownsSession()) message.success('真实登录成功，账号已加入工作台');
+          if (ownsSession()) message.success('真实登录成功，账号状态已更新');
         }
         if (data.status === 'failed' || data.status === 'cancelled') {
           window.clearInterval(timer);
@@ -107,6 +123,7 @@ export default function Accounts() {
     authSessionIdRef.current = null;
     setAuthOpen(false);
     setAuthSession(null);
+    setAuthTarget(null);
     setAuthLoading(false);
     if (session?.status === 'waiting') {
       try {
@@ -121,6 +138,7 @@ export default function Accounts() {
     authGenerationRef.current += 1;
     authSessionIdRef.current = null;
     setAuthSession(null);
+    setAuthTarget(null);
     setAuthLoading(false);
     setAuthOpen(true);
   }
@@ -129,14 +147,24 @@ export default function Accounts() {
     authGenerationRef.current += 1;
     authSessionIdRef.current = null;
     setAuthSession(null);
+    setAuthTarget(null);
     setAuthLoading(false);
+  }
+
+  function openAccount(account: PlatformAccount) {
+    if (loginStatusText(account) === '离线') {
+      setAuthOpen(true);
+      void startPlatformLogin(account.platform, account);
+      return;
+    }
+    setActive(account);
   }
 
   async function syncAccount(account: PlatformAccount) {
     try {
       await api.syncAccount(account.id);
       await loadAccounts();
-      message.success('账号数据已同步');
+      message.success('账号数据已同步到数据分析');
     } catch (error) {
       message.error(error instanceof Error ? error.message : '同步失败');
     }
@@ -178,13 +206,15 @@ export default function Accounts() {
 
   const metrics = useMemo(() => {
     const authorized = accounts.filter((item) => item.auth_status === '已授权').length;
+    const online = accounts.filter((item) => loginStatusText(item) === '在线').length;
+    const offline = accounts.filter((item) => loginStatusText(item) === '离线').length;
     const monitoring = accounts.filter((item) => item.monitor_status === '监测中').length;
-    const expired = accounts.filter((item) => item.auth_status === '授权失效').length;
     return [
       { label: '已添加', value: String(accounts.length), note: '覆盖公众号、视频号、小红书、抖音' },
       { label: '已授权', value: String(authorized), note: '可用于定时任务发布' },
+      { label: '在线账号', value: String(online), note: '可直接执行发布和同步' },
+      { label: '离线账号', value: String(offline), note: '点击账号可重新扫码' },
       { label: '监测中', value: String(monitoring), note: '每天自动同步，也可手动同步' },
-      { label: '授权失效', value: String(expired), note: '需重新扫码授权' },
     ];
   }, [accounts]);
 
@@ -213,6 +243,12 @@ export default function Accounts() {
               onChange={setAuthStatus}
               options={['', '已授权', '授权失效', '未授权'].map((value) => ({ value, label: value || '全部授权状态' }))}
             />
+            <Select
+              value={loginStatus}
+              style={{ width: 160 }}
+              onChange={setLoginStatus}
+              options={['', '在线', '离线'].map((value) => ({ value, label: value || '全部登录状态' }))}
+            />
           </Space>
           <Space>
             <Button onClick={loadAccounts}>授权检测</Button>
@@ -226,11 +262,21 @@ export default function Accounts() {
           pagination={false}
           dataSource={accounts}
           columns={[
-            { title: '账号', render: (_, row) => <><strong>{row.name}</strong><br /><span className="muted">{row.role}</span></> },
+            {
+              title: '账号',
+              render: (_, row) => (
+                <>
+                  <Button type="link" className="inline-link" onClick={() => openAccount(row)}>{row.name}</Button>
+                  <br />
+                  <span className="muted">{row.role}</span>
+                </>
+              ),
+            },
             { title: '平台', render: (_, row) => <Platform value={row.platform} /> },
             { title: '标签', render: (_, row) => <SmallTag value={row.tag || '未设置'} /> },
             { title: '运营人', render: (_, row) => row.owner || '未分配' },
             { title: '授权状态', render: (_, row) => <Status value={row.auth_status} /> },
+            { title: '登录状态', render: (_, row) => <Status value={loginStatusText(row)} /> },
             { title: '监测状态', render: (_, row) => <Status value={row.monitor_status} /> },
             { title: '最近同步', render: (_, row) => row.last_sync_at || '-' },
             {
@@ -250,8 +296,17 @@ export default function Accounts() {
         />
       </Card>
 
-      <Modal centered title="添加账号" open={authOpen} onCancel={closeAuthModal} footer={null} width={680}>
-        {!authSession ? (
+      <Modal centered title={authTarget ? `重新登录：${authTarget.name}` : '添加账号'} open={authOpen} onCancel={closeAuthModal} footer={null} width={680} destroyOnHidden>
+        {!authSession && authTarget ? (
+          <Spin spinning={authLoading}>
+            <Alert
+              showIcon
+              type="info"
+              message={`正在打开${authTarget.platform}扫码登录窗口`}
+              description="完成扫码后，工作台会把该账号状态更新为在线，并自动关闭登录弹窗。"
+            />
+          </Spin>
+        ) : !authSession ? (
           <>
             <p className="muted">选择平台后将自动打开独立的真实 Chrome 登录窗口，请使用对应平台 App 扫码。</p>
             <div className="platform-login-grid">
@@ -277,7 +332,9 @@ export default function Accounts() {
               {authSession.status === 'success' && <Button type="primary" onClick={closeAuthModal}>完成</Button>}
               {authSession.status !== 'success' && <Button onClick={closeAuthModal}>取消</Button>}
               {(authSession.status === 'failed' || authSession.status === 'cancelled') && (
-                <Button type="primary" onClick={resetAuthPlatform}>重新选择平台</Button>
+                authTarget
+                  ? <Button type="primary" onClick={() => startPlatformLogin(authTarget.platform, authTarget)}>重新扫码</Button>
+                  : <Button type="primary" onClick={resetAuthPlatform}>重新选择平台</Button>
               )}
             </Space>
           </Spin>
@@ -317,8 +374,10 @@ export default function Accounts() {
             <Detail label="运营人" value={active.owner} />
             <Detail label="账号标签" value={active.tag} />
             <Detail label="授权状态" value={active.auth_status} />
+            <Detail label="登录状态" value={loginStatusText(active)} />
             <Detail label="监测状态" value={active.monitor_status} />
             <Detail label="同步状态" value={active.sync_status} />
+            <Detail label="同步错误" value={active.sync_error || '-'} />
             <Detail label="最近同步" value={active.last_sync_at || '-'} />
             <Detail label="角色定位" value={active.role} />
             <Detail label="面向用户" value={active.audience} />

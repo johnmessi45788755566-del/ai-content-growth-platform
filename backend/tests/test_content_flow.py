@@ -61,6 +61,35 @@ class FakePlatformPublisher:
         return None
 
 
+class FakeMultiPlatformPublisher(FakePlatformPublisher):
+    def publish(self, payload, account, action):
+        if account["platform"] == "小红书":
+            if action == "draft":
+                return PublishResult(
+                    status="platform_draft",
+                    platform_draft_id="xhs-draft-id",
+                    platform_url="https://creator.xiaohongshu.com/new/home",
+                    response={
+                        "source": "xiaohongshu_platform",
+                        "event": "draft_created",
+                        "receipt_id": "xhs-draft-id",
+                        "corroboration": "draft_saved",
+                    },
+                )
+            return PublishResult(
+                status="published",
+                platform_publish_id="xhs-publish-id",
+                platform_url="https://creator.xiaohongshu.com/publish/success?note=1",
+                response={
+                    "source": "xiaohongshu_platform",
+                    "event": "note_published",
+                    "receipt_id": "xhs-publish-id",
+                    "corroboration": "publish_success_url",
+                },
+            )
+        return super().publish(payload, account, action)
+
+
 def make_service(tmp_path: Path) -> ContentService:
     db = Database(tmp_path / "content.db")
     db.init_schema()
@@ -123,6 +152,228 @@ def test_content_creation_flow_persists_article_images_draft_and_publish_package
     assert package["status"] == "platform_draft"
     assert package["platform_draft_id"] == "draft-media-id"
     assert package["platform"] == "微信公众号"
+
+
+def test_xiaohongshu_publish_job_uses_note_payload_and_success_receipt(tmp_path):
+    db = Database(tmp_path / "xhs.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakeMultiPlatformPublisher(),
+    )
+    project = service.create_project("小红书标题超过二十字会被截断用于发布", platform="小红书")
+    article = service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    inline = next(asset for asset in images if asset["asset_type"] == "inline")
+    service.save_layout(
+        project["id"],
+        [
+            {"section_type": "title", "content": project["title"], "media_asset_id": cover["id"], "sort_order": 1},
+            {"section_type": "body", "content": f"{article['blocks'][0]['content']} #AI记账", "media_asset_id": inline["id"], "sort_order": 2},
+        ],
+    )
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('小红书', '小红书账号', '已授权')"
+    )
+
+    job = service.create_publish_job(project["id"], account_id, "publish")
+
+    assert job["platform"] == "小红书"
+    assert job["status"] == "published"
+    assert job["platform_publish_id"] == "xhs-publish-id"
+    assert job["platform_url"].startswith("https://creator.xiaohongshu.com/publish/success")
+    work = service.db.fetch_one("SELECT platform, content_type, status FROM platform_works WHERE account_id = ?", (account_id,))
+    assert work == {"platform": "小红书", "content_type": "笔记", "status": "已发布"}
+
+
+def test_xiaohongshu_login_failure_marks_account_offline(tmp_path):
+    class LoginExpiredPublisher:
+        def publish(self, payload, account, action):
+            raise RuntimeError("小红书登录态失效，请重新扫码登录")
+
+        def resume(self, account, job_context):
+            raise AssertionError("小红书不支持人工恢复")
+
+        def cancel(self, account, job_context):
+            return None
+
+    db = Database(tmp_path / "xhs-login-expired.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=LoginExpiredPublisher(),
+    )
+    project = service.create_project("小红书登录态失效", platform="小红书")
+    service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    cover = next(asset for asset in images if asset["asset_type"] == "cover")
+    service.save_layout(
+        project["id"],
+        [
+            {"section_type": "title", "content": project["title"], "media_asset_id": cover["id"], "sort_order": 1},
+            {"section_type": "body", "content": "小红书正文", "media_asset_id": None, "sort_order": 2},
+        ],
+    )
+    account_id = service.db.execute(
+        """
+        INSERT INTO platform_accounts (platform, name, auth_status, login_status)
+        VALUES ('小红书', '找房子的派大星', '已授权', '在线')
+        """
+    )
+
+    job = service.create_publish_job(project["id"], account_id, "publish")
+    account = service.get_public_account(account_id)
+
+    assert job["status"] == "failed"
+    assert account["login_status"] == "离线"
+    assert account["sync_status"] == "同步失败"
+    assert account["sync_error"] == "小红书登录态失效，请重新扫码登录"
+
+
+def test_xiaohongshu_publish_payload_skips_svg_fallback_and_uses_existing_jpg(tmp_path):
+    db = Database(tmp_path / "xhs-image-format.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakeMultiPlatformPublisher(),
+    )
+    project = service.create_project("小红书图片格式", platform="小红书")
+    service.generate_article(project["id"])
+    jpg_path = service.upload_dir / "existing-cover.jpg"
+    jpg_path.write_bytes(b"fake jpg")
+    svg_cover_path = service.upload_dir / "cover-task-fallback.svg"
+    svg_cover_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>")
+    svg_inline_path = service.upload_dir / "inline-task-fallback.svg"
+    svg_inline_path.write_text("<svg xmlns='http://www.w3.org/2000/svg'></svg>")
+    service.db.execute(
+        """
+        INSERT INTO media_assets (project_id, asset_type, url, local_path, prompt, selected)
+        VALUES (?, 'cover', '/uploads/existing-cover.jpg', 'uploads/existing-cover.jpg', '已有 JPG', 0)
+        """,
+        (project["id"],),
+    )
+    svg_cover_id = service.db.execute(
+        """
+        INSERT INTO media_assets (project_id, asset_type, url, local_path, prompt, selected)
+        VALUES (?, 'cover', '/uploads/cover-task-fallback.svg', 'uploads/cover-task-fallback.svg', 'fallback', 1)
+        """,
+        (project["id"],),
+    )
+    svg_inline_id = service.db.execute(
+        """
+        INSERT INTO media_assets (project_id, asset_type, url, local_path, prompt, selected)
+        VALUES (?, 'inline', '/uploads/inline-task-fallback.svg', 'uploads/inline-task-fallback.svg', 'fallback', 1)
+        """,
+        (project["id"],),
+    )
+    service.save_layout(
+        project["id"],
+        [
+            {"section_type": "title", "content": project["title"], "media_asset_id": svg_cover_id, "sort_order": 1},
+            {"section_type": "body", "content": "小红书正文", "media_asset_id": svg_inline_id, "sort_order": 2},
+        ],
+    )
+
+    payload = service._build_xiaohongshu_publish_payload(
+        service.get_project(project["id"]),
+        "小红书账号",
+    )
+
+    assert payload["image_paths"] == [str(service.upload_dir / "existing-cover.jpg")]
+    assert str(service.upload_dir / "cover-task-fallback.svg") not in payload["image_paths"]
+    assert str(service.upload_dir / "inline-task-fallback.svg") not in payload["image_paths"]
+
+
+def test_xiaohongshu_publish_job_records_event_log_and_monitoring_summary(tmp_path):
+    class ProgressPublisher(FakeMultiPlatformPublisher):
+        def publish_with_progress(self, payload, account, action, report_progress):
+            report_progress("uploading_assets")
+            report_progress("filling_content")
+            report_progress("publishing")
+            return self.publish(payload, account, action)
+
+    db = Database(tmp_path / "xhs-events.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=ProgressPublisher(),
+    )
+    project = service.create_project("小红书日志监控", platform="小红书")
+    service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    service.save_layout(
+        project["id"],
+        [
+            {"section_type": "title", "content": project["title"], "media_asset_id": images[0]["id"], "sort_order": 1},
+            {"section_type": "body", "content": "小红书正文", "media_asset_id": images[1]["id"], "sort_order": 2},
+        ],
+    )
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('小红书', '小红书账号', '已授权')"
+    )
+
+    job = service.create_publish_job(project["id"], account_id, "publish")
+
+    assert job["status"] == "published"
+    assert [event["stage"] for event in job["events"]] == [
+        "checking_login",
+        "uploading_assets",
+        "filling_content",
+        "publishing",
+        "published",
+    ]
+    assert job["events"][-1]["level"] == "info"
+    assert job["events"][-1]["message"] == "小红书发布成功"
+
+    monitoring = service.get_publish_monitoring("小红书")
+    assert monitoring["platform"] == "小红书"
+    assert monitoring["total_jobs"] == 1
+    assert monitoring["published_jobs"] == 1
+    assert monitoring["failed_jobs"] == 0
+    assert monitoring["in_progress_jobs"] == 0
+    assert monitoring["success_rate"] == 1
+    assert monitoring["recent_failures"] == []
+
+
+def test_xiaohongshu_draft_action_creates_platform_draft(tmp_path):
+    db = Database(tmp_path / "xhs-draft.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakeMultiPlatformPublisher(),
+    )
+    project = service.create_project("小红书草稿", platform="小红书")
+    service.generate_article(project["id"])
+    images = service.generate_images(project["id"])["assets"]
+    service.save_layout(
+        project["id"],
+        [
+            {"section_type": "title", "content": project["title"], "media_asset_id": images[0]["id"], "sort_order": 1},
+            {"section_type": "body", "content": "小红书正文", "media_asset_id": images[1]["id"], "sort_order": 2},
+        ],
+    )
+    account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name, auth_status) VALUES ('小红书', '小红书账号', '已授权')"
+    )
+
+    job = service.create_publish_job(project["id"], account_id, "draft")
+
+    assert job["platform"] == "小红书"
+    assert job["status"] == "platform_draft"
+    assert job["platform_draft_id"] == "xhs-draft-id"
+    assert job["response"]["source"] == "xiaohongshu_platform"
+    assert job["response"]["event"] == "draft_created"
 
 
 def test_delete_media_asset_removes_file_selection_and_layout_reference(tmp_path):
@@ -1543,22 +1794,102 @@ def test_publish_jobs_schema_and_default_task_action(tmp_path):
     }
 
 
-def test_publish_jobs_rejects_non_wechat_platform(tmp_path):
+def test_publish_jobs_accept_xiaohongshu_and_reject_unsupported_platform(tmp_path):
     service = make_service(tmp_path)
-    project = service.create_project("平台约束测试", platform="微信公众号")
-    account_id = service.db.execute(
+    xhs_project = service.create_project("小红书平台约束测试", platform="小红书")
+    xhs_account_id = service.db.execute(
         "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
-        ("微信公众号", "浏览器授权账号"),
+        ("小红书", "小红书账号"),
     )
 
+    job_id = service.db.execute(
+        """
+        INSERT INTO publish_jobs (
+          project_id, account_id, platform, action, status,
+          platform_publish_id, platform_url, response_json
+        ) VALUES (?, ?, '小红书', 'publish', 'published', ?, ?, ?)
+        """,
+        (
+            xhs_project["id"],
+            xhs_account_id,
+            "xhs-publish-id",
+            "https://creator.xiaohongshu.com/publish/success?note=1",
+            '{"source":"xiaohongshu_platform","event":"note_published","receipt_id":"xhs-publish-id","corroboration":"publish_success_url"}',
+        ),
+    )
+    assert service.db.fetch_one("SELECT platform, status FROM publish_jobs WHERE id = ?", (job_id,)) == {
+        "platform": "小红书",
+        "status": "published",
+    }
     with pytest.raises(sqlite3.IntegrityError):
         service.db.execute(
             "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
-            (project["id"], account_id, "小红书", "draft", "pending"),
+            (xhs_project["id"], xhs_account_id, "视频号", "publish", "pending"),
         )
 
 
-def test_publish_jobs_reject_non_wechat_account_and_project_on_insert_and_update(tmp_path):
+def test_publish_jobs_old_wechat_only_platform_check_is_migrated(tmp_path):
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE publish_jobs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              project_id INTEGER NOT NULL REFERENCES content_projects(id) ON DELETE CASCADE,
+              account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+              platform TEXT NOT NULL CHECK(platform = '微信公众号'),
+              action TEXT NOT NULL CHECK(action IN ('draft', 'publish')),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN (
+                'pending', 'checking_login', 'uploading_assets', 'filling_content',
+                'platform_draft', 'publishing', 'awaiting_confirmation', 'published', 'failed'
+              )),
+              platform_draft_id TEXT NOT NULL DEFAULT '',
+              platform_publish_id TEXT NOT NULL DEFAULT '',
+              platform_url TEXT NOT NULL DEFAULT '',
+              response_json TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(response_json)),
+              requires_confirmation INTEGER NOT NULL DEFAULT 0 CHECK(requires_confirmation IN (0, 1)),
+              failure_stage TEXT NOT NULL DEFAULT '',
+              failure_reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              CHECK(status <> 'awaiting_confirmation' OR requires_confirmation = 1)
+            );
+            """
+        )
+    db = Database(db_path)
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakeMultiPlatformPublisher(),
+    )
+    xhs_project = service.create_project("旧库迁移后小红书发布", platform="小红书")
+    xhs_account_id = service.db.execute(
+        "INSERT INTO platform_accounts (platform, name) VALUES (?, ?)",
+        ("小红书", "小红书账号"),
+    )
+
+    job_id = service.db.execute(
+        """
+        INSERT INTO publish_jobs (
+          project_id, account_id, platform, action, status,
+          platform_publish_id, platform_url, response_json
+        ) VALUES (?, ?, '小红书', 'publish', 'published', ?, ?, ?)
+        """,
+        (
+            xhs_project["id"],
+            xhs_account_id,
+            "xhs-publish-id",
+            "https://creator.xiaohongshu.com/publish/success?note=1",
+            '{"source":"xiaohongshu_platform","event":"note_published","receipt_id":"xhs-publish-id","corroboration":"publish_success_url"}',
+        ),
+    )
+
+    assert service.db.fetch_one("SELECT platform FROM publish_jobs WHERE id = ?", (job_id,)) == {"platform": "小红书"}
+
+
+def test_publish_jobs_reject_mismatched_account_and_project_platform_on_insert_and_update(tmp_path):
     service = make_service(tmp_path)
     project = service.create_project("跨表平台约束测试", platform="微信公众号")
     xhs_project = service.create_project("小红书项目", platform="小红书")
@@ -1571,17 +1902,16 @@ def test_publish_jobs_reject_non_wechat_account_and_project_on_insert_and_update
         ("小红书", "小红书账号"),
     )
 
-    with pytest.raises(sqlite3.IntegrityError):
-        service.db.execute(
-            "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
-            (project["id"], xhs_account_id, "微信公众号", "draft", "pending"),
-        )
-
-    with pytest.raises(sqlite3.IntegrityError):
-        service.db.execute(
-            "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
-            (xhs_project["id"], wechat_account_id, "微信公众号", "draft", "pending"),
-        )
+    for params in [
+        (project["id"], xhs_account_id, "微信公众号", "draft", "pending"),
+        (xhs_project["id"], wechat_account_id, "小红书", "publish", "pending"),
+        (xhs_project["id"], xhs_account_id, "微信公众号", "draft", "pending"),
+    ]:
+        with pytest.raises(sqlite3.IntegrityError):
+            service.db.execute(
+                "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",
+                params,
+            )
 
     job_id = service.db.execute(
         "INSERT INTO publish_jobs (project_id, account_id, platform, action, status) VALUES (?, ?, ?, ?, ?)",

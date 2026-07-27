@@ -24,8 +24,10 @@ const account = {
   owner: '未分配',
   tag: '',
   auth_status: '已授权',
+  login_status: '在线',
   monitor_status: '监测中',
   sync_status: '待同步',
+  sync_error: '',
   role: '',
   audience: '',
   style: '',
@@ -107,7 +109,7 @@ describe('Accounts authentication', () => {
       status: 'success',
       message: '登录成功',
       login_url: 'https://mp.weixin.qq.com/cgi-bin/home',
-      account: { id: 7, platform: '微信公众号', name: '轮询成功账号', auth_status: '已授权' },
+      account: { id: 7, platform: '微信公众号', name: '轮询成功账号', auth_status: '已授权', login_status: '在线' },
       error: '',
     });
     api.accounts
@@ -117,8 +119,44 @@ describe('Accounts authentication', () => {
     await startWechatLogin();
     await act(async () => { await intervalCallback?.(); });
 
-    await screen.findByText('已登录账号：轮询成功账号');
+    await waitFor(() => expect(screen.queryByText('等待微信公众号扫码登录')).toBeNull());
+    expect(screen.queryByText('已登录账号：轮询成功账号')).toBeNull();
     expect(api.accountAuthStatus).toHaveBeenCalledWith('session-success');
+    expect(api.accounts).toHaveBeenCalledTimes(2);
+  });
+
+  it('closes the login modal immediately after a successful scan login', async () => {
+    api.startAccountAuth.mockResolvedValue({
+      session_id: 'session-close',
+      platform: '小红书',
+      status: 'waiting',
+      message: '等待扫码登录',
+      login_url: 'https://creator.xiaohongshu.com/new/home',
+      account: null,
+      error: '',
+    });
+    api.accountAuthStatus.mockResolvedValue({
+      session_id: 'session-close',
+      platform: '小红书',
+      status: 'success',
+      message: '登录成功',
+      login_url: 'https://creator.xiaohongshu.com/new/home',
+      account: { id: 8, platform: '小红书', name: '小红书账号', auth_status: '已授权', login_status: '在线' },
+      error: '',
+    });
+    api.accounts
+      .mockResolvedValueOnce({ accounts: [] })
+      .mockResolvedValue({ accounts: [{ ...account, id: 8, platform: '小红书', name: '小红书账号' }] });
+
+    render(<Accounts />);
+    await waitFor(() => expect(api.accounts).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: '添加账号' }));
+    fireEvent.click(await screen.findByRole('button', { name: /小红书/ }));
+    await screen.findByText('等待小红书扫码登录');
+    await act(async () => { await intervalCallback?.(); });
+
+    await waitFor(() => expect(screen.queryByText('等待小红书扫码登录')).toBeNull());
+    expect(screen.queryByText('已登录账号：小红书账号')).toBeNull();
     expect(api.accounts).toHaveBeenCalledTimes(2);
   });
 
@@ -157,7 +195,7 @@ describe('Accounts authentication', () => {
       status: 'success';
       message: string;
       login_url: string;
-      account: { id: number; platform: string; name: string; auth_status: string };
+      account: { id: number; platform: string; name: string; auth_status: string; login_status: string };
       error: string;
     }>();
     api.startAccountAuth
@@ -204,7 +242,7 @@ describe('Accounts authentication', () => {
       status: 'success',
       message: 'A 登录成功',
       login_url: 'https://mp.weixin.qq.com/cgi-bin/home',
-      account: { id: 8, platform: '微信公众号', name: 'A 账号', auth_status: '已授权' },
+      account: { id: 8, platform: '微信公众号', name: 'A 账号', auth_status: '已授权', login_status: '在线' },
       error: '',
     });
     await act(async () => { await pollAPromise; });
@@ -227,5 +265,64 @@ describe('Accounts authentication', () => {
 
     await screen.findByText('账号已被发布任务或定时任务引用，不能删除');
     expect(api.deleteAccount).toHaveBeenCalledWith(account.id);
+  });
+
+  it('reopens scan login for an offline Xiaohongshu account from the matrix row', async () => {
+    const offlineAccount = {
+      ...account,
+      id: 18,
+      platform: '小红书',
+      name: '离线小红书',
+      login_status: '离线',
+      sync_status: '同步失败',
+      sync_error: '平台登录态已失效，请重新扫码登录',
+    };
+    api.accounts.mockResolvedValue({ accounts: [offlineAccount] });
+    api.startAccountAuth.mockResolvedValue({
+      session_id: 'xhs-relogin',
+      platform: '小红书',
+      status: 'waiting',
+      message: '等待扫码登录',
+      login_url: 'https://creator.xiaohongshu.com/new/home',
+      account: null,
+      error: '',
+    });
+
+    render(<Accounts />);
+    fireEvent.click(await screen.findByRole('button', { name: '离线小红书' }));
+
+    await screen.findByText('等待小红书扫码登录');
+    expect(api.startAccountAuth).toHaveBeenCalledWith({
+      platform: '小红书',
+      account_name: '离线小红书',
+      account_id: 18,
+    });
+  });
+
+  it('only offers online and offline login status filters', async () => {
+    api.accounts.mockResolvedValue({ accounts: [account] });
+
+    render(<Accounts />);
+    await screen.findByText(account.name);
+    fireEvent.mouseDown(screen.getByText('全部登录状态'));
+    const optionTexts = Array.from(document.querySelectorAll('.ant-select-item-option-content'))
+      .map((node) => node.textContent || '');
+
+    expect(optionTexts).toContain('在线');
+    expect(optionTexts).toContain('离线');
+    expect(optionTexts).not.toContain('检测中');
+    expect(optionTexts).not.toContain('未知');
+  });
+
+  it('syncs one account into analytics data from the matrix row', async () => {
+    api.accounts.mockResolvedValue({ accounts: [account] });
+    api.syncAccount.mockResolvedValue({ synced: true, account });
+
+    render(<Accounts />);
+    await screen.findByText(account.name);
+    fireEvent.click(screen.getByRole('button', { name: '同步' }));
+
+    await screen.findByText('账号数据已同步到数据分析');
+    expect(api.syncAccount).toHaveBeenCalledWith(account.id);
   });
 });

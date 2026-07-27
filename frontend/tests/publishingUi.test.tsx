@@ -22,6 +22,7 @@ const api = vi.hoisted(() => ({
   getProject: vi.fn(),
   getPublishJob: vi.fn(),
   projectPublishJob: vi.fn(),
+  publishMonitoring: vi.fn(),
   resumePublishJob: vi.fn(),
   retryPublishJob: vi.fn(),
   retryTasks: vi.fn(),
@@ -45,11 +46,12 @@ const authorizedAccount = {
   platform: '微信公众号',
   name: '授权公众号',
   auth_status: '已授权',
+  login_status: '在线',
 };
 
 const unavailableAccounts = [
-  { id: 12, platform: '微信公众号', name: '未授权公众号', auth_status: '未授权' },
-  { id: 13, platform: '小红书', name: '其他平台账号', auth_status: '已授权' },
+  { id: 12, platform: '微信公众号', name: '未授权公众号', auth_status: '未授权', login_status: '在线' },
+  { id: 13, platform: '小红书', name: '其他平台账号', auth_status: '已授权', login_status: '在线' },
 ];
 
 const boundAccount = {
@@ -123,6 +125,18 @@ function clickButton(text: string) {
   fireEvent.click(buttons[0]);
 }
 
+async function selectFormOption(labelText: string, optionText: string) {
+  const label = screen.getAllByText(labelText, { exact: true }).find((node) => node.tagName.toLowerCase() === 'label');
+  expect(label).toBeDefined();
+  const formItem = label?.closest('.ant-form-item');
+  expect(formItem).not.toBeNull();
+  const selector = formItem?.querySelector('.ant-select-selector');
+  expect(selector).not.toBeNull();
+  fireEvent.mouseDown(selector as HTMLElement);
+  const option = await screen.findByText(optionText, { selector: '.ant-select-item-option-content' });
+  fireEvent.click(option);
+}
+
 function expectButtonReady(text: string) {
   const buttons = buttonsWithText(text);
   expect(buttons).toHaveLength(1);
@@ -169,6 +183,16 @@ beforeEach(() => {
   api.deleteTask.mockResolvedValue({});
   api.currentPublishJob.mockResolvedValue({ job: null });
   api.projectPublishJob.mockResolvedValue({ job: null });
+  api.publishMonitoring.mockResolvedValue({
+    platform: '小红书',
+    total_jobs: 0,
+    published_jobs: 0,
+    failed_jobs: 0,
+    in_progress_jobs: 0,
+    success_rate: 0,
+    avg_duration_seconds: 0,
+    recent_failures: [],
+  });
   api.retryTasks.mockResolvedValue({});
 });
 
@@ -772,6 +796,59 @@ describe('Draft publishing', () => {
 });
 
 describe('Task publishing results', () => {
+  it('shows xiaohongshu publish monitoring and job event logs', async () => {
+    const task = scheduledTask(5, {
+      platform: '小红书',
+      account_name: '小红书账号',
+      task_type: '小红书图文生成',
+      topic: '小红书日志任务',
+      status: '已发布',
+      publish_action: 'publish',
+      publish_job: publishJob({
+        id: 95,
+        platform: '小红书',
+        action: 'publish',
+        status: 'published',
+        platform_draft_id: '',
+        platform_publish_id: 'xhs-95',
+        platform_url: 'https://creator.xiaohongshu.com/publish/success?note=95',
+        events: [
+          { id: 1, stage: 'checking_login', level: 'info', message: '开始检查平台登录状态', payload: {}, created_at: '2026-07-22 10:00:00' },
+          { id: 2, stage: 'uploading_assets', level: 'info', message: '开始上传发布素材', payload: {}, created_at: '2026-07-22 10:00:01' },
+          { id: 3, stage: 'published', level: 'info', message: '小红书发布成功', payload: {}, created_at: '2026-07-22 10:00:05' },
+        ],
+      }),
+    });
+    api.tasks.mockResolvedValue({ tasks: [task] });
+    api.task.mockResolvedValue(task);
+    api.publishMonitoring.mockResolvedValue({
+      platform: '小红书',
+      total_jobs: 3,
+      published_jobs: 2,
+      failed_jobs: 1,
+      in_progress_jobs: 0,
+      success_rate: 0.6667,
+      avg_duration_seconds: 12.4,
+      recent_failures: [
+        { id: 94, failure_stage: '发布文章', failure_reason: '平台拒绝', updated_at: '2026-07-22 09:50:00' },
+      ],
+    });
+
+    render(<Tasks />);
+
+    await screen.findByText('小红书发布监控');
+    expect(document.body.textContent).toContain('总任务 3');
+    expect(document.body.textContent).toContain('成功率 66.67%');
+    expect(document.body.textContent).toContain('最近失败：发布文章 / 平台拒绝');
+    expect(api.publishMonitoring).toHaveBeenCalledWith('小红书');
+
+    clickButton('详情');
+
+    await screen.findByText('发布日志');
+    expect(document.body.textContent).toContain('开始上传发布素材');
+    expect(document.body.textContent).toContain('小红书发布成功');
+  });
+
   it('orders tasks by execution time from newest to oldest', async () => {
     api.tasks.mockResolvedValue({
       tasks: [
@@ -797,6 +874,52 @@ describe('Task publishing results', () => {
     render(<StrictMode><Tasks /></StrictMode>);
 
     await screen.findByText('严格模式任务');
+  });
+
+  it('defaults new scheduled tasks to one-click publish and keeps platform draft selectable', async () => {
+    api.tasks.mockResolvedValue({ tasks: [] });
+
+    render(<Tasks />);
+
+    await waitFor(() => expect(api.accounts).toHaveBeenCalled());
+    clickButton('新增任务');
+    await screen.findByText('新增任务');
+    const publishLabel = screen.getAllByText('发布方式', { exact: true }).find((node) => node.tagName.toLowerCase() === 'label');
+    const publishItem = publishLabel?.closest('.ant-form-item');
+    expect(publishItem?.textContent).toContain('一键发布');
+
+    await selectFormOption('发布方式', '同步到平台草稿箱');
+
+    expect(publishItem?.textContent).toContain('同步到平台草稿箱');
+    expect(screen.queryAllByText('该功能未上线')).toHaveLength(0);
+  });
+
+  it('keeps offline Xiaohongshu accounts out of scheduled task account choices', async () => {
+    api.tasks.mockResolvedValue({ tasks: [] });
+    api.accounts.mockResolvedValue({
+      accounts: [
+        authorizedAccount,
+        {
+          id: 18,
+          platform: '小红书',
+          name: '离线小红书',
+          auth_status: '已授权',
+          login_status: '离线',
+        },
+      ],
+    });
+
+    render(<Tasks />);
+
+    await waitFor(() => expect(api.accounts).toHaveBeenCalled());
+    clickButton('新增任务');
+    await screen.findByText('新增任务');
+    const accountSelect = document.querySelector('#account_id') as HTMLElement;
+    expect(accountSelect).not.toBeNull();
+    fireEvent.mouseDown(accountSelect);
+
+    expect(screen.queryAllByText(/授权公众号/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/离线小红书/)).toBeNull();
   });
 
   it('polls with the latest search and ignores an older response generation', async () => {
@@ -885,12 +1008,12 @@ describe('Task publishing results', () => {
     expect(screen.queryByText('发布 ID：publish-93')).not.toBeNull();
   });
 
-  it('keeps legacy non-WeChat tasks visible but blocks editing them in V1', async () => {
+  it('keeps legacy unsupported platform tasks visible but blocks editing them in V1', async () => {
     const legacy = scheduledTask(4, {
-      platform: '小红书',
+      platform: '视频号',
       account_id: 44,
-      account_name: '旧小红书账号',
-      task_type: '小红书图文生成',
+      account_name: '旧视频号账号',
+      task_type: '视频号内容发布',
       topic: '旧平台任务',
       status: '待执行',
     });
@@ -901,7 +1024,7 @@ describe('Task publishing results', () => {
     await waitFor(() => expect(screen.queryByText('旧平台任务')).not.toBeNull());
     expect(buttonsWithText('删除')).toHaveLength(1);
     clickButton('编辑');
-    await waitFor(() => expect(screen.queryByText('V1 仅开放已授权微信公众号账号发布，当前旧任务只能查看或删除，不能编辑提交。')).not.toBeNull());
+    await waitFor(() => expect(screen.queryByText('V1 仅开放微信公众号和小红书图文任务，当前旧任务只能查看或删除，不能编辑提交。')).not.toBeNull());
 
     const submit = buttonsWithText('保存修改并进入待执行')[0];
     expect(submit).toBeDefined();

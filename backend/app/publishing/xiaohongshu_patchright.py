@@ -1,0 +1,459 @@
+import hashlib
+import json
+import time
+import urllib.parse
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from .models import PublishAction, PublishResult
+
+
+XHS_IMAGE_PUBLISH_URL = "https://creator.xiaohongshu.com/publish/publish?from=homepage&target=image"
+XHS_CREATOR_HOST = "creator.xiaohongshu.com"
+XHS_PUBLISH_PATH = "/publish/publish"
+XHS_SUCCESS_PATH = "/publish/success"
+XHS_LOGIN_COOKIE_MARKERS = {
+    "access-token-creator.xiaohongshu.com",
+    "customer-sso-sid",
+    "galaxy.creator.beaker.session.id",
+    "galaxy_creator_session_id",
+}
+XHS_MAX_NOTE_LENGTH = 1000
+XHS_UPLOAD_INPUT_SELECTORS = (
+    'input[type="file"][accept*="image"]',
+    "div[class^='upload-content'] input[class='upload-input']",
+    "input.upload-input",
+    'input[type="file"]',
+)
+
+
+class XiaoHongShuPublishingError(RuntimeError):
+    pass
+
+
+def _start_patchright() -> Any:
+    try:
+        from patchright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        from playwright.sync_api import sync_playwright
+    return sync_playwright().start()
+
+
+class XiaoHongShuPatchrightPublisher:
+    def __init__(self, playwright_factory: Callable[[], Any] | None = None):
+        self.playwright_factory = playwright_factory or _start_patchright
+        self._trace_job_id = 0
+        self._trace_path: Path | None = None
+
+    def set_trace_context(self, job_id: int, trace_path: str) -> None:
+        self._trace_job_id = int(job_id)
+        self._trace_path = Path(trace_path)
+        self._trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self._trace("trace.started")
+
+    def clear_trace_context(self) -> None:
+        self._trace("trace.finished")
+        self._trace_job_id = 0
+        self._trace_path = None
+
+    def publish(
+        self,
+        payload: dict[str, Any],
+        account: Mapping[str, Any],
+        action: PublishAction,
+    ) -> PublishResult:
+        return self._publish(payload, account, action)
+
+    def publish_with_progress(
+        self,
+        payload: dict[str, Any],
+        account: Mapping[str, Any],
+        action: PublishAction,
+        report_progress: Callable[[str], None],
+    ) -> PublishResult:
+        return self._publish(payload, account, action, report_progress)
+
+    def resume(self, account: Mapping[str, Any], job_context: Mapping[str, Any]) -> PublishResult:
+        raise XiaoHongShuPublishingError("小红书发布不支持人工确认恢复")
+
+    def cancel(self, account: Mapping[str, Any], job_context: Mapping[str, Any]) -> None:
+        return None
+
+    def verify_login(self, account: Mapping[str, Any]) -> dict[str, Any]:
+        profile_path = self._profile_path(account)
+        playwright = None
+        context = None
+        page = None
+        try:
+            playwright = self.playwright_factory()
+            self._trace("xhs.patchright.auth_preflight_launch")
+            context = self._launch_context(playwright, profile_path)
+            self._close_previous_publish_pages(context)
+            page = context.new_page()
+            page.goto(XHS_IMAGE_PUBLISH_URL, wait_until="domcontentloaded", timeout=60000)
+            with _suppress_exceptions():
+                page.wait_for_url("**/publish/publish**", timeout=15000)
+            self._trace("xhs.patchright.auth_preflight_url", url=self._current_url(page))
+            self._require_authenticated(context, page)
+            parsed = urllib.parse.urlparse(self._current_url(page))
+            if parsed.hostname != XHS_CREATOR_HOST or parsed.path != XHS_PUBLISH_PATH:
+                raise XiaoHongShuPublishingError("小红书发布页登录态未通过，请重新扫码登录")
+            return {"verified": True, "platform_url": self._current_url(page)}
+        except XiaoHongShuPublishingError:
+            if page is not None:
+                self._capture_failure_snapshot(page, "xiaohongshu_auth_preflight_error")
+            raise
+        except Exception as exc:
+            if page is not None:
+                self._capture_failure_snapshot(page, "xiaohongshu_auth_preflight_unexpected_error")
+            raise XiaoHongShuPublishingError(f"小红书发布页登录态未通过，请重新扫码登录：{exc}") from exc
+        finally:
+            if context is not None:
+                self._close_publish_pages(context)
+                with _suppress_exceptions():
+                    context.close()
+            if playwright is not None:
+                with _suppress_exceptions():
+                    playwright.stop()
+
+    def _publish(
+        self,
+        payload: dict[str, Any],
+        account: Mapping[str, Any],
+        action: PublishAction,
+        report_progress: Callable[[str], None] | None = None,
+    ) -> PublishResult:
+        self._validate_action(action)
+        self._validate_payload(payload)
+        profile_path = self._profile_path(account)
+        playwright = None
+        context = None
+        page = None
+        try:
+            playwright = self.playwright_factory()
+            self._trace("xhs.patchright.launch")
+            context = self._launch_context(playwright, profile_path)
+            self._close_previous_publish_pages(context)
+            page = context.new_page()
+            page.goto(XHS_IMAGE_PUBLISH_URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_url("**/publish/publish**", timeout=60000)
+            self._trace("xhs.patchright.goto_publish", url=self._current_url(page))
+            self._require_authenticated(context, page)
+            if report_progress:
+                report_progress("uploading_assets")
+            self._upload_images(page, payload["image_paths"])
+            if report_progress:
+                report_progress("filling_content")
+            self._fill_content(page, payload)
+            if report_progress:
+                report_progress("publishing")
+            if action == "draft":
+                return self._save_draft_note(page, payload)
+            return self._publish_note(page, payload)
+        except XiaoHongShuPublishingError:
+            if page is not None:
+                self._capture_failure_snapshot(page, "xiaohongshu_publish_error")
+            raise
+        except Exception as exc:
+            if page is not None:
+                self._capture_failure_snapshot(page, "xiaohongshu_unexpected_error")
+            raise XiaoHongShuPublishingError(f"小红书 Patchright 发布失败：{exc}") from exc
+        finally:
+            if context is not None:
+                self._close_publish_pages(context)
+                with _suppress_exceptions():
+                    context.close()
+            if playwright is not None:
+                with _suppress_exceptions():
+                    playwright.stop()
+
+    def _launch_context(self, playwright: Any, profile_path: Path) -> Any:
+        launcher = getattr(playwright, "chromium", None)
+        if launcher is None:
+            raise XiaoHongShuPublishingError("Patchright 未提供 chromium 浏览器")
+        return launcher.launch_persistent_context(
+            user_data_dir=str(profile_path),
+            headless=False,
+            viewport={"width": 1200, "height": 707},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+
+    def _require_authenticated(self, context: Any, page: Any) -> None:
+        cookie_names = {
+            str(cookie.get("name") or "")
+            for cookie in (context.cookies() or [])
+            if str(cookie.get("name") or "").strip()
+        }
+        current_url = self._current_url(page)
+        parsed = urllib.parse.urlparse(current_url)
+        if parsed.hostname and parsed.hostname != XHS_CREATOR_HOST:
+            raise XiaoHongShuPublishingError("小红书当前页面不是创作者中心，已终止发布")
+        if parsed.path.startswith("/login") or not (cookie_names & XHS_LOGIN_COOKIE_MARKERS):
+            raise XiaoHongShuPublishingError("小红书登录态失效，请重新扫码登录")
+
+    def _upload_images(self, page: Any, image_paths: list[str]) -> None:
+        paths = [str(Path(path).expanduser().resolve()) for path in image_paths]
+        upload_input = self._first_existing_locator(page, XHS_UPLOAD_INPUT_SELECTORS)
+        upload_input.wait_for(state="attached", timeout=30000)
+        self._trace("xhs.upload.locator_ready", selector="input[type=file]", file_count=len(paths))
+        upload_input.set_input_files(paths)
+        self._trace("xhs.upload.set_input_files_done", file_count=len(paths))
+        title_input = page.locator('input[placeholder*="填写标题"]').first
+        title_input.wait_for(state="visible", timeout=90000)
+
+    def _fill_content(self, page: Any, payload: Mapping[str, Any]) -> None:
+        title = str(payload.get("title") or "").strip()[:20]
+        note = str(payload.get("note") or "").strip()
+        self._trace(
+            "xhs.content.length_check",
+            title_length=len(title),
+            note_length=len(note),
+            max_note_length=XHS_MAX_NOTE_LENGTH,
+        )
+        title_input = page.locator('input[placeholder*="填写标题"]').first
+        title_input.fill(title)
+        editor = self._first_existing_locator(
+            page,
+            (
+                'p[data-placeholder*="输入正文描述"]',
+                '[contenteditable="true"][data-placeholder*="输入正文描述"]',
+                '[contenteditable="true"]',
+            ),
+        )
+        editor.click()
+        keyboard = getattr(page, "keyboard", None)
+        if keyboard is None:
+            raise XiaoHongShuPublishingError("小红书页面键盘输入接口不可用")
+        insert_text = getattr(keyboard, "insert_text", None) or getattr(keyboard, "type", None)
+        if not callable(insert_text):
+            raise XiaoHongShuPublishingError("小红书页面键盘输入接口不可用")
+        insert_text(note)
+
+    def _publish_note(self, page: Any, payload: Mapping[str, Any]) -> PublishResult:
+        page.wait_for_timeout(2000)
+        button = page.locator('button:has-text("发布")').last
+        button.wait_for(state="visible", timeout=30000)
+        self._trace("xhs.publish.locator_found", button_text="发布")
+        button.click()
+        self._trace("xhs.publish.locator_clicked", button_text="发布")
+        page.wait_for_url("**/publish/success**", timeout=60000)
+        success_url = self._current_url(page)
+        parsed = urllib.parse.urlparse(success_url)
+        if parsed.hostname != XHS_CREATOR_HOST or parsed.path != XHS_SUCCESS_PATH:
+            raise XiaoHongShuPublishingError("小红书发布后未进入成功页")
+        self._trace("xhs.publish.success_url", url=success_url)
+        return self._publish_result(success_url, payload)
+
+    def _save_draft_note(self, page: Any, payload: Mapping[str, Any]) -> PublishResult:
+        page.wait_for_timeout(2000)
+        button = page.locator('button:has-text("暂存离开")').last
+        button.wait_for(state="visible", timeout=30000)
+        self._trace("xhs.draft.locator_found", button_text="暂存离开")
+        button.click()
+        self._trace("xhs.draft.locator_clicked", button_text="暂存离开")
+        page.wait_for_function(
+            "() => !location.pathname.includes('/publish/publish')",
+            timeout=60000,
+        )
+        draft_url = self._current_url(page)
+        parsed = urllib.parse.urlparse(draft_url)
+        if parsed.hostname == XHS_CREATOR_HOST and parsed.path == XHS_PUBLISH_PATH:
+            raise XiaoHongShuPublishingError("小红书暂存离开后未确认草稿保存")
+        self._trace("xhs.draft.saved_confirmed", url=draft_url)
+        return self._draft_result(draft_url, payload)
+
+    @staticmethod
+    def _first_existing_locator(page: Any, selectors: tuple[str, ...]) -> Any:
+        first = None
+        for selector in selectors:
+            locator = page.locator(selector).first
+            if first is None:
+                first = locator
+            try:
+                if locator.count() > 0:
+                    return locator
+            except Exception:
+                return locator
+        if first is None:
+            raise XiaoHongShuPublishingError("小红书页面未找到目标控件")
+        return first
+
+    def _close_previous_publish_pages(self, context: Any) -> None:
+        for page in list(getattr(context, "pages", []) or []):
+            if self._is_publish_page(page):
+                with _suppress_exceptions():
+                    page.close()
+                    self._trace("tab.close_target", reason="previous_publish_page")
+
+    def _close_publish_pages(self, context: Any) -> None:
+        for page in list(getattr(context, "pages", []) or []):
+            if self._is_publish_page(page):
+                with _suppress_exceptions():
+                    page.close()
+                    self._trace("tab.close_target", reason="publish_page_cleanup")
+
+    @staticmethod
+    def _is_publish_page(page: Any) -> bool:
+        parsed = urllib.parse.urlparse(str(getattr(page, "url", "") or ""))
+        return parsed.hostname == XHS_CREATOR_HOST and parsed.path in {XHS_PUBLISH_PATH, XHS_SUCCESS_PATH}
+
+    @staticmethod
+    def _current_url(page: Any) -> str:
+        return str(getattr(page, "url", "") or page.evaluate("location.href") or "")
+
+    def _capture_failure_snapshot(self, page: Any, label: str) -> None:
+        self._trace("monitor.installed", label=label, result={"ok": True, "installed": True})
+        state = {"ok": True, "url": self._current_url(page)}
+        with _suppress_exceptions():
+            state.update(page.evaluate(self._monitor_expression()) or {})
+        self._trace("monitor.snapshot", label=label, state=state)
+        self._write_trace_json_artifact(label, state)
+        path = self._trace_artifact_path(label, ".png")
+        if path is None:
+            return
+        with _suppress_exceptions():
+            page.screenshot(path=str(path), full_page=True)
+            self._trace("monitor.screenshot", label=label, path=str(path))
+
+    @staticmethod
+    def _monitor_expression() -> str:
+        return """
+        (() => {
+          const visible = (node) => !!node && getComputedStyle(node).display !== 'none'
+            && getComputedStyle(node).visibility !== 'hidden' && node.getClientRects().length > 0;
+          const textOf = (node) => (node.innerText || node.textContent || '').trim();
+          const buttons = [...document.querySelectorAll('button, a, [role="button"]')]
+            .filter(visible).slice(0, 80).map((node) => textOf(node).slice(0, 80));
+          const editor = document.querySelector('p[data-placeholder*="输入正文描述"], [contenteditable="true"]');
+          const noteText = editor ? textOf(editor) : '';
+          return {
+            publishButtonCount: [...document.querySelectorAll('button')].filter((node) => textOf(node).includes('发布')).length,
+            draftButtonCount: [...document.querySelectorAll('button')].filter((node) => textOf(node).includes('暂存离开')).length,
+            visibleButtons: buttons,
+            noteLength: noteText.length,
+            noteOverLimit: noteText.length > 1000,
+          };
+        })()
+        """
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        if not self._trace_path:
+            return
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
+            "event": event,
+            "job_id": self._trace_job_id,
+            **self._safe_trace_payload(fields),
+        }
+        with self._trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _trace_artifact_path(self, label: str, suffix: str) -> Path | None:
+        if not self._trace_path:
+            return None
+        directory = self._trace_path.with_suffix("")
+        directory.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        safe_label = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in label)[:80]
+        return directory / f"{timestamp}-{safe_label}{suffix}"
+
+    def _write_trace_json_artifact(self, label: str, state: Any) -> None:
+        path = self._trace_artifact_path(label, "-state.json")
+        if path is None:
+            return
+        with _suppress_exceptions():
+            path.write_text(json.dumps(self._safe_trace_payload(state), ensure_ascii=False, indent=2), encoding="utf-8")
+            self._trace("monitor.snapshot_file", label=label, path=str(path))
+
+    @classmethod
+    def _safe_trace_payload(cls, value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return {str(key): cls._safe_trace_payload(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._safe_trace_payload(item) for item in value]
+        if isinstance(value, Path):
+            return value.name
+        return value
+
+    @staticmethod
+    def _validate_action(action: str) -> None:
+        if action not in {"draft", "publish"}:
+            raise XiaoHongShuPublishingError("小红书发布 action 必须是 draft 或 publish")
+
+    @staticmethod
+    def _validate_payload(payload: Mapping[str, Any]) -> None:
+        if not str(payload.get("title") or "").strip():
+            raise XiaoHongShuPublishingError("小红书标题不能为空")
+        note = str(payload.get("note") or "").strip()
+        if len(note) > XHS_MAX_NOTE_LENGTH:
+            raise XiaoHongShuPublishingError("小红书正文超过 1000 字，请缩短后再发布")
+        image_paths = payload.get("image_paths")
+        if not isinstance(image_paths, list) or not image_paths:
+            raise XiaoHongShuPublishingError("小红书图文发布至少需要一张图片")
+        for image_path in image_paths:
+            path = Path(str(image_path or "")).expanduser()
+            if not path.is_file():
+                raise XiaoHongShuPublishingError(f"小红书图文图片不存在：{path}")
+
+    @staticmethod
+    def _profile_path(account: Mapping[str, Any]) -> Path:
+        if account.get("platform") != "小红书":
+            raise XiaoHongShuPublishingError("所选账号不是小红书账号")
+        if account.get("auth_status") != "已授权":
+            raise XiaoHongShuPublishingError("小红书账号未授权，请重新扫码登录")
+        raw_path = str(account.get("profile_path") or "").strip()
+        path = Path(raw_path).expanduser() if raw_path else Path()
+        if not raw_path or not path.is_dir():
+            raise XiaoHongShuPublishingError(f"账号浏览器 Profile 不存在：{raw_path or '未配置'}")
+        return path
+
+    @staticmethod
+    def _publish_result(success_url: str, payload: Mapping[str, Any]) -> PublishResult:
+        title = str(payload.get("title") or "").strip()
+        receipt_id = "xhs-" + hashlib.sha256(f"{success_url}\n{title}".encode("utf-8")).hexdigest()[:16]
+        return PublishResult(
+            status="published",
+            platform_publish_id=receipt_id,
+            platform_url=success_url,
+            response={
+                "source": "xiaohongshu_platform",
+                "event": "note_published",
+                "receipt_id": receipt_id,
+                "title": title,
+                "corroboration": "publish_success_url",
+                "delivery_status": "published",
+            },
+        )
+
+    @staticmethod
+    def _draft_result(draft_url: str, payload: Mapping[str, Any]) -> PublishResult:
+        title = str(payload.get("title") or "").strip()
+        receipt_id = "xhs-draft-" + hashlib.sha256(f"{draft_url}\n{title}".encode("utf-8")).hexdigest()[:16]
+        return PublishResult(
+            status="platform_draft",
+            platform_draft_id=receipt_id,
+            platform_url=draft_url,
+            response={
+                "source": "xiaohongshu_platform",
+                "event": "draft_created",
+                "receipt_id": receipt_id,
+                "title": title,
+                "corroboration": "draft_saved",
+                "delivery_status": "platform_draft",
+            },
+        )
+
+
+class _suppress_exceptions:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> bool:
+        return True
+
+
+__all__ = [
+    "XHS_IMAGE_PUBLISH_URL",
+    "XiaoHongShuPatchrightPublisher",
+    "XiaoHongShuPublishingError",
+]

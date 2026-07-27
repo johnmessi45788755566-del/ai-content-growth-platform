@@ -41,7 +41,23 @@ describe('buildTaskPayload', () => {
     expect(payload.publish_action).toBe('draft');
   });
 
-  it('rejects reserved non-WeChat task types instead of serializing them as WeChat', () => {
+  it('allows Xiaohongshu note tasks', () => {
+    const payload = buildTaskPayload({
+      platform: '小红书',
+      accountId: 2,
+      accountName: '小红书账号',
+      topic: '小红书图文',
+      taskType: '小红书图文生成',
+      executionMode: 'once',
+      executeAt: '2026-07-09 10:48',
+    });
+
+    expect(payload.platform).toBe('小红书');
+    expect(payload.task_type).toBe('小红书图文生成');
+    expect(payload.publish_action).toBe('publish');
+  });
+
+  it('rejects mismatched platform task types', () => {
     expect(() => buildTaskPayload({
       platform: '微信公众号',
       accountId: 1,
@@ -50,6 +66,6 @@ describe('buildTaskPayload', () => {
       taskType: '小红书图文生成',
       executionMode: 'once',
       executeAt: '2026-07-09 10:48',
-    })).toThrow('V1 仅支持微信公众号图文生成任务');
+    })).toThrow('V1 仅支持微信公众号和小红书图文生成任务');
   });
 });

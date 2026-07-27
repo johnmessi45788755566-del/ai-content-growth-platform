@@ -108,7 +108,7 @@ export interface PublishJob {
   id: number;
   project_id: number;
   account_id: number;
-  platform: '微信公众号';
+  platform: string;
   action: PublishAction;
   status: PublishJobStatus;
   platform_draft_id?: string;
@@ -119,6 +119,39 @@ export interface PublishJob {
   failure_reason?: string;
   created_at?: string;
   updated_at?: string;
+  events?: PublishJobEvent[];
+}
+
+export interface PublishJobEvent {
+  id: number;
+  stage: PublishJobStatus | string;
+  level: 'info' | 'warning' | 'error';
+  message: string;
+  payload?: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface PublishMonitoringFailure {
+  id: number;
+  project_id?: number;
+  account_id?: number;
+  platform?: string;
+  action?: PublishAction | string;
+  status?: PublishJobStatus | string;
+  failure_stage?: string;
+  failure_reason?: string;
+  updated_at?: string;
+}
+
+export interface PublishMonitoringSummary {
+  platform: string;
+  total_jobs: number;
+  published_jobs: number;
+  failed_jobs: number;
+  in_progress_jobs: number;
+  success_rate: number;
+  avg_duration_seconds: number;
+  recent_failures: PublishMonitoringFailure[];
 }
 
 export interface PublishPackage {
@@ -142,8 +175,10 @@ export interface PlatformAccount {
   owner: string;
   tag: string;
   auth_status: string;
+  login_status: string;
   monitor_status: string;
   sync_status: string;
+  sync_error?: string;
   role: string;
   audience: string;
   style: string;
@@ -161,8 +196,10 @@ export interface AccountAuthAccount {
   name: string;
   account_name?: string;
   auth_status: string;
+  login_status?: string;
   monitor_status?: string;
   sync_status?: string;
+  sync_error?: string;
   last_sync_at?: string;
 }
 

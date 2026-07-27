@@ -16,6 +16,96 @@ def test_xiaohongshu_creator_cookie_is_authenticated(tmp_path):
     assert manager._is_authenticated("小红书", {"url": "https://creator.xiaohongshu.com/"}) is True
 
 
+def test_xiaohongshu_login_page_cookie_is_not_authenticated(tmp_path):
+    manager = BrowserAuthManager(tmp_path)
+    manager._cdp_call = lambda page, method, params=None: {
+        "cookies": [{"name": "access-token-creator.xiaohongshu.com", "value": "token"}]
+    }
+
+    assert manager._is_authenticated(
+        "小红书",
+        {
+            "url": (
+                "https://creator.xiaohongshu.com/login?source=&redirectReason=401"
+                "&lastUrl=%252Fpublish%252Fpublish%253Ftarget%253Dimage"
+            )
+        },
+    ) is False
+
+
+def test_xiaohongshu_publish_access_rejects_login_redirect(tmp_path, monkeypatch):
+    manager = BrowserAuthManager(tmp_path)
+    page = {
+        "url": "https://creator.xiaohongshu.com/new/home",
+        "webSocketDebuggerUrl": "ws://page",
+    }
+    calls = []
+
+    def fake_cdp_call(current_page, method, params=None):
+        calls.append((method, params))
+        if method == "Page.navigate":
+            page["url"] = "https://creator.xiaohongshu.com/login?redirectReason=401"
+            return {}
+        return {
+            "cookies": [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"}
+            ]
+        }
+
+    monkeypatch.setattr(browser_auth.time, "sleep", lambda seconds: None)
+    manager._platform_page = lambda port, platform: page
+    manager._cdp_call = fake_cdp_call
+
+    with pytest.raises(RuntimeError, match="发布页登录态未通过"):
+        manager._verify_xiaohongshu_publish_access(9222, page)
+
+    assert calls[0][0] == "Page.navigate"
+
+
+def test_xiaohongshu_publish_access_accepts_publish_page(tmp_path, monkeypatch):
+    manager = BrowserAuthManager(tmp_path)
+    page = {
+        "url": "https://creator.xiaohongshu.com/new/home",
+        "webSocketDebuggerUrl": "ws://page",
+    }
+
+    def fake_cdp_call(current_page, method, params=None):
+        if method == "Page.navigate":
+            page["url"] = "https://creator.xiaohongshu.com/publish/publish?from=homepage&target=image"
+            return {}
+        return {
+            "cookies": [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"}
+            ]
+        }
+
+    monkeypatch.setattr(browser_auth.time, "sleep", lambda seconds: None)
+    manager._platform_page = lambda port, platform: page
+    manager._cdp_call = fake_cdp_call
+
+    verified = manager._verify_xiaohongshu_publish_access(9222, page)
+
+    assert verified["url"].startswith("https://creator.xiaohongshu.com/publish/publish")
+
+
+def test_xiaohongshu_identity_detection_returns_cookie_id_without_waiting_for_name(tmp_path, monkeypatch):
+    manager = BrowserAuthManager(tmp_path)
+    sleep_calls = []
+    times = iter([0, 0, 13])
+    monkeypatch.setattr(browser_auth.time, "time", lambda: next(times))
+    monkeypatch.setattr(browser_auth.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    manager._platform_page = lambda port, platform: {"webSocketDebuggerUrl": "ws://page"}
+    manager._cdp_call = lambda page, method, params=None: {
+        "cookies": [{"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"}]
+    }
+    manager._detect_account_name = lambda platform, page: ""
+
+    identity = manager._detect_account_identity("小红书", 9222)
+
+    assert identity == {"account_name": "", "external_id": "xhs-user-id"}
+    assert sleep_calls == []
+
+
 def test_fallback_account_name_uses_real_platform_id():
     assert BrowserAuthManager._fallback_account_name("抖音", "1234567890") == "抖音账号（ID 34567890）"
 
@@ -101,6 +191,433 @@ def test_login_launch_restores_the_last_browser_session(tmp_path, monkeypatch):
     assert json.loads(preferences_paths[0].read_text(encoding="utf-8"))["profile"]["session"] == {
         "restore_on_startup": 1
     }
+
+
+def test_xiaohongshu_login_uses_patchright_context_instead_of_system_chrome(tmp_path, monkeypatch):
+    class Page:
+        def __init__(self):
+            self.url = ""
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return "找房子的派大星" if "document.querySelector" in expression else self.url
+
+    class Context:
+        def __init__(self):
+            self.page = Page()
+            self.closed = False
+
+        def new_page(self):
+            return self.page
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+                {"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"},
+            ]
+
+        def close(self):
+            self.closed = True
+
+    class Chromium:
+        def __init__(self, context):
+            self.context = context
+            self.launch_calls = []
+
+        def launch_persistent_context(self, **kwargs):
+            self.launch_calls.append(kwargs)
+            return self.context
+
+    class Playwright:
+        def __init__(self):
+            self.context = Context()
+            self.chromium = Chromium(self.context)
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class Thread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            self.kwargs["target"](*self.kwargs["args"])
+
+    playwright = Playwright()
+    monkeypatch.setattr(browser_auth.threading, "Thread", Thread)
+    manager = BrowserAuthManager(
+        tmp_path / "profiles",
+        chrome_path=tmp_path / "missing-chrome",
+        xiaohongshu_playwright_factory=lambda: playwright,
+    )
+
+    session = manager.start("小红书", "找房子的派大星", lambda account: {"id": 7, **account})
+
+    assert session["status"] == "success"
+    assert playwright.chromium.launch_calls
+    assert playwright.context.page.url.startswith("https://creator.xiaohongshu.com/publish/publish")
+    assert playwright.context.closed is True
+    assert playwright.stopped is True
+
+
+def test_xiaohongshu_login_defers_patchright_start_to_worker_thread(tmp_path, monkeypatch):
+    class Thread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            return None
+
+    calls = []
+    monkeypatch.setattr(browser_auth.threading, "Thread", Thread)
+    manager = BrowserAuthManager(
+        tmp_path / "profiles",
+        chrome_path=tmp_path / "missing-chrome",
+        xiaohongshu_playwright_factory=lambda: calls.append("started"),
+    )
+
+    session = manager.start("小红书", "找房子的派大星", lambda account: account)
+
+    assert session["status"] == "waiting"
+    assert calls == []
+
+
+def test_xiaohongshu_login_cancel_is_deferred_to_patchright_worker(tmp_path, monkeypatch):
+    class Page:
+        def goto(self, url, **kwargs):
+            return None
+
+    class Context:
+        def __init__(self):
+            self.closed = False
+
+        def new_page(self):
+            return Page()
+
+        def close(self):
+            self.closed = True
+
+    class Chromium:
+        def __init__(self, context):
+            self.context = context
+
+        def launch_persistent_context(self, **kwargs):
+            return self.context
+
+    class Playwright:
+        def __init__(self):
+            self.context = Context()
+            self.chromium = Chromium(self.context)
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class Thread:
+        def __init__(self, **kwargs):
+            pass
+
+        def start(self):
+            return None
+
+    playwright = Playwright()
+    monkeypatch.setattr(browser_auth.threading, "Thread", Thread)
+    manager = BrowserAuthManager(
+        tmp_path / "profiles",
+        chrome_path=tmp_path / "missing-chrome",
+        xiaohongshu_playwright_factory=lambda: playwright,
+    )
+    session = manager.start("小红书", "", lambda account: account)
+
+    cancelled = manager.cancel(session["session_id"])
+
+    assert cancelled["status"] == "cancelled"
+    assert playwright.context.closed is False
+    assert playwright.stopped is False
+
+
+def test_xiaohongshu_login_monitor_marks_current_window_preflight_verified(tmp_path, monkeypatch):
+    class Page:
+        def __init__(self):
+            self.url = "https://creator.xiaohongshu.com/new/home"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return "找房子的派大星" if "document.querySelector" in expression else self.url
+
+    class Context:
+        def __init__(self):
+            self.closed = False
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+                {"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"},
+            ]
+
+        def close(self):
+            self.closed = True
+
+    class Playwright:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    captured = {}
+    manager = BrowserAuthManager(tmp_path / "profiles", timeout_seconds=1)
+    context = Context()
+    playwright = Playwright()
+    session_id = "xhs-session"
+    with manager._lock:
+        manager.sessions[session_id] = {
+            "session_id": session_id,
+            "platform": "小红书",
+            "status": "waiting",
+            "message": "等待扫码",
+            "login_url": "https://creator.xiaohongshu.com/new/home",
+            "profile_path": str(tmp_path / "profiles" / "小红书" / "profile"),
+            "account": None,
+            "error": "",
+            "process": None,
+            "port": None,
+            "context": context,
+            "playwright": playwright,
+            "page": Page(),
+        }
+
+    def on_success(payload):
+        captured.update(payload)
+        return {"id": 7, "platform": "小红书", "name": payload["account_name"]}
+
+    manager._monitor_xiaohongshu_patchright(session_id, "", on_success)
+
+    assert captured["publish_preflight_verified"] is True
+    assert captured["login_url"].startswith("https://creator.xiaohongshu.com/publish/publish")
+    assert manager.get_status(session_id)["status"] == "success"
+    assert context.closed is True
+    assert playwright.stopped is True
+
+
+def test_xiaohongshu_login_monitor_accepts_login_page_after_cookie_lands(
+    tmp_path, monkeypatch
+):
+    class Page:
+        def __init__(self):
+            self.url = "https://creator.xiaohongshu.com/login"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return "找房子的派大星" if "document.querySelector" in expression else self.url
+
+    class Context:
+        def __init__(self):
+            self.closed = False
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+                {"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"},
+            ]
+
+        def close(self):
+            self.closed = True
+
+    class Playwright:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    captured = {}
+    manager = BrowserAuthManager(tmp_path / "profiles", timeout_seconds=1)
+    context = Context()
+    playwright = Playwright()
+    session_id = "xhs-session"
+    with manager._lock:
+        manager.sessions[session_id] = {
+            "session_id": session_id,
+            "platform": "小红书",
+            "status": "waiting",
+            "message": "等待扫码",
+            "login_url": "https://creator.xiaohongshu.com/new/home",
+            "profile_path": str(tmp_path / "profiles" / "小红书" / "profile"),
+            "account": None,
+            "error": "",
+            "process": None,
+            "port": None,
+            "context": context,
+            "playwright": playwright,
+            "page": Page(),
+        }
+
+    def on_success(payload):
+        captured.update(payload)
+        return {"id": 7, "platform": "小红书", "name": payload["account_name"]}
+
+    manager._monitor_xiaohongshu_patchright(session_id, "", on_success)
+
+    assert captured["publish_preflight_verified"] is True
+    assert captured["login_url"].startswith("https://creator.xiaohongshu.com/publish/publish")
+    assert manager.get_status(session_id)["status"] == "success"
+    assert context.closed is True
+    assert playwright.stopped is True
+
+
+def test_xiaohongshu_login_monitor_reports_preflight_errors_without_waiting_for_timeout(
+    tmp_path, monkeypatch
+):
+    class Page:
+        url = "https://creator.xiaohongshu.com/new/home"
+
+        def goto(self, url, **kwargs):
+            raise Exception("goto timed out")
+
+        def evaluate(self, expression):
+            return self.url
+
+    class Context:
+        def __init__(self):
+            self.closed = False
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+            ]
+
+        def close(self):
+            self.closed = True
+
+    class Playwright:
+        def __init__(self):
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    times = iter([0, 0, 0, 13])
+    monkeypatch.setattr(browser_auth.time, "time", lambda: next(times))
+    monkeypatch.setattr(browser_auth.time, "sleep", lambda seconds: None)
+    manager = BrowserAuthManager(tmp_path / "profiles", timeout_seconds=3)
+    context = Context()
+    playwright = Playwright()
+    session_id = "xhs-session"
+    profile_path = tmp_path / "profiles" / "小红书" / "profile"
+    with manager._lock:
+        manager.sessions[session_id] = {
+            "session_id": session_id,
+            "platform": "小红书",
+            "status": "waiting",
+            "message": "等待扫码",
+            "login_url": "https://creator.xiaohongshu.com/new/home",
+            "profile_path": str(profile_path),
+            "account": None,
+            "error": "",
+            "process": None,
+            "port": None,
+            "context": context,
+            "playwright": playwright,
+            "page": Page(),
+        }
+
+    manager._monitor_xiaohongshu_patchright(session_id, "", lambda payload: payload)
+
+    status = manager.get_status(session_id)
+    assert status["status"] == "failed"
+    assert "小红书发布页预检失败" in status["error"]
+    assert context.closed is True
+    assert playwright.stopped is True
+
+
+def test_xiaohongshu_patchright_publish_preflight_accepts_publish_url_after_goto_timeout(
+    tmp_path, monkeypatch
+):
+    class Page:
+        def __init__(self):
+            self.url = "https://creator.xiaohongshu.com/new/home"
+
+        def goto(self, url, **kwargs):
+            self.url = url
+            raise Exception("navigation timed out")
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return self.url
+
+    class Context:
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+            ]
+
+    manager = BrowserAuthManager(tmp_path / "profiles")
+    page = Page()
+
+    verified = manager._verify_xiaohongshu_patchright_publish_access(Context(), page)
+
+    assert verified.startswith("https://creator.xiaohongshu.com/publish/publish")
+
+
+def test_xiaohongshu_patchright_auth_accepts_visible_creator_identity_without_cookie_marker(
+    tmp_path,
+):
+    class Page:
+        url = "https://creator.xiaohongshu.com/new/home"
+
+        def evaluate(self, expression):
+            if "document.querySelector" in expression:
+                return "找房子的派大星"
+            return self.url
+
+    class Context:
+        def cookies(self):
+            return []
+
+    manager = BrowserAuthManager(tmp_path / "profiles")
+
+    assert manager._patchright_xiaohongshu_authenticated(Context(), Page()) is True
+
+
+def test_xiaohongshu_patchright_auth_accepts_cookie_marker_with_empty_value(
+    tmp_path,
+):
+    class Page:
+        url = "https://creator.xiaohongshu.com/new/home"
+
+        def evaluate(self, expression):
+            if "document.querySelector" in expression:
+                return ""
+            return self.url
+
+    class Context:
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": ""},
+            ]
+
+    manager = BrowserAuthManager(tmp_path / "profiles")
+
+    assert manager._patchright_xiaohongshu_authenticated(Context(), Page()) is True
 
 
 def test_sync_launch_restores_the_last_browser_session(tmp_path, monkeypatch):

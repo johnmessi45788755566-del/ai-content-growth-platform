@@ -154,6 +154,37 @@ class FakePlatformPublisher:
         return None
 
 
+class FakeMultiPlatformPublisher(FakePlatformPublisher):
+    def publish(self, payload, account, action):
+        if account["platform"] == "小红书":
+            if action == "draft":
+                self.calls.append((payload, account, action))
+                return PublishResult(
+                    status="platform_draft",
+                    platform_draft_id="xhs-draft-id",
+                    platform_url="https://creator.xiaohongshu.com/new/home",
+                    response={
+                        "source": "xiaohongshu_platform",
+                        "event": "draft_created",
+                        "receipt_id": "xhs-draft-id",
+                        "corroboration": "draft_saved",
+                    },
+                )
+            self.calls.append((payload, account, action))
+            return PublishResult(
+                status="published",
+                platform_publish_id="xhs-publish-id",
+                platform_url="https://creator.xiaohongshu.com/publish/success?note=1",
+                response={
+                    "source": "xiaohongshu_platform",
+                    "event": "note_published",
+                    "receipt_id": "xhs-publish-id",
+                    "corroboration": "publish_success_url",
+                },
+            )
+        return super().publish(payload, account, action)
+
+
 class FailingPlatformPublisher:
     def publish(self, payload, account, action):
         raise RuntimeError("微信接口错误 40164：IP 不在白名单")
@@ -165,11 +196,55 @@ class FailingPlatformPublisher:
         return None
 
 
+class XhsLoginPreflightFailingPublisher(FakePlatformPublisher):
+    def __init__(self):
+        super().__init__()
+        self.verify_accounts = []
+
+    def verify_login(self, account):
+        self.verify_accounts.append(account)
+        raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+
+
 def add_authorized_account(service, name: str, platform: str = "微信公众号") -> int:
     return service.db.execute(
         "INSERT INTO platform_accounts (platform, name, auth_status) VALUES (?, ?, ?)",
         (platform, name, "已授权"),
     )
+
+
+def test_xiaohongshu_auth_success_is_not_blocked_by_initial_sync_identity_mismatch(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+
+    account = service._complete_account_auth(
+        {
+            "platform": "小红书",
+            "account_name": "扫码识别账号",
+            "external_id": "xhs-login-id",
+            "profile_path": "/tmp/xhs-profile",
+            "login_url": "https://creator.xiaohongshu.com/new/home",
+            "sync_data": {
+                "source": "browser",
+                "account_name": "页面里的另一个账号",
+                "external_id": "xhs-other-id",
+                "metrics": {"fans": 1},
+                "works": [],
+            },
+        }
+    )
+
+    assert account["platform"] == "小红书"
+    assert account["auth_status"] == "已授权"
+    assert account["sync_status"] == "同步失败"
+    stored = service.get_account(int(account["id"]))
+    assert "同步页面账号身份与所选账号不一致" in stored["sync_error"]
 
 
 def leave_task_publish_job_in_history(service, detail, source: str, status: str) -> None:
@@ -658,7 +733,7 @@ def prepare_publish_job_api(tmp_path: Path, publisher, platform: str = "微信�
     )
     project = client.post(
         "/api/content-projects",
-        json={"title": "发布任务 API 测试", "platform": "微信公众号"},
+        json={"title": "发布任务 API 测试", "platform": platform},
     ).json()
     article = client.post(f"/api/content-projects/{project['id']}/generate-article").json()
     assets = client.post(f"/api/content-projects/{project['id']}/generate-images").json()["assets"]
@@ -685,9 +760,9 @@ def prepare_publish_job_api(tmp_path: Path, publisher, platform: str = "微信�
     return client, project, account_id
 
 
-def test_create_publish_job_rejects_non_wechat_platform(tmp_path: Path):
+def test_create_publish_job_allows_xiaohongshu_publish(tmp_path: Path):
     client, project, account_id = prepare_publish_job_api(
-        tmp_path, FakePlatformPublisher(), platform="小红书"
+        tmp_path, FakeMultiPlatformPublisher(), platform="小红书"
     )
 
     response = client.post(
@@ -695,8 +770,11 @@ def test_create_publish_job_rejects_non_wechat_platform(tmp_path: Path):
         json={"project_id": project["id"], "account_id": account_id, "action": "publish"},
     )
 
-    assert response.status_code == 400
-    assert "暂未开放" in response.json()["detail"]
+    assert response.status_code == 200
+    body = response.json()
+    assert body["platform"] == "小红书"
+    assert body["status"] == "published"
+    assert body["platform_publish_id"] == "xhs-publish-id"
 
 
 def test_create_publish_job_rejects_switching_project_account(tmp_path: Path):
@@ -766,6 +844,22 @@ def test_publish_job_rejects_weak_or_action_mismatched_platform_evidence(tmp_pat
         assert response.status_code == 200
         assert response.json()["status"] == "failed"
         assert "平台" in response.json()["failure_reason"]
+
+
+def test_publish_job_accepts_wechat_manual_save_history_for_platform_draft(tmp_path: Path):
+    publisher = MutableEvidencePublisher()
+    publisher.override = {"corroboration": "draft_manual_save_history"}
+    client, project, account_id = prepare_publish_job_api(tmp_path, publisher)
+
+    response = client.post(
+        "/api/publish-jobs",
+        json={"project_id": project["id"], "account_id": account_id, "action": "draft"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "platform_draft"
+    assert body["platform_draft_id"] == "evidence-draft"
 
 
 def test_failed_publish_job_does_not_expose_browser_profile_path(tmp_path: Path):
@@ -1133,9 +1227,10 @@ def test_project_publish_job_returns_latest_bound_job_with_public_fields_only(
         "failure_stage",
         "failure_reason",
         "created_at",
-        "updated_at",
-        "response",
-    }
+            "updated_at",
+            "response",
+            "events",
+        }
     assert "response_json" not in response.text
     assert "profile_path" not in response.text
 
@@ -1876,6 +1971,7 @@ def test_account_management_update_cannot_overwrite_authenticated_identity(tmp_p
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
         browser_auth_manager=FakeBrowserAuthManager(),
+        platform_publisher=FakePlatformPublisher(),
         scheduler_enabled=False,
     )
     client = TestClient(app)
@@ -2168,8 +2264,10 @@ def test_public_account_endpoints_use_safe_whitelist_but_sync_receives_private_r
         "owner",
         "tag",
         "auth_status",
+        "login_status",
         "monitor_status",
         "sync_status",
+        "sync_error",
         "role",
         "audience",
         "style",
@@ -2191,7 +2289,8 @@ def test_public_account_endpoints_use_safe_whitelist_but_sync_receives_private_r
         assert account["external_id"] == "safe-external-id"
         for private_value in private_values:
             assert private_value not in response.text
-        for private_field in ("profile_path", "login_url", "qr_url", "sync_error"):
+        assert "已隐藏账号诊断信息" in account["sync_error"] or not account["sync_error"]
+        for private_field in ("profile_path", "login_url", "qr_url"):
             assert private_field not in account
     assert browser_auth.synced_account["profile_path"] == private_values[0]
     assert private_values[1] in browser_auth.synced_account["login_url"]
@@ -2285,7 +2384,7 @@ def test_task_platform_failure_copies_sanitized_publish_job_failure(tmp_path: Pa
     assert detail["publish_package"]["platform_draft_id"] == ""
 
 
-def test_task_defaults_to_direct_publish_and_returns_public_publish_job(tmp_path: Path):
+def test_task_defaults_to_publish_and_returns_public_publish_job(tmp_path: Path):
     app = create_app(
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
@@ -2390,7 +2489,7 @@ def test_task_create_and_update_reject_platform_account_mismatch(tmp_path: Path)
     }
 
     invalid_create = client.post("/api/tasks", json={**payload, "platform": "小红书"})
-    task = client.post("/api/tasks", json=payload).json()
+    task = client.post("/api/tasks", json={**payload, "publish_action": "publish"}).json()
     invalid_update = client.patch(
         f"/api/tasks/{task['id']}",
         json={**payload, "platform": "小红书"},
@@ -2403,8 +2502,8 @@ def test_task_create_and_update_reject_platform_account_mismatch(tmp_path: Path)
     assert client.get(f"/api/tasks/{task['id']}").json()["platform"] == "微信公众号"
 
 
-def test_task_publishing_rejects_unavailable_platform_on_create_update_and_execute(tmp_path: Path):
-    publisher = FakePlatformPublisher()
+def test_task_publishing_allows_xiaohongshu_publish_and_draft_execution(tmp_path: Path):
+    publisher = FakeMultiPlatformPublisher()
     app = create_app(
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
@@ -2413,52 +2512,290 @@ def test_task_publishing_rejects_unavailable_platform_on_create_update_and_execu
         scheduler_enabled=False,
     )
     client = TestClient(app)
-    wechat_id = add_authorized_account(app.state.content_service, "可用公众号")
-    xhs_id = add_authorized_account(app.state.content_service, "不可用小红书", platform="小红书")
+    xhs_id = add_authorized_account(app.state.content_service, "可用小红书", platform="小红书")
     payload = {
-        "platform": "微信公众号",
-        "account_id": wechat_id,
-        "account_name": "可用公众号",
+        "platform": "小红书",
+        "account_id": xhs_id,
+        "account_name": "可用小红书",
         "execute_time": "2026-07-14 09:30",
-        "task_type": "微信公众号图文生成",
-        "topic": "平台边界测试",
+        "task_type": "小红书图文生成",
+        "topic": "小红书平台边界测试",
     }
 
-    invalid_create = client.post(
+    task = client.post("/api/tasks", json={**payload, "publish_action": "publish"}).json()
+    executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    draft_task = client.post(
+        "/api/tasks",
+        json={**payload, "topic": "小红书草稿边界测试", "publish_action": "draft"},
+    ).json()
+    draft_executed = app.state.content_service.execute_task(
+        draft_task["id"], datetime(2026, 7, 14, 9, 30)
+    )
+
+    assert task["platform"] == "小红书"
+    assert executed["status"] == "已发布"
+    assert executed["publish_job"]["platform"] == "小红书"
+    assert executed["publish_job"]["platform_publish_id"] == "xhs-publish-id"
+    assert draft_executed["status"] == "已生成平台草稿"
+    assert draft_executed["publish_job"]["status"] == "platform_draft"
+    assert draft_executed["publish_job"]["platform_draft_id"] == "xhs-draft-id"
+    assert [call[2] for call in publisher.calls] == ["publish", "draft"]
+
+
+def test_xiaohongshu_task_fails_before_browser_when_account_is_offline(tmp_path: Path):
+    publisher = FakeMultiPlatformPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    xhs_id = add_authorized_account(app.state.content_service, "离线小红书", platform="小红书")
+    app.state.content_service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '离线', sync_status = '同步失败',
+            sync_error = '平台登录态已失效，请重新扫码登录'
+        WHERE id = ?
+        """,
+        (xhs_id,),
+    )
+    task = client.post(
         "/api/tasks",
         json={
-            **payload,
             "platform": "小红书",
             "account_id": xhs_id,
-            "account_name": "不可用小红书",
-            "task_type": "小红书图文生成（预留）",
+            "account_name": "离线小红书",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "小红书图文生成",
+            "topic": "离线账号发布拦截",
+            "publish_action": "publish",
         },
-    )
-    task = client.post("/api/tasks", json=payload).json()
-    invalid_update = client.patch(
-        f"/api/tasks/{task['id']}",
-        json={
-            **payload,
-            "platform": "小红书",
-            "account_id": xhs_id,
-            "account_name": "不可用小红书",
-            "task_type": "小红书图文生成（预留）",
-        },
-    )
-    app.state.content_service.db.execute(
-        "UPDATE scheduled_tasks SET platform = '小红书' WHERE id = ?",
-        (task["id"],),
-    )
+    ).json()
 
     executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    account = client.get(f"/api/accounts/{xhs_id}").json()
 
-    assert invalid_create.status_code == 400
-    assert invalid_update.status_code == 400
-    assert "仅支持微信公众号" in invalid_create.json()["detail"]
-    assert "仅支持微信公众号" in invalid_update.json()["detail"]
     assert executed["status"] == "失败"
-    assert "仅支持微信公众号" in executed["failure_reason"]
+    assert executed["failure_stage"] == "检查账号"
+    assert "账号离线，请重新扫码登录" in executed["failure_reason"]
+    assert executed["publish_job_id"] is None
     assert publisher.calls == []
+    assert account["login_status"] == "离线"
+    assert account["sync_error"] == "平台登录态已失效，请重新扫码登录"
+
+
+def test_accounts_api_returns_login_status_for_matrix_display(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "在线展示账号", platform="小红书")
+    app.state.content_service.db.execute(
+        "UPDATE platform_accounts SET login_status = '在线' WHERE id = ?",
+        (account_id,),
+    )
+
+    listed = client.get("/api/accounts").json()["accounts"][0]
+    detail = client.get(f"/api/accounts/{account_id}").json()
+
+    assert listed["login_status"] == "在线"
+    assert detail["login_status"] == "在线"
+
+
+def test_reauth_start_keeps_offline_status_until_scan_succeeds(tmp_path: Path):
+    class WaitingBrowserAuthManager:
+        def start(self, platform, account_name, on_success):
+            return {
+                "session_id": "waiting-session",
+                "platform": platform,
+                "status": "waiting",
+                "message": "等待扫码登录",
+                "login_url": "https://creator.xiaohongshu.com/new/home",
+                "account": None,
+                "error": "",
+            }
+
+        def close_all(self):
+            return None
+
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=WaitingBrowserAuthManager(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "找房子的派大星", platform="小红书")
+    app.state.content_service.db.execute(
+        "UPDATE platform_accounts SET login_status = '离线' WHERE id = ?",
+        (account_id,),
+    )
+
+    started = client.post(
+        "/api/accounts/auth/start",
+        json={"platform": "小红书", "account_name": "找房子的派大星", "account_id": account_id},
+    )
+    account = client.get(f"/api/accounts/{account_id}").json()
+
+    assert started.status_code == 200
+    assert started.json()["status"] == "waiting"
+    assert account["login_status"] == "离线"
+
+
+def test_xiaohongshu_auth_completion_rejects_publish_login_redirect(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=FakePlatformPublisher(),
+    )
+
+    with pytest.raises(RuntimeError, match="发布页登录态未通过"):
+        service._complete_account_auth(
+            {
+                "platform": "小红书",
+                "account_name": "找房子的派大星",
+                "external_id": "xhs-user-id",
+                "profile_path": "/tmp/xhs-profile",
+                "login_url": "https://creator.xiaohongshu.com/login?redirectReason=401",
+            }
+        )
+
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS count FROM platform_accounts WHERE platform = '小红书'"
+    )["count"] == 0
+
+
+def test_xiaohongshu_auth_completion_requires_patchright_publish_preflight(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    publisher = XhsLoginPreflightFailingPublisher()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=publisher,
+    )
+
+    with pytest.raises(RuntimeError, match="发布页登录态未通过"):
+        service._complete_account_auth(
+            {
+                "platform": "小红书",
+                "account_name": "找房子的派大星",
+                "external_id": "xhs-user-id",
+                "profile_path": "/tmp/xhs-profile",
+                "login_url": "https://creator.xiaohongshu.com/new/home",
+            }
+        )
+
+    assert publisher.verify_accounts[0]["platform"] == "小红书"
+    assert db.fetch_one(
+        "SELECT COUNT(*) AS count FROM platform_accounts WHERE platform = '小红书'"
+    )["count"] == 0
+
+
+def test_xiaohongshu_auth_completion_skips_second_preflight_after_login_window_verified(tmp_path: Path):
+    db = Database(tmp_path / "content.db")
+    db.init_schema()
+    publisher = XhsLoginPreflightFailingPublisher()
+    service = ContentService(
+        db=db,
+        ai_client=FakeAIClient(),
+        upload_dir=tmp_path / "uploads",
+        platform_publisher=publisher,
+    )
+
+    account = service._complete_account_auth(
+        {
+            "platform": "小红书",
+            "account_name": "找房子的派大星",
+            "external_id": "xhs-user-id",
+            "profile_path": "/tmp/xhs-profile",
+            "login_url": "https://creator.xiaohongshu.com/publish/publish?from=homepage&target=image",
+            "publish_preflight_verified": True,
+        }
+    )
+
+    assert account["login_status"] == "在线"
+    assert publisher.verify_accounts == []
+
+
+def test_xiaohongshu_account_sync_writes_rows_used_by_analytics(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "小红书同步账号", platform="小红书")
+
+    response = client.post(f"/api/accounts/{account_id}/sync")
+    account_rows = client.get("/api/analytics/accounts", params={"platform": "小红书"}).json()["accounts"]
+    work_rows = client.get("/api/analytics/works", params={"platform": "小红书"}).json()["works"]
+
+    assert response.status_code == 200
+    assert account_rows[0]["account_name"] == "小红书同步账号"
+    assert account_rows[0]["fans"] == 321
+    assert work_rows[0]["account_name"] == "小红书同步账号"
+    assert work_rows[0]["title"] == "真实平台作品"
+
+
+def test_non_login_sync_failure_keeps_online_login_status(tmp_path: Path):
+    class GenericFailingBrowserAuthManager(FakeBrowserAuthManager):
+        def sync(self, account):
+            raise RuntimeError("平台数据页面仍在加载")
+
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=GenericFailingBrowserAuthManager(),
+        platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "同步失败小红书", platform="小红书")
+
+    response = client.post(f"/api/accounts/{account_id}/sync")
+    account = client.get(f"/api/accounts/{account_id}").json()
+
+    assert response.status_code == 502
+    assert account["login_status"] == "在线"
+
+
+def test_login_expired_sync_failure_marks_account_offline(tmp_path: Path):
+    class LoginExpiredBrowserAuthManager(FakeBrowserAuthManager):
+        def sync(self, account):
+            raise RuntimeError("平台登录态已失效，请重新扫码登录")
+
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=LoginExpiredBrowserAuthManager(),
+        platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "登录失效小红书", platform="小红书")
+
+    response = client.post(f"/api/accounts/{account_id}/sync")
+    account = client.get(f"/api/accounts/{account_id}").json()
+
+    assert response.status_code == 502
+    assert account["login_status"] == "离线"
 
 
 def test_draft_task_remains_distinct_from_direct_publish(tmp_path: Path):
@@ -4951,13 +5288,13 @@ def test_api_repeat_task_accepts_time_only_input(tmp_path: Path):
 
 def test_unavailable_platform_task_is_rejected_before_generation(tmp_path: Path):
     service = make_task_service(tmp_path)
-    with pytest.raises(RuntimeError, match="仅支持微信公众号"):
+    with pytest.raises(RuntimeError, match="仅支持微信公众号和小红书图文"):
         service.create_task(
             {
-                "platform": "小红书",
-                "account_name": "财务自动化笔记",
+                "platform": "视频号",
+                "account_name": "视频号账号",
                 "execute_time": "2026-07-08 09:30",
-                "task_type": "小红书图文生成（预留）",
-                "topic": "小红书预留任务",
+                "task_type": "视频号内容发布",
+                "topic": "视频号预留任务",
             }
         )

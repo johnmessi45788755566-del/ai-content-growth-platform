@@ -9,6 +9,7 @@ import type {
   PlatformAccount,
   PublishAction,
   PublishJob,
+  PublishMonitoringSummary,
   PublishPackage,
   ScheduledTask,
   TopicDirection,
@@ -138,6 +139,12 @@ export const api = {
     const params = new URLSearchParams({ project_id: String(projectId) });
     return request<{ job: PublishJob | null }>(`/api/publish-jobs/project?${params.toString()}`);
   },
+  publishMonitoring(platform?: string) {
+    const params = new URLSearchParams();
+    if (platform) params.set('platform', platform);
+    const query = params.toString();
+    return request<PublishMonitoringSummary>(`/api/publish-jobs/monitoring${query ? `?${query}` : ''}`);
+  },
   retryPublishJob(id: number) {
     return request<PublishJob>(`/api/publish-jobs/${id}/retry`, { method: 'POST' });
   },
@@ -155,7 +162,7 @@ export const api = {
     const query = params.toString();
     return request<{ accounts: PlatformAccount[] }>(`/api/accounts${query ? `?${query}` : ''}`);
   },
-  startAccountAuth(payload: { platform: string; account_name?: string }) {
+  startAccountAuth(payload: { platform: string; account_name?: string; account_id?: number }) {
     return request<AccountAuthSession>('/api/accounts/auth/start', {
       method: 'POST',
       body: JSON.stringify(payload),

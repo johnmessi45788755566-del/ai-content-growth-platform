@@ -15,8 +15,11 @@ export interface TaskFormValues {
 }
 
 export function buildTaskPayload(values: TaskFormValues) {
-  if (values.platform !== '微信公众号' || values.taskType !== '微信公众号图文生成') {
-    throw new Error('V1 仅支持微信公众号图文生成任务');
+  const supportedTask =
+    (values.platform === '微信公众号' && values.taskType === '微信公众号图文生成') ||
+    (values.platform === '小红书' && values.taskType === '小红书图文生成');
+  if (!supportedTask) {
+    throw new Error('V1 仅支持微信公众号和小红书图文生成任务');
   }
   return {
     platform: values.platform,

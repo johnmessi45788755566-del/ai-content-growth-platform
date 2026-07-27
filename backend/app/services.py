@@ -1,9 +1,12 @@
 import json
 import re
+import threading
 import unicodedata
+import urllib.parse
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .ai import OpenAICompatibleClient, TopicRecommendation
 from .database import Database
@@ -12,7 +15,7 @@ from .publishing.coordinator import (
     PublishCoordinator,
     PublishJobValidationError,
 )
-from .publishing.wechat import WeChatDraftPublisher
+from .publishing.router import PlatformPublisherRouter
 
 
 STAGE_LABELS = {
@@ -26,6 +29,7 @@ STAGE_LABELS = {
 STAGE_ORDER = ["title", "article", "images", "layout", "publish"]
 TASK_TYPE_WECHAT = "微信公众号图文生成"
 TASK_TYPE_WECHAT_LEGACY = "公众号文章创作"
+TASK_TYPE_XIAOHONGSHU = "小红书图文生成"
 TASK_TYPE_XIAOHONGSHU_RESERVED = "小红书图文生成（预留）"
 TASK_TIME_FORMAT = "%Y-%m-%d %H:%M"
 PUBLISH_INTERRUPTION_TIMEOUT = timedelta(minutes=15)
@@ -38,6 +42,14 @@ WAITING_TASK_RECOVERY_JOB_STATUSES = (
 PLATFORMS = ["微信公众号", "视频号", "小红书", "抖音"]
 MARKDOWN_ASSET_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(asset:(\d+)\)")
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+ACCOUNT_SYNC_ERROR_SECRET_RE = re.compile(
+    r"(token|cookie|credentials|debug_port|authorization|bearer)=\S+",
+    re.IGNORECASE,
+)
+ACCOUNT_SYNC_ERROR_LOCAL_URL_RE = re.compile(r"https?://127\.0\.0\.1:\d+/\S*")
+ACCOUNT_SYNC_ERROR_PRIVATE_PATH_RE = re.compile(r"/(?:private/)?[^\s]*browser-profile[^\s]*")
+REDACTED_ACCOUNT_DIAGNOSTIC = "[已隐藏账号诊断信息]"
+XIAOHONGSHU_SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 PLATFORM_ALIASES = {
     "公众号": "微信公众号",
     "微信公众平台": "微信公众号",
@@ -54,8 +66,10 @@ PUBLIC_ACCOUNT_FIELDS = (
     "owner",
     "tag",
     "auth_status",
+    "login_status",
     "monitor_status",
     "sync_status",
+    "sync_error",
     "role",
     "audience",
     "style",
@@ -94,15 +108,17 @@ class ContentService:
         self.upload_dir = Path(upload_dir)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
         self.browser_auth_manager = browser_auth_manager
-        self.platform_publisher = platform_publisher or WeChatDraftPublisher()
+        self.platform_publisher = platform_publisher or PlatformPublisherRouter()
         self.publish_coordinator = PublishCoordinator(
             db=self.db,
             publisher=self.platform_publisher,
             project_loader=self.get_project,
             account_loader=self.get_account,
-            payload_builder=self._build_wechat_publish_payload,
+            payload_builder=self._build_publish_payload,
             confirmation_expired_callback=self._synchronize_linked_waiting_tasks,
         )
+        self._account_browser_locks: dict[int, threading.Lock] = {}
+        self._account_browser_locks_guard = threading.Lock()
         self._fail_unrecoverable_confirmations_after_restart()
 
     def _fail_unrecoverable_confirmations_after_restart(self) -> None:
@@ -114,6 +130,38 @@ class ContentService:
                 int(job["id"]),
                 reason="服务重启后原运营者确认窗口已失效，请重试发布任务",
             )
+
+    def _account_browser_lock(self, account_id: int) -> threading.Lock:
+        with self._account_browser_locks_guard:
+            lock = self._account_browser_locks.get(account_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._account_browser_locks[account_id] = lock
+            return lock
+
+    @contextmanager
+    def _account_browser_scope(self, account_id: int) -> Iterator[None]:
+        lock = self._account_browser_lock(account_id)
+        if not lock.acquire(blocking=False):
+            raise RuntimeError("该账号正在执行登录、同步或发布，请稍后再试")
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @staticmethod
+    def _login_status_from_sync_error(error: str) -> str:
+        lowered = error.lower()
+        expired_markers = (
+            "登录态已失效",
+            "重新扫码",
+            "未登录",
+            "登录失效",
+            "扫码登录",
+            "redirectreason=401",
+            "unauthorized",
+        )
+        return "离线" if any(marker in lowered or marker in error for marker in expired_markers) else "在线"
 
     def recover_stale_awaiting_confirmations(
         self, now: datetime | None = None
@@ -515,14 +563,30 @@ class ContentService:
         self.db.execute("DELETE FROM draft_snapshots WHERE id = ?", (draft_id,))
         return {"deleted": True, "id": draft_id}
 
-    def start_account_auth(self, platform: str, account_name: str = "") -> dict[str, Any]:
+    def start_account_auth(
+        self,
+        platform: str,
+        account_name: str = "",
+        account_id: int | None = None,
+    ) -> dict[str, Any]:
         normalized_platform = _normalize_platform(platform)
         if not self.browser_auth_manager:
             raise RuntimeError("真实浏览器登录服务未配置")
+        target_account: dict[str, Any] | None = None
+        if account_id is not None:
+            target_account = self.get_account(int(account_id))
+            if target_account["platform"] != normalized_platform:
+                raise RuntimeError("重新登录账号与所选平台不一致")
+            account_name = account_name or str(target_account.get("name") or "")
+        completion = (
+            (lambda result: self._complete_account_auth(result, int(account_id)))
+            if account_id is not None
+            else self._complete_account_auth
+        )
         return self.browser_auth_manager.start(
             normalized_platform,
             account_name,
-            self._complete_account_auth,
+            completion,
         )
 
     def get_account_auth_status(self, session_id: str) -> dict[str, Any]:
@@ -535,28 +599,51 @@ class ContentService:
             raise RuntimeError("真实浏览器登录服务未配置")
         return self.browser_auth_manager.cancel(session_id)
 
-    def _complete_account_auth(self, result: dict[str, Any]) -> dict[str, Any]:
+    def _complete_account_auth(
+        self,
+        result: dict[str, Any],
+        expected_account_id: int | None = None,
+    ) -> dict[str, Any]:
         normalized_platform = _normalize_platform(result["platform"])
         name = str(result.get("account_name") or f"{normalized_platform}账号").strip()
         external_id = str(result.get("external_id") or "").strip()
         profile_path = str(result.get("profile_path") or "")
         login_url = str(result.get("login_url") or "")
+        publish_preflight_verified = bool(result.get("publish_preflight_verified"))
         sync_data = result.get("sync_data")
         sync_error = str(result.get("sync_error") or "")
         if normalized_platform == "微信公众号" and not external_id:
             raise RuntimeError("微信公众号授权缺少稳定账号 ID，请重新扫码")
+        if normalized_platform == "小红书" and self._xiaohongshu_login_url_expired(login_url):
+            raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录")
+        if normalized_platform == "小红书" and not publish_preflight_verified:
+            self._verify_xiaohongshu_publish_login(
+                {
+                    "platform": normalized_platform,
+                    "name": name,
+                    "auth_status": "已授权",
+                    "profile_path": profile_path,
+                }
+            )
         existing = None
-        if external_id:
+        if expected_account_id is not None:
+            existing = self.db.fetch_one(
+                "SELECT id FROM platform_accounts WHERE id = ? AND platform = ?",
+                (expected_account_id, normalized_platform),
+            )
+            if not existing:
+                raise RuntimeError("重新登录账号不存在或平台不一致")
+        if not existing and external_id:
             existing = self.db.fetch_one(
                 "SELECT id FROM platform_accounts WHERE platform = ? AND external_id = ?",
                 (normalized_platform, external_id),
             )
-        if not external_id and profile_path:
+        if not existing and not external_id and profile_path:
             existing = self.db.fetch_one(
                 "SELECT id FROM platform_accounts WHERE profile_path = ?",
                 (profile_path,),
             )
-        if not external_id and not existing and "信息待完善" not in name:
+        if not existing and not external_id and "信息待完善" not in name:
             existing = self.db.fetch_one(
                 "SELECT id FROM platform_accounts WHERE platform = ? AND name = ?",
                 (normalized_platform, name),
@@ -566,7 +653,7 @@ class ContentService:
                 """
                 UPDATE platform_accounts
                 SET name = ?, external_id = ?, auth_status = '已授权', monitor_status = '监测中', sync_status = '待同步',
-                    sync_error = '',
+                    sync_error = '', login_status = '在线',
                     auth_method = '真实浏览器扫码', profile_path = ?, login_url = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
@@ -577,10 +664,10 @@ class ContentService:
             account_id = self.db.execute(
                 """
                 INSERT INTO platform_accounts (
-                  platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status,
+                  platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status,
                   role, audience, style, taboo, preference, auth_method, profile_path, login_url
                 )
-                VALUES (?, ?, ?, '未分配', '', '已授权', '监测中', '待同步', ?, ?, ?, ?, ?,
+                VALUES (?, ?, ?, '未分配', '', '已授权', '在线', '监测中', '待同步', ?, ?, ?, ?, ?,
                         '真实浏览器扫码', ?, ?)
                 """,
                 (
@@ -597,15 +684,46 @@ class ContentService:
                 ),
             )
         if isinstance(sync_data, dict):
-            self._persist_account_sync(account_id, sync_data)
+            try:
+                self._persist_account_sync(account_id, sync_data)
+            except RuntimeError as exc:
+                if normalized_platform != "小红书":
+                    raise
+                self.db.execute(
+                    "UPDATE platform_accounts SET login_status = '在线', sync_status = '同步失败', sync_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (str(exc) or "平台数据同步失败", account_id),
+                )
         elif sync_error:
             self.db.execute(
-                "UPDATE platform_accounts SET sync_status = '同步失败', sync_error = ? WHERE id = ?",
+                "UPDATE platform_accounts SET login_status = '在线', sync_status = '同步失败', sync_error = ? WHERE id = ?",
                 (sync_error, account_id),
             )
         return self.get_public_account(account_id)
 
-    def list_accounts(self, platform: str = "", auth_status: str = "", q: str = "") -> list[dict[str, Any]]:
+    @staticmethod
+    def _xiaohongshu_login_url_expired(login_url: str) -> bool:
+        parsed = urllib.parse.urlparse(login_url)
+        if parsed.netloc != "creator.xiaohongshu.com":
+            return False
+        query = urllib.parse.parse_qs(parsed.query)
+        return parsed.path.startswith("/login") or query.get("redirectReason") == ["401"]
+
+    def _verify_xiaohongshu_publish_login(self, account: dict[str, Any]) -> None:
+        verifier = getattr(self.platform_publisher, "verify_login", None)
+        if not callable(verifier):
+            return
+        try:
+            verifier(account)
+        except Exception as exc:
+            raise RuntimeError("小红书发布页登录态未通过，请重新扫码登录") from exc
+
+    def list_accounts(
+        self,
+        platform: str = "",
+        auth_status: str = "",
+        login_status: str = "",
+        q: str = "",
+    ) -> list[dict[str, Any]]:
         clauses = []
         params: list[Any] = []
         if platform and platform != "全部平台":
@@ -614,6 +732,9 @@ class ContentService:
         if auth_status and auth_status != "全部授权状态":
             clauses.append("auth_status = ?")
             params.append(auth_status)
+        if login_status and login_status != "全部登录状态":
+            clauses.append("login_status = ?")
+            params.append(login_status)
         if q:
             clauses.append("(name LIKE ? OR tag LIKE ? OR owner LIKE ?)")
             keyword = f"%{q}%"
@@ -621,7 +742,7 @@ class ContentService:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         accounts = self.db.fetch_all(
             f"""
-            SELECT id, platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status, sync_error,
+            SELECT id, platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status, sync_error,
                    role, audience, style, taboo, preference, auth_method, qr_url, profile_path, login_url,
                    last_sync_at, created_at, updated_at
             FROM platform_accounts
@@ -635,7 +756,7 @@ class ContentService:
     def get_account(self, account_id: int) -> dict[str, Any]:
         account = self.db.fetch_one(
             """
-            SELECT id, platform, name, external_id, owner, tag, auth_status, monitor_status, sync_status, sync_error,
+            SELECT id, platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status, sync_error,
                    role, audience, style, taboo, preference, auth_method, qr_url, profile_path, login_url,
                    last_sync_at, created_at, updated_at
             FROM platform_accounts
@@ -652,7 +773,21 @@ class ContentService:
 
     @staticmethod
     def _public_account(account: dict[str, Any]) -> dict[str, Any]:
-        return {field: account[field] for field in PUBLIC_ACCOUNT_FIELDS if field in account}
+        resource = {field: account[field] for field in PUBLIC_ACCOUNT_FIELDS if field in account}
+        if isinstance(resource.get("sync_error"), str):
+            resource["sync_error"] = ContentService._redact_account_diagnostic(
+                str(resource["sync_error"])
+            )
+        return resource
+
+    @staticmethod
+    def _redact_account_diagnostic(value: str) -> str:
+        value = ACCOUNT_SYNC_ERROR_LOCAL_URL_RE.sub(REDACTED_ACCOUNT_DIAGNOSTIC, value)
+        value = ACCOUNT_SYNC_ERROR_PRIVATE_PATH_RE.sub(REDACTED_ACCOUNT_DIAGNOSTIC, value)
+        return ACCOUNT_SYNC_ERROR_SECRET_RE.sub(
+            lambda match: f"{match.group(1)}={REDACTED_ACCOUNT_DIAGNOSTIC}",
+            value,
+        )
 
     def sync_account(self, account_id: int) -> dict[str, Any]:
         account = self.get_account(account_id)
@@ -660,24 +795,31 @@ class ContentService:
             raise RuntimeError("账号未授权，请先完成扫码登录")
         if not self.browser_auth_manager:
             raise RuntimeError("真实浏览器同步服务未配置")
-        self.db.execute(
-            "UPDATE platform_accounts SET sync_status = '同步中', sync_error = '' WHERE id = ?",
-            (account_id,),
-        )
-        try:
-            data = self.browser_auth_manager.sync(account)
-            self._persist_account_sync(account_id, data)
-        except Exception as exc:
-            error = str(exc) or "平台数据同步失败"
+        with self._account_browser_scope(account_id):
             self.db.execute(
                 """
                 UPDATE platform_accounts
-                SET sync_status = '同步失败', sync_error = ?, updated_at = CURRENT_TIMESTAMP
+                SET sync_status = '同步中', sync_error = '', updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (error, account_id),
+                (account_id,),
             )
-            raise RuntimeError(f"真实数据同步失败：{error}") from exc
+            try:
+                if account["platform"] == "小红书":
+                    self._verify_xiaohongshu_publish_login(account)
+                data = self.browser_auth_manager.sync(account)
+                self._persist_account_sync(account_id, data)
+            except Exception as exc:
+                error = str(exc) or "平台数据同步失败"
+                self.db.execute(
+                    """
+                    UPDATE platform_accounts
+                    SET login_status = ?, sync_status = '同步失败', sync_error = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (self._login_status_from_sync_error(error), error, account_id),
+                )
+                raise RuntimeError(f"真实数据同步失败：{error}") from exc
         return {
             "synced": True,
             "source": data.get("source", "browser"),
@@ -2075,13 +2217,21 @@ class ContentService:
             )
             if account:
                 account_id = int(account["id"])
-        if platform != "微信公众号" or task_type != TASK_TYPE_WECHAT:
-            raise RuntimeError("V1 定时任务真实发布仅支持微信公众号")
+        if platform == "微信公众号":
+            if task_type != TASK_TYPE_WECHAT:
+                raise RuntimeError("微信公众号任务类型必须是微信公众号图文生成")
+        elif platform == "小红书":
+            if task_type == TASK_TYPE_XIAOHONGSHU_RESERVED:
+                task_type = TASK_TYPE_XIAOHONGSHU
+            if task_type != TASK_TYPE_XIAOHONGSHU:
+                raise RuntimeError("小红书任务类型必须是小红书图文生成")
+        else:
+            raise RuntimeError("V1 定时任务真实发布仅支持微信公众号和小红书图文")
         if account_id in {None, ""}:
-            raise RuntimeError("请选择一个已授权的微信公众号账号")
+            raise RuntimeError(f"请选择一个已授权的{platform}账号")
         account = self.get_account(int(account_id))
-        if account["platform"] != "微信公众号" or account["auth_status"] != "已授权":
-            raise RuntimeError("请选择一个已授权的微信公众号账号")
+        if account["platform"] != platform or account["auth_status"] != "已授权":
+            raise RuntimeError(f"请选择一个已授权的{platform}账号")
         publish_action = str(payload.get("publish_action", "publish")).strip() or "publish"
         if publish_action not in {"publish", "draft"}:
             raise RuntimeError("发布动作必须是 publish 或 draft")
@@ -2148,7 +2298,7 @@ class ContentService:
         platform = account["platform"]
         account_name = account["name"]
         account_id = int(account["id"])
-        job = self.create_publish_job(project_id, account_id, action)
+        job = self.publish_coordinator.create_publish_job(project_id, account_id, action)
         return self._persist_publish_package(project, account, job)
 
     def _persist_publish_package(
@@ -2218,20 +2368,51 @@ class ContentService:
         platform = str(account["platform"])
         account_name = str(account["name"])
         if job["status"] == "platform_draft":
-            self._create_work_from_project(account_id, platform, account_name, project, status="平台草稿")
+            self._create_work_from_project(
+                account_id,
+                platform,
+                account_name,
+                project,
+                status="平台草稿",
+                publish_url=str(job.get("platform_url") or ""),
+            )
         elif job["status"] == "published":
-            self._create_work_from_project(account_id, platform, account_name, project, status="已发布")
+            self._create_work_from_project(
+                account_id,
+                platform,
+                account_name,
+                project,
+                status="已发布",
+                publish_url=str(job.get("platform_url") or ""),
+            )
         self._set_stage(int(project["id"]), "publish")
         self.autosave(int(project["id"]), stage="publish", restore_stage="layout")
 
     def create_publish_job(self, project_id: int, account_id: int, action: str) -> dict[str, Any]:
-        return self.publish_coordinator.create_publish_job(project_id, account_id, action)
+        job = self.publish_coordinator.create_publish_job(project_id, account_id, action)
+        self._postprocess_publish_job_result(job)
+        return job
 
     def prepare_publish_job(self, project_id: int, account_id: int, action: str) -> dict[str, Any]:
         return self.publish_coordinator.prepare_publish_job(project_id, account_id, action)
 
     def execute_publish_job(self, job_id: int) -> dict[str, Any]:
-        return self.publish_coordinator.execute_publish_job(job_id)
+        pending_job = self.db.fetch_one(
+            "SELECT account_id, platform FROM publish_jobs WHERE id = ?",
+            (job_id,),
+        )
+        if not pending_job:
+            job = self.publish_coordinator.execute_publish_job(job_id)
+            self._postprocess_publish_job_result(job)
+            return job
+        if pending_job["platform"] != "小红书":
+            job = self.publish_coordinator.execute_publish_job(job_id)
+            self._postprocess_publish_job_result(job)
+            return job
+        with self._account_browser_scope(int(pending_job["account_id"])):
+            job = self.publish_coordinator.execute_publish_job(job_id)
+        self._postprocess_publish_job_result(job)
+        return job
 
     def get_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
@@ -2249,6 +2430,9 @@ class ContentService:
     def get_project_publish_job(self, project_id: int) -> dict[str, Any] | None:
         return self.publish_coordinator.get_project_publish_job(project_id)
 
+    def get_publish_monitoring(self, platform: str | None = None) -> dict[str, Any]:
+        return self.publish_coordinator.get_publish_monitoring(platform)
+
     def retry_publish_job(self, job_id: int) -> dict[str, Any]:
         try:
             try:
@@ -2265,6 +2449,7 @@ class ContentService:
                     "awaiting_confirmation",
                 } or not linked_failed_task:
                     raise
+            self._postprocess_publish_job_result(job)
             self._synchronize_linked_tasks(job, "失败", "失败")
             return job
         except LookupError as exc:
@@ -2282,6 +2467,7 @@ class ContentService:
                 )
                 if job["status"] not in {"published", "platform_draft", "failed"} or not linked_waiting_task:
                     raise
+            self._postprocess_publish_job_result(job)
             self._synchronize_linked_waiting_tasks(job)
             return job
         except LookupError as exc:
@@ -2335,13 +2521,23 @@ class ContentService:
             )
 
     def _validate_task_publish_target(self, task: dict[str, Any]) -> dict[str, Any]:
-        if task["platform"] != "微信公众号" or task["task_type"] != TASK_TYPE_WECHAT:
-            raise RuntimeError("V1 定时任务真实发布仅支持微信公众号")
+        if task["platform"] == "微信公众号":
+            if task["task_type"] != TASK_TYPE_WECHAT:
+                raise RuntimeError("微信公众号任务类型必须是微信公众号图文生成")
+        elif task["platform"] == "小红书":
+            if task["task_type"] not in {TASK_TYPE_XIAOHONGSHU, TASK_TYPE_XIAOHONGSHU_RESERVED}:
+                raise RuntimeError("小红书任务类型必须是小红书图文生成")
+        else:
+            raise RuntimeError("V1 定时任务真实发布仅支持微信公众号和小红书图文")
         if not task.get("account_id"):
-            raise RuntimeError("请选择一个已授权的微信公众号账号")
+            raise RuntimeError(f"请选择一个已授权的{task['platform']}账号")
         account = self.get_account(int(task["account_id"]))
-        if account["platform"] != "微信公众号" or account["auth_status"] != "已授权":
-            raise RuntimeError("请选择一个已授权的微信公众号账号")
+        if account["platform"] != task["platform"] or account["auth_status"] != "已授权":
+            raise RuntimeError(f"请选择一个已授权的{task['platform']}账号")
+        if account["platform"] == "小红书":
+            login_status = str(account.get("login_status") or "在线")
+            if login_status != "在线":
+                raise RuntimeError("小红书账号离线，请重新扫码登录")
         return account
 
     def _resolve_publish_account(
@@ -2394,6 +2590,172 @@ class ContentService:
             if line.startswith("# "):
                 return line[2:].strip()
         return ""
+
+    def _build_publish_payload(self, project: dict[str, Any], account_name: str) -> dict[str, Any]:
+        platform = str(project.get("platform") or "微信公众号")
+        if platform == "微信公众号":
+            return self._build_wechat_publish_payload(project, account_name)
+        if platform == "小红书":
+            return self._build_xiaohongshu_publish_payload(project, account_name)
+        raise RuntimeError(f"{platform}暂未接入真实发布")
+
+    def _build_xiaohongshu_publish_payload(self, project: dict[str, Any], account_name: str) -> dict[str, Any]:
+        assets = {int(asset["id"]): asset for asset in project["media_assets"]}
+        markdown_block = next(
+            (
+                block
+                for block in project["layout_blocks"]
+                if block["section_type"] == "markdown" and str(block["content"] or "").strip()
+            ),
+            None,
+        )
+        if markdown_block:
+            title, image_paths, note = self._parse_xhs_markdown_layout(
+                str(markdown_block["content"]),
+                project["title"],
+                assets,
+            )
+        else:
+            title = str(project["title"] or "").strip()
+            image_paths = self._xhs_image_paths_from_layout(project, assets)
+            note_parts = [
+                str(block.get("content") or "").strip()
+                for block in project["layout_blocks"]
+                if str(block.get("section_type") or "").strip() != "title"
+                and str(block.get("content") or "").strip()
+            ]
+            if not note_parts:
+                note_parts = [
+                    str(block.get("content") or "").strip()
+                    for block in project["article_blocks"]
+                    if str(block.get("content") or "").strip()
+                ]
+            note = "\n\n".join(note_parts)
+        if not image_paths:
+            image_paths = self._selected_xhs_image_paths(project)
+        return {
+            "title": title[:20] or str(project["title"] or "").strip()[:20],
+            "note": note,
+            "tags": self._extract_xhs_tags(note),
+            "image_paths": image_paths,
+            "account_name": account_name,
+        }
+
+    def _parse_xhs_markdown_layout(
+        self,
+        markdown: str,
+        fallback_title: str,
+        assets: dict[int, dict[str, Any]],
+    ) -> tuple[str, list[str], str]:
+        title = ""
+        image_paths: list[str] = []
+        note_lines: list[str] = []
+        for raw_line in markdown.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            image_sources = [match.strip() for match in MARKDOWN_IMAGE_RE.findall(line)]
+            for image_source in image_sources:
+                asset_match = re.fullmatch(r"asset:(\d+)", image_source)
+                if asset_match:
+                    asset = assets.get(int(asset_match.group(1)))
+                    if asset:
+                        image_path = self._xiaohongshu_supported_asset_path(asset)
+                        if image_path:
+                            image_paths.append(image_path)
+                elif not image_source.startswith(("http://", "https://", "data:")):
+                    image_path = self._xiaohongshu_supported_local_path(image_source)
+                    if image_path:
+                        image_paths.append(image_path)
+            text = MARKDOWN_IMAGE_RE.sub("", line).strip()
+            if not text:
+                continue
+            if text.startswith("# ") and not title:
+                title = text[2:].strip()
+                continue
+            note_lines.append(self._markdown_line_to_block(text)[1])
+        return title or fallback_title, list(dict.fromkeys(image_paths)), "\n\n".join(note_lines)
+
+    def _xhs_image_paths_from_layout(
+        self,
+        project: dict[str, Any],
+        assets: dict[int, dict[str, Any]],
+    ) -> list[str]:
+        ordered_assets: list[dict[str, Any]] = []
+        cover = next(
+            (
+                asset
+                for asset in project["media_assets"]
+                if asset["asset_type"] == "cover" and int(asset["selected"]) == 1
+            ),
+            None,
+        )
+        if cover:
+            ordered_assets.append(cover)
+        for block in project["layout_blocks"]:
+            asset = assets.get(int(block["media_asset_id"])) if block.get("media_asset_id") else None
+            if asset and int(asset["selected"]) == 1 and asset not in ordered_assets:
+                ordered_assets.append(asset)
+        for asset in project["media_assets"]:
+            if int(asset["selected"]) == 1 and asset not in ordered_assets:
+                ordered_assets.append(asset)
+        image_paths = self._xiaohongshu_image_paths_from_assets(ordered_assets)
+        if image_paths:
+            return image_paths
+        return self._fallback_xiaohongshu_image_paths(project)
+
+    def _selected_xhs_image_paths(self, project: dict[str, Any]) -> list[str]:
+        selected = [
+            asset
+            for asset in project["media_assets"]
+            if int(asset["selected"]) == 1
+        ]
+        selected.sort(key=lambda asset: (0 if asset["asset_type"] == "cover" else 1, int(asset["id"])))
+        image_paths = self._xiaohongshu_image_paths_from_assets(selected)
+        if image_paths:
+            return image_paths
+        return self._fallback_xiaohongshu_image_paths(project)
+
+    def _fallback_xiaohongshu_image_paths(self, project: dict[str, Any]) -> list[str]:
+        assets = sorted(
+            project["media_assets"],
+            key=lambda asset: (
+                0 if asset["asset_type"] == "cover" else 1,
+                0 if int(asset["selected"]) == 1 else 1,
+                int(asset["id"]),
+            ),
+        )
+        return self._xiaohongshu_image_paths_from_assets(assets)
+
+    def _xiaohongshu_image_paths_from_assets(self, assets: list[dict[str, Any]]) -> list[str]:
+        image_paths: list[str] = []
+        for asset in assets:
+            image_path = self._xiaohongshu_supported_asset_path(asset)
+            if image_path and image_path not in image_paths:
+                image_paths.append(image_path)
+        return image_paths
+
+    def _xiaohongshu_supported_asset_path(self, asset: dict[str, Any]) -> str:
+        return self._xiaohongshu_supported_local_path(str(self._media_file_path(asset)))
+
+    def _xiaohongshu_supported_local_path(self, image_path: str) -> str:
+        path = Path(str(image_path)).expanduser()
+        if not path.is_absolute() and path.parts and path.parts[0] == "uploads":
+            path = self.upload_dir / path.name
+        if path.suffix.lower() not in XIAOHONGSHU_SUPPORTED_IMAGE_SUFFIXES:
+            return ""
+        if not path.is_file():
+            return ""
+        return str(path)
+
+    @staticmethod
+    def _extract_xhs_tags(note: str) -> list[str]:
+        tags = []
+        for match in re.findall(r"#([\w\u4e00-\u9fff-]{1,30})", note):
+            cleaned = match.strip().lstrip("#")
+            if cleaned and cleaned not in tags:
+                tags.append(cleaned)
+        return tags[:10]
 
     def _build_wechat_publish_payload(self, project: dict[str, Any], account_name: str) -> dict[str, Any]:
         assets = {int(asset["id"]): asset for asset in project["media_assets"]}
@@ -2751,11 +3113,37 @@ class ContentService:
         self.db.execute(
             """
             UPDATE platform_accounts
-            SET name = ?, external_id = ?, sync_status = '已同步', sync_error = '', last_sync_at = ?,
+            SET name = ?, external_id = ?, login_status = '在线', sync_status = '已同步', sync_error = '', last_sync_at = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
             (account_name, external_id, _format_task_time(now), account_id),
+        )
+
+    def _postprocess_publish_job_result(self, job: dict[str, Any]) -> None:
+        if job["status"] == "failed":
+            self._mark_account_offline_after_publish_login_failure(job)
+            return
+        if job["status"] not in {"platform_draft", "published"}:
+            return
+        project = self.get_project(int(job["project_id"]))
+        account = self.get_account(int(job["account_id"]))
+        self._postprocess_publish_package(project, account, job)
+
+    def _mark_account_offline_after_publish_login_failure(self, job: dict[str, Any]) -> None:
+        if job.get("platform") != "小红书":
+            return
+        reason = str(job.get("failure_reason") or "")
+        if not any(marker in reason for marker in ("登录态失效", "重新扫码", "redirectReason=401", "/login")):
+            return
+        self.db.execute(
+            """
+            UPDATE platform_accounts
+            SET login_status = '离线', sync_status = '同步失败', sync_error = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (reason or "小红书登录态失效，请重新扫码登录", int(job["account_id"])),
         )
 
     def _create_work_from_project(
@@ -2765,13 +3153,36 @@ class ContentService:
         account_name: str,
         project: dict[str, Any],
         status: str = "已生成平台草稿",
+        publish_url: str = "",
     ) -> None:
+        content_type = "笔记" if platform == "小红书" else "图文"
+        existing = self.db.fetch_one(
+            """
+            SELECT id FROM platform_works
+            WHERE account_id = ? AND publish_url = ? AND publish_url <> ''
+            LIMIT 1
+            """,
+            (account_id, publish_url),
+        )
+        if existing:
+            return
         work_id = self.db.execute(
             """
-            INSERT INTO platform_works (account_id, platform, account_name, title, content_type, status, published_at)
-            VALUES (?, ?, ?, ?, '图文', ?, ?)
+            INSERT INTO platform_works (
+              account_id, platform, account_name, title, content_type, status, publish_url, published_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (account_id, platform, account_name, project["title"], status, _format_task_time(datetime.now())),
+            (
+                account_id,
+                platform,
+                account_name,
+                project["title"],
+                content_type,
+                status,
+                publish_url,
+                _format_task_time(datetime.now()),
+            ),
         )
         self.db.execute(
             """
