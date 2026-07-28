@@ -805,12 +805,20 @@ class PublishCoordinator:
                 raise RuntimeError("平台返回的小红书发布证据字段无效或与动作不匹配")
             return
         if response.get("source") == "xiaohongshu_platform" and action == "draft":
-            if (
-                parsed.hostname != "creator.xiaohongshu.com"
-                or response.get("event") != "draft_created"
-                or str(response.get("receipt_id") or "") != platform_id
-                or response.get("corroboration") != "draft_saved"
-            ):
+            valid_local_draft = (
+                parsed.hostname == "creator.xiaohongshu.com"
+                and response.get("event") == "draft_created"
+                and str(response.get("receipt_id") or "") == platform_id
+                and response.get("corroboration") == "draft_saved"
+            )
+            valid_private_publish = (
+                parsed.hostname == "creator.xiaohongshu.com"
+                and parsed.path == "/publish/success"
+                and response.get("event") == "private_note_published"
+                and str(response.get("receipt_id") or "") == platform_id
+                and response.get("corroboration") == "private_visibility_publish_success"
+            )
+            if not (valid_local_draft or valid_private_publish):
                 raise RuntimeError("平台返回的小红书草稿证据字段无效或与动作不匹配")
             return
         raise RuntimeError(f"平台返回的{label}证据字段无效或与动作不匹配")

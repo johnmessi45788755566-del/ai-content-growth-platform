@@ -10,6 +10,7 @@ import pytest
 
 from app.ai import GeneratedImage, TopicRecommendation
 from app.database import Database
+from app.publishing.coordinator import PublishCoordinator
 from app.publishing.wechat import PublishResult
 from app.services import ContentService
 
@@ -492,6 +493,20 @@ def test_xiaohongshu_draft_action_creates_platform_draft(tmp_path):
     assert job["platform_draft_id"] == "xhs-draft-id"
     assert job["response"]["source"] == "xiaohongshu_platform"
     assert job["response"]["event"] == "draft_created"
+
+
+def test_publish_coordinator_accepts_xiaohongshu_private_visibility_publish_as_draft_evidence():
+    PublishCoordinator._require_platform_evidence(
+        "xhs-private-draft-id",
+        "https://creator.xiaohongshu.com/publish/success?note=1",
+        {
+            "source": "xiaohongshu_platform",
+            "event": "private_note_published",
+            "receipt_id": "xhs-private-draft-id",
+            "corroboration": "private_visibility_publish_success",
+        },
+        "draft",
+    )
 
 
 def test_delete_media_asset_removes_file_selection_and_layout_reference(tmp_path):

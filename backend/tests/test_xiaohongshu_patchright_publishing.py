@@ -276,6 +276,107 @@ class IdleFirstPublishPage(FakePage):
         return True
 
 
+class PrivateVisibilityDraftLocator(ClosedShadowPublishLocator):
+    def count(self):
+        if self.selector.startswith("button:has-text"):
+            return 0
+        if self.selector.startswith("xhs-publish-btn"):
+            return 1 if 'submit-text="发布"' in self.selector else 0
+        if "公开可见" in self.selector:
+            return 1
+        if "仅自己可见" in self.selector:
+            return 1 if self.page.visibility_menu_open else 0
+        return super().count()
+
+    def bounding_box(self):
+        if self.selector.startswith("xhs-publish-btn"):
+            return {"x": 248, "y": 617, "width": 680, "height": 90}
+        return None
+
+    def click(self, **kwargs):
+        if kwargs:
+            self.page.actions.append(("locator_click", self.selector, kwargs))
+        else:
+            self.page.actions.append(("locator_click", self.selector))
+        if "公开可见" in self.selector:
+            self.page.visibility_menu_open = True
+        elif "仅自己可见" in self.selector:
+            self.page.visibility = "仅自己可见"
+        elif self.selector.startswith("xhs-publish-btn"):
+            position = kwargs.get("position") or {}
+            if float(position.get("x") or 0) > 340:
+                self.page.url = "https://creator.xiaohongshu.com/publish/success?note=1"
+
+
+class PrivateVisibilityDraftPage(FakePage):
+    def __init__(self):
+        super().__init__()
+        self.visibility = "公开可见"
+        self.visibility_menu_open = False
+
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return PrivateVisibilityDraftLocator(self, selector)
+
+    def wait_for_function(self, expression, **kwargs):
+        self.actions.append(("wait_for_function", expression, kwargs))
+        if "仅自己可见" in expression and self.visibility != "仅自己可见":
+            raise TimeoutError("private visibility was not selected")
+
+    def evaluate(self, expression):
+        self.actions.append(("evaluate", expression))
+        if "location.href" in expression:
+            return self.url
+        if "publishControls" in expression:
+            return {
+                "publishButtonCount": 1,
+                "draftButtonCount": 0,
+                "visibleButtons": ["发布", self.visibility],
+                "publishControls": [
+                    {
+                        "submitText": "发布",
+                        "saveText": "暂存离开",
+                        "submitDisabled": "false",
+                        "submitLoading": "false",
+                        "saveDisabled": "false",
+                    }
+                ],
+                "visibility": self.visibility,
+                "noteLength": len(self.note),
+                "noteOverLimit": False,
+            }
+        return True
+
+
+class CollapsedMoreSettingsLocator(PrivateVisibilityDraftLocator):
+    def count(self):
+        if "更多设置" in self.selector:
+            return 1
+        if "公开可见" in self.selector:
+            return 1 if self.page.more_settings_open else 0
+        return super().count()
+
+    def click(self, **kwargs):
+        if kwargs:
+            self.page.actions.append(("locator_click", self.selector, kwargs))
+        else:
+            self.page.actions.append(("locator_click", self.selector))
+        if "更多设置" in self.selector:
+            self.page.more_settings_open = True
+            return
+        super().click(**kwargs)
+
+
+class CollapsedMoreSettingsPage(PrivateVisibilityDraftPage):
+    def __init__(self):
+        super().__init__()
+        self.more_settings_open = False
+
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return CollapsedMoreSettingsLocator(self, selector)
+
+
 class FakeContext:
     def __init__(self, cookie_value="valid", page=None):
         self.page = page or FakePage()
@@ -366,13 +467,18 @@ def test_patchright_publisher_clicks_publish_with_locator_and_never_cdp_mouse(tm
     actions = playwright.context.page.actions
     assert result.status == "published"
     assert ("locator_click", 'button:has-text("发布")') in actions
+    assert not any(
+        action[0] == "locator_click"
+        and any(text in action[1] for text in ("更多设置", "公开可见", "仅自己可见"))
+        for action in actions
+    )
     assert not any("dispatchMouseEvent" in str(action) or "cdp_mouse" in str(action) for action in actions)
     assert progress == ["uploading_assets", "filling_content", "publishing"]
     assert playwright.context.closed is True
     assert playwright.stopped is True
 
 
-def test_patchright_publisher_clicks_draft_with_locator_and_never_publish_button(tmp_path: Path):
+def test_patchright_publisher_draft_uses_private_visibility_publish_without_save_draft(tmp_path: Path):
     profile = tmp_path / "profile"
     profile.mkdir()
     image = tmp_path / "cover.jpg"
@@ -387,9 +493,14 @@ def test_patchright_publisher_clicks_draft_with_locator_and_never_publish_button
 
     actions = playwright.context.page.actions
     assert result.status == "platform_draft"
-    assert result.platform_url == "https://creator.xiaohongshu.com/new/home"
-    assert ("locator_click", 'button:has-text("暂存离开")') in actions
-    assert ("locator_click", 'button:has-text("发布")') not in actions
+    assert result.platform_url == "https://creator.xiaohongshu.com/publish/success?note=1"
+    assert result.response["event"] == "private_note_published"
+    assert result.response["corroboration"] == "private_visibility_publish_success"
+    assert ("locator_click", 'button:has-text("发布")') in actions
+    assert not any(
+        action[0] == "locator_click" and "暂存离开" in action[1]
+        for action in actions
+    )
     assert not any("dispatchMouseEvent" in str(action) or "cdp_mouse" in str(action) for action in actions)
 
 
@@ -413,7 +524,7 @@ def test_patchright_publisher_clicks_closed_shadow_publish_host_when_button_is_h
     )
 
 
-def test_patchright_publisher_clicks_closed_shadow_draft_host_when_button_is_hidden(tmp_path: Path):
+def test_patchright_publisher_draft_clicks_closed_shadow_publish_host_after_private_visibility(tmp_path: Path):
     profile = tmp_path / "profile"
     profile.mkdir()
     image = tmp_path / "cover.jpg"
@@ -426,10 +537,14 @@ def test_patchright_publisher_clicks_closed_shadow_draft_host_when_button_is_hid
     assert result.status == "platform_draft"
     assert any(
         action[0] == "locator_click"
-        and action[1] == 'xhs-publish-btn[save-text="暂存离开"]'
-        and action[2]["position"]["x"] < 130
+        and action[1] == 'xhs-publish-btn[submit-text="发布"]'
+        and action[2]["position"]["x"] > 130
         for action in page.actions
         if len(action) == 3
+    )
+    assert not any(
+        action[0] == "locator_click" and action[1] == 'xhs-publish-btn[save-text="暂存离开"]'
+        for action in page.actions
     )
 
 
@@ -521,6 +636,59 @@ def test_patchright_publisher_retries_publish_host_when_page_stays_idle_after_cl
         and action[1] == 'xhs-publish-btn[submit-text="发布"]'
     ]
     assert len(publish_clicks) == 2
+
+
+def test_patchright_publisher_draft_sets_private_visibility_and_publishes(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = PrivateVisibilityDraftPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "draft")
+
+    assert result.status == "platform_draft"
+    assert result.platform_url == "https://creator.xiaohongshu.com/publish/success?note=1"
+    assert result.response["event"] == "private_note_published"
+    assert result.response["corroboration"] == "private_visibility_publish_success"
+    assert page.visibility == "仅自己可见"
+    assert any(action[0] == "locator_click" and "公开可见" in action[1] for action in page.actions)
+    assert any(action[0] == "locator_click" and "仅自己可见" in action[1] for action in page.actions)
+    assert any(
+        action[0] == "locator_click"
+        and action[1] == 'xhs-publish-btn[submit-text="发布"]'
+        for action in page.actions
+    )
+    assert not any(
+        action[0] == "locator_click"
+        and "暂存离开" in action[1]
+        for action in page.actions
+    )
+
+
+def test_patchright_publisher_draft_expands_more_settings_before_visibility(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = CollapsedMoreSettingsPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "draft")
+
+    assert result.status == "platform_draft"
+    more_settings_index = next(
+        index
+        for index, action in enumerate(page.actions)
+        if action[0] == "locator_click" and "更多设置" in action[1]
+    )
+    visibility_index = next(
+        index
+        for index, action in enumerate(page.actions)
+        if action[0] == "locator_click" and "公开可见" in action[1]
+    )
+    assert more_settings_index < visibility_index
 
 
 def test_xiaohongshu_monitor_expression_includes_publish_control_state():

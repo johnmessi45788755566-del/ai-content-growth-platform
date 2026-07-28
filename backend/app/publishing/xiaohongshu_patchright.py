@@ -34,6 +34,20 @@ XHS_PUBLISH_BUTTON_SELECTOR = 'button:has-text("发布")'
 XHS_DRAFT_BUTTON_SELECTOR = 'button:has-text("暂存离开")'
 XHS_PUBLISH_HOST_SELECTOR = 'xhs-publish-btn[submit-text="发布"]'
 XHS_DRAFT_HOST_SELECTOR = 'xhs-publish-btn[save-text="暂存离开"]'
+XHS_VISIBILITY_SELECT_SELECTORS = (
+    '.permission-card-select:has-text("公开可见")',
+    '.permission-card-select:has-text("仅自己可见")',
+    '.d-select:has-text("公开可见")',
+)
+XHS_PRIVATE_VISIBILITY_OPTION_SELECTORS = (
+    '.d-select-option:has-text("仅自己可见")',
+    '[role="option"]:has-text("仅自己可见")',
+    'text=仅自己可见',
+)
+XHS_MORE_SETTINGS_SELECTORS = (
+    '.publish-page-content-settings-header:has-text("更多设置")',
+    'text=更多设置',
+)
 
 
 class XiaoHongShuPublishingError(RuntimeError):
@@ -164,7 +178,7 @@ class XiaoHongShuPatchrightPublisher:
             if report_progress:
                 report_progress("publishing")
             if action == "draft":
-                result = self._save_draft_note(page, payload)
+                result = self._publish_private_note_as_draft(page, payload)
             else:
                 result = self._publish_note(page, payload)
             self._export_storage_state(context, storage_state_path)
@@ -380,13 +394,13 @@ class XiaoHongShuPatchrightPublisher:
 
     def _publish_note(self, page: Any, payload: Mapping[str, Any]) -> PublishResult:
         page.wait_for_timeout(2000)
-        self._click_publish_action(page, "publish")
+        self._click_publish_action(page)
         state = self._trace_publish_after_click_state(page, attempt=1, elapsed_ms=1000, wait_ms=1000)
         if self._should_retry_publish_click(state):
             state = self._trace_publish_after_click_state(page, attempt=1, elapsed_ms=3000, wait_ms=2000)
             if self._should_retry_publish_click(state):
                 self._trace("xhs.publish.retry_click", reason="publish_page_still_idle_after_click")
-                self._click_publish_action(page, "publish")
+                self._click_publish_action(page)
                 self._trace_publish_after_click_state(page, attempt=2, elapsed_ms=1000, wait_ms=1000)
         page.wait_for_url("**/publish/success**", timeout=60000)
         success_url = self._current_url(page)
@@ -396,35 +410,66 @@ class XiaoHongShuPatchrightPublisher:
         self._trace("xhs.publish.success_url", url=success_url)
         return self._publish_result(success_url, payload)
 
-    def _save_draft_note(self, page: Any, payload: Mapping[str, Any]) -> PublishResult:
-        page.wait_for_timeout(2000)
-        self._click_publish_action(page, "draft")
-        page.wait_for_function(
-            "() => !location.pathname.includes('/publish/publish')",
-            timeout=60000,
-        )
-        draft_url = self._current_url(page)
-        parsed = urllib.parse.urlparse(draft_url)
-        if parsed.hostname == XHS_CREATOR_HOST and parsed.path == XHS_PUBLISH_PATH:
-            raise XiaoHongShuPublishingError("小红书暂存离开后未确认草稿保存")
-        self._trace("xhs.draft.saved_confirmed", url=draft_url)
-        return self._draft_result(draft_url, payload)
+    def _publish_private_note_as_draft(self, page: Any, payload: Mapping[str, Any]) -> PublishResult:
+        self._set_private_visibility(page)
+        success_url = self._submit_private_visibility_draft_note(page)
+        self._trace("xhs.draft.private_publish_success_url", url=success_url)
+        return self._private_visibility_draft_result(success_url, payload)
 
-    def _click_publish_action(self, page: Any, action: str) -> None:
-        if action == "publish":
-            text = "发布"
-            trace_prefix = "xhs.publish"
-            button_selector = XHS_PUBLISH_BUTTON_SELECTOR
-            host_selector = XHS_PUBLISH_HOST_SELECTOR
-            host_x_ratio = 0.75
-        elif action == "draft":
-            text = "暂存离开"
-            trace_prefix = "xhs.draft"
-            button_selector = XHS_DRAFT_BUTTON_SELECTOR
-            host_selector = XHS_DRAFT_HOST_SELECTOR
-            host_x_ratio = 0.25
-        else:
-            raise XiaoHongShuPublishingError(f"小红书发布动作不支持：{action}")
+    def _submit_private_visibility_draft_note(self, page: Any) -> str:
+        page.wait_for_timeout(2000)
+        self._click_publish_action(page)
+        state = self._trace_publish_after_click_state(page, attempt=1, elapsed_ms=1000, wait_ms=1000)
+        if self._should_retry_publish_click(state):
+            state = self._trace_publish_after_click_state(page, attempt=1, elapsed_ms=3000, wait_ms=2000)
+            if self._should_retry_publish_click(state):
+                self._trace("xhs.publish.retry_click", reason="publish_page_still_idle_after_click")
+                self._click_publish_action(page)
+                self._trace_publish_after_click_state(page, attempt=2, elapsed_ms=1000, wait_ms=1000)
+        page.wait_for_url("**/publish/success**", timeout=60000)
+        success_url = self._current_url(page)
+        parsed = urllib.parse.urlparse(success_url)
+        if parsed.hostname != XHS_CREATOR_HOST or parsed.path != XHS_SUCCESS_PATH:
+            raise XiaoHongShuPublishingError("小红书发布后未进入成功页")
+        return success_url
+
+    def _set_private_visibility(self, page: Any) -> None:
+        self._trace("xhs.draft.visibility_start")
+        self._ensure_more_settings_open(page)
+        visibility_select = self._first_existing_locator(page, XHS_VISIBILITY_SELECT_SELECTORS)
+        scroll = getattr(visibility_select, "scroll_into_view_if_needed", None)
+        if callable(scroll):
+            with _suppress_exceptions():
+                scroll(timeout=10000)
+        visibility_select.wait_for(state="visible", timeout=30000)
+        visibility_select.click()
+        private_option = self._first_existing_locator(page, XHS_PRIVATE_VISIBILITY_OPTION_SELECTORS)
+        private_option.wait_for(state="visible", timeout=10000)
+        private_option.click()
+        page.wait_for_function(
+            "() => (document.body.innerText || document.body.textContent || '').includes('仅自己可见')",
+            timeout=10000,
+        )
+        self._trace("xhs.draft.visibility_selected", visibility="仅自己可见")
+
+    def _ensure_more_settings_open(self, page: Any) -> None:
+        if self._has_existing_locator(page, XHS_VISIBILITY_SELECT_SELECTORS):
+            return
+        more_settings = self._first_existing_locator(page, XHS_MORE_SETTINGS_SELECTORS)
+        scroll = getattr(more_settings, "scroll_into_view_if_needed", None)
+        if callable(scroll):
+            with _suppress_exceptions():
+                scroll(timeout=10000)
+        more_settings.wait_for(state="visible", timeout=10000)
+        more_settings.click()
+        self._trace("xhs.draft.more_settings_opened")
+
+    def _click_publish_action(self, page: Any) -> None:
+        text = "发布"
+        trace_prefix = "xhs.publish"
+        button_selector = XHS_PUBLISH_BUTTON_SELECTOR
+        host_selector = XHS_PUBLISH_HOST_SELECTOR
+        host_x_ratio = 0.75
 
         if self._click_publish_host(page, host_selector, host_x_ratio, trace_prefix, text):
             return
@@ -783,23 +828,23 @@ class XiaoHongShuPatchrightPublisher:
         )
 
     @staticmethod
-    def _draft_result(draft_url: str, payload: Mapping[str, Any]) -> PublishResult:
+    def _private_visibility_draft_result(success_url: str, payload: Mapping[str, Any]) -> PublishResult:
         title = str(payload.get("title") or "").strip()
-        receipt_id = "xhs-draft-" + hashlib.sha256(f"{draft_url}\n{title}".encode("utf-8")).hexdigest()[:16]
+        receipt_id = "xhs-private-" + hashlib.sha256(f"{success_url}\n{title}".encode("utf-8")).hexdigest()[:16]
         return PublishResult(
             status="platform_draft",
             platform_draft_id=receipt_id,
-            platform_url=draft_url,
+            platform_url=success_url,
             response={
                 "source": "xiaohongshu_platform",
-                "event": "draft_created",
+                "event": "private_note_published",
                 "receipt_id": receipt_id,
                 "title": title,
-                "corroboration": "draft_saved",
+                "visibility": "private",
+                "corroboration": "private_visibility_publish_success",
                 "delivery_status": "platform_draft",
             },
         )
-
 
 class _suppress_exceptions:
     def __enter__(self) -> None:
