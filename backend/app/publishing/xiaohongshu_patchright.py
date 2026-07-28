@@ -381,6 +381,13 @@ class XiaoHongShuPatchrightPublisher:
     def _publish_note(self, page: Any, payload: Mapping[str, Any]) -> PublishResult:
         page.wait_for_timeout(2000)
         self._click_publish_action(page, "publish")
+        state = self._trace_publish_after_click_state(page, attempt=1, elapsed_ms=1000, wait_ms=1000)
+        if self._should_retry_publish_click(state):
+            state = self._trace_publish_after_click_state(page, attempt=1, elapsed_ms=3000, wait_ms=2000)
+            if self._should_retry_publish_click(state):
+                self._trace("xhs.publish.retry_click", reason="publish_page_still_idle_after_click")
+                self._click_publish_action(page, "publish")
+                self._trace_publish_after_click_state(page, attempt=2, elapsed_ms=1000, wait_ms=1000)
         page.wait_for_url("**/publish/success**", timeout=60000)
         success_url = self._current_url(page)
         parsed = urllib.parse.urlparse(success_url)
@@ -419,28 +426,146 @@ class XiaoHongShuPatchrightPublisher:
         else:
             raise XiaoHongShuPublishingError(f"小红书发布动作不支持：{action}")
 
-        button = page.locator(button_selector).last
-        if self._locator_count(page, button_selector) > 0:
-            button.wait_for(state="visible", timeout=30000)
-            self._trace(f"{trace_prefix}.locator_found", button_text=text, selector=button_selector)
-            button.click()
-            self._trace(f"{trace_prefix}.locator_clicked", button_text=text, selector=button_selector)
+        if self._click_publish_host(page, host_selector, host_x_ratio, trace_prefix, text):
             return
+        if self._click_plain_publish_button(page, button_selector, trace_prefix, text):
+            return
+        if self._click_publish_host(page, host_selector, host_x_ratio, trace_prefix, text):
+            return
+        raise XiaoHongShuPublishingError(f"小红书页面未找到{text}按钮")
 
-        host = page.locator(host_selector).last
-        if self._locator_count(page, host_selector) <= 0:
-            raise XiaoHongShuPublishingError(f"小红书页面未找到{text}按钮")
+    def _click_plain_publish_button(
+        self, page: Any, selector: str, trace_prefix: str, text: str
+    ) -> bool:
+        if self._locator_count(page, selector) <= 0:
+            return False
+        button = page.locator(selector).last
+        try:
+            button.wait_for(state="visible", timeout=2000)
+        except Exception as exc:
+            self._trace(
+                f"{trace_prefix}.locator_unavailable",
+                button_text=text,
+                selector=selector,
+                error=str(exc),
+            )
+            return False
+        self._trace(f"{trace_prefix}.locator_found", button_text=text, selector=selector)
+        button.click()
+        self._trace(f"{trace_prefix}.locator_clicked", button_text=text, selector=selector)
+        return True
+
+    def _click_publish_host(
+        self,
+        page: Any,
+        selector: str,
+        x_ratio: float,
+        trace_prefix: str,
+        text: str,
+    ) -> bool:
+        if self._locator_count(page, selector) <= 0:
+            return False
+        host = page.locator(selector).last
         host.wait_for(state="visible", timeout=30000)
-        position = self._publish_host_click_position(host, host_x_ratio)
-        self._trace(f"{trace_prefix}.host_found", button_text=text, selector=host_selector)
+        state = self._publish_host_state(host)
+        self._trace(
+            f"{trace_prefix}.host_state",
+            button_text=text,
+            selector=selector,
+            **state,
+        )
+        if text == "发布":
+            if state.get("submit_disabled") == "true" or state.get("submit_loading") == "true":
+                raise XiaoHongShuPublishingError("小红书发布按钮不可用")
+        elif state.get("save_disabled") == "true":
+            raise XiaoHongShuPublishingError("小红书暂存按钮不可用")
+        position = self._publish_host_click_position(host, x_ratio)
+        self._trace(f"{trace_prefix}.host_found", button_text=text, selector=selector)
         host.click(position=position)
         self._trace(
             f"{trace_prefix}.host_clicked",
             button_text=text,
-            selector=host_selector,
+            selector=selector,
             position_x=int(position["x"]),
             position_y=int(position["y"]),
         )
+        return True
+
+    def _trace_publish_after_click_state(
+        self,
+        page: Any,
+        *,
+        attempt: int,
+        elapsed_ms: int,
+        wait_ms: int,
+    ) -> dict[str, Any]:
+        page.wait_for_timeout(wait_ms)
+        state: dict[str, Any] = {"ok": True, "url": self._current_url(page)}
+        with _suppress_exceptions():
+            evaluated = page.evaluate(self._monitor_expression())
+            if isinstance(evaluated, Mapping):
+                state.update(evaluated)
+        self._trace(
+            "xhs.publish.after_click_state",
+            attempt=attempt,
+            elapsed_ms=elapsed_ms,
+            state=state,
+        )
+        return state
+
+    @staticmethod
+    def _should_retry_publish_click(state: Mapping[str, Any]) -> bool:
+        parsed = urllib.parse.urlparse(str(state.get("url") or ""))
+        if parsed.hostname != XHS_CREATOR_HOST or parsed.path != XHS_PUBLISH_PATH:
+            return False
+        controls = state.get("publishControls")
+        if not isinstance(controls, list) or not controls:
+            return False
+        control = next(
+            (
+                item for item in controls
+                if isinstance(item, Mapping) and str(item.get("submitText") or "") == "发布"
+            ),
+            controls[0],
+        )
+        if not isinstance(control, Mapping):
+            return False
+        if str(control.get("submitDisabled") or "").lower() == "true":
+            return False
+        if str(control.get("submitLoading") or "").lower() == "true":
+            return False
+        return True
+
+    @staticmethod
+    def _publish_host_state(locator: Any) -> dict[str, Any]:
+        state = {
+            "submit_disabled": "",
+            "submit_loading": "",
+            "save_disabled": "",
+            "submit_text": "",
+            "save_text": "",
+            "rect": {},
+        }
+        with _suppress_exceptions():
+            getter = getattr(locator, "get_attribute", None)
+            if callable(getter):
+                state["submit_disabled"] = str(getter("submit-disabled") or "")
+                state["submit_loading"] = str(getter("submit-loading") or "")
+                state["save_disabled"] = str(getter("save-disabled") or "")
+                state["submit_text"] = str(getter("submit-text") or "")
+                state["save_text"] = str(getter("save-text") or "")
+        bounding_box = getattr(locator, "bounding_box", None)
+        if callable(bounding_box):
+            with _suppress_exceptions():
+                box = bounding_box()
+                if isinstance(box, Mapping):
+                    state["rect"] = {
+                        "x": int(float(box.get("x") or 0)),
+                        "y": int(float(box.get("y") or 0)),
+                        "width": int(float(box.get("width") or 0)),
+                        "height": int(float(box.get("height") or 0)),
+                    }
+        return state
 
     @staticmethod
     def _publish_host_click_position(locator: Any, x_ratio: float) -> dict[str, float]:
@@ -453,8 +578,10 @@ class XiaoHongShuPatchrightPublisher:
                 if isinstance(box, Mapping):
                     width = float(box.get("width") or width)
                     height = float(box.get("height") or height)
+        direction = 1.0 if x_ratio >= 0.5 else -1.0
+        x = (width * 0.5) + (direction * 72.0)
         return {
-            "x": max(1.0, width * x_ratio),
+            "x": max(1.0, min(width - 1.0, x)),
             "y": max(1.0, height * 0.5),
         }
 
@@ -528,12 +655,30 @@ class XiaoHongShuPatchrightPublisher:
             .filter(visible).slice(0, 80).map((node) => textOf(node).slice(0, 80));
           const publishHosts = [...document.querySelectorAll('xhs-publish-btn[submit-text="发布"]')].filter(visible);
           const draftHosts = [...document.querySelectorAll('xhs-publish-btn[save-text="暂存离开"]')].filter(visible);
+          const publishControls = [...document.querySelectorAll('xhs-publish-btn')]
+            .filter(visible).slice(0, 20).map((node) => {
+              const rect = node.getBoundingClientRect();
+              return {
+                submitText: node.getAttribute('submit-text') || '',
+                saveText: node.getAttribute('save-text') || '',
+                submitDisabled: node.getAttribute('submit-disabled') || '',
+                submitLoading: node.getAttribute('submit-loading') || '',
+                saveDisabled: node.getAttribute('save-disabled') || '',
+                rect: {
+                  x: Math.round(rect.x),
+                  y: Math.round(rect.y),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                },
+              };
+            });
           const editor = document.querySelector('p[data-placeholder*="输入正文描述"], [contenteditable="true"]');
           const noteText = editor ? textOf(editor) : '';
           return {
             publishButtonCount: [...document.querySelectorAll('button')].filter((node) => textOf(node).includes('发布')).length + publishHosts.length,
             draftButtonCount: [...document.querySelectorAll('button')].filter((node) => textOf(node).includes('暂存离开')).length + draftHosts.length,
             visibleButtons: buttons.concat(publishHosts.map(() => '发布')).concat(draftHosts.map(() => '暂存离开')),
+            publishControls,
             noteLength: noteText.length,
             noteOverLimit: noteText.length > 1000,
           };

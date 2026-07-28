@@ -26,6 +26,8 @@ class FakeLocator:
         return self
 
     def count(self):
+        if self.selector.startswith("xhs-publish-btn"):
+            return 0
         return self.count_value
 
     def wait_for(self, **kwargs):
@@ -127,8 +129,8 @@ class UploadEntryLocator(FakeLocator):
             raise TimeoutError("file input is not attached before upload entry click")
         super().wait_for(**kwargs)
 
-    def click(self):
-        super().click()
+    def click(self, **kwargs):
+        super().click(**kwargs)
         if "上传图片" in self.selector or "upload-button" in self.selector:
             self.page.upload_input_available = True
 
@@ -171,6 +173,107 @@ class ClosedShadowPublishPage(FakePage):
     def locator(self, selector):
         self.actions.append(("locator", selector))
         return ClosedShadowPublishLocator(self, selector)
+
+
+class HiddenButtonPublishLocator(ClosedShadowPublishLocator):
+    def count(self):
+        if self.selector.startswith("button:has-text"):
+            return 1
+        return super().count()
+
+    def wait_for(self, **kwargs):
+        if self.selector.startswith("button:has-text"):
+            self.page.actions.append(("wait_for_hidden_button", self.selector, kwargs))
+            raise TimeoutError("internal button is hidden")
+        super().wait_for(**kwargs)
+
+
+class HiddenButtonPublishPage(FakePage):
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return HiddenButtonPublishLocator(self, selector)
+
+
+class HiddenButtonWithoutHostLocator(HiddenButtonPublishLocator):
+    def count(self):
+        if self.selector.startswith("xhs-publish-btn"):
+            return 0
+        return super().count()
+
+
+class HiddenButtonWithoutHostPage(FakePage):
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return HiddenButtonWithoutHostLocator(self, selector)
+
+
+class DisabledPublishHostLocator(ClosedShadowPublishLocator):
+    def get_attribute(self, name):
+        values = {
+            "submit-disabled": "true",
+            "submit-loading": "false",
+            "save-disabled": "false",
+            "submit-text": "发布",
+            "save-text": "暂存离开",
+        }
+        return values.get(name)
+
+
+class DisabledPublishHostPage(FakePage):
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return DisabledPublishHostLocator(self, selector)
+
+
+class IdleFirstPublishLocator(ClosedShadowPublishLocator):
+    def bounding_box(self):
+        if self.selector.startswith("xhs-publish-btn"):
+            return {"x": 248, "y": 617, "width": 680, "height": 90}
+        return None
+
+    def click(self, **kwargs):
+        if kwargs:
+            self.page.actions.append(("locator_click", self.selector, kwargs))
+        else:
+            self.page.actions.append(("locator_click", self.selector))
+        if not self.selector.startswith("xhs-publish-btn"):
+            return
+        self.page.publish_host_clicks += 1
+        if self.page.publish_host_clicks >= 2:
+            self.page.url = "https://creator.xiaohongshu.com/publish/success?note=1"
+
+
+class IdleFirstPublishPage(FakePage):
+    def __init__(self):
+        super().__init__()
+        self.publish_host_clicks = 0
+
+    def locator(self, selector):
+        self.actions.append(("locator", selector))
+        return IdleFirstPublishLocator(self, selector)
+
+    def evaluate(self, expression):
+        self.actions.append(("evaluate", expression))
+        if "location.href" in expression:
+            return self.url
+        if "publishControls" in expression:
+            return {
+                "publishButtonCount": 1,
+                "draftButtonCount": 1,
+                "visibleButtons": ["发布", "暂存离开"],
+                "publishControls": [
+                    {
+                        "submitText": "发布",
+                        "saveText": "暂存离开",
+                        "submitDisabled": "false",
+                        "submitLoading": "false",
+                        "saveDisabled": "false",
+                    }
+                ],
+                "noteLength": len(self.note),
+                "noteOverLimit": False,
+            }
+        return True
 
 
 class FakeContext:
@@ -328,6 +431,106 @@ def test_patchright_publisher_clicks_closed_shadow_draft_host_when_button_is_hid
         for action in page.actions
         if len(action) == 3
     )
+
+
+def test_publish_host_click_position_targets_centered_buttons_on_wide_host():
+    class WideHostLocator:
+        def bounding_box(self):
+            return {"x": 248, "y": 617, "width": 680, "height": 90}
+
+    publish_position = XiaoHongShuPatchrightPublisher._publish_host_click_position(
+        WideHostLocator(),
+        0.75,
+    )
+    draft_position = XiaoHongShuPatchrightPublisher._publish_host_click_position(
+        WideHostLocator(),
+        0.25,
+    )
+
+    assert publish_position == {"x": 412.0, "y": 45.0}
+    assert draft_position == {"x": 268.0, "y": 45.0}
+
+
+def test_patchright_publisher_falls_back_to_host_when_internal_publish_button_is_hidden(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = HiddenButtonPublishPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "publish")
+
+    assert result.status == "published"
+    assert not any(action[0] == "wait_for_hidden_button" for action in page.actions)
+    assert any(
+        action[0] == "locator_click"
+        and action[1] == 'xhs-publish-btn[submit-text="发布"]'
+        for action in page.actions
+        if len(action) == 3
+    )
+
+
+def test_patchright_publisher_short_waits_internal_button_when_host_is_absent(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = HiddenButtonWithoutHostPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    with pytest.raises(XiaoHongShuPublishingError, match="未找到发布按钮"):
+        make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "publish")
+
+    assert ("wait_for_hidden_button", 'button:has-text("发布")', {"state": "visible", "timeout": 2000}) in page.actions
+    assert ("wait_for_hidden_button", 'button:has-text("发布")', {"state": "visible", "timeout": 30000}) not in page.actions
+
+
+def test_patchright_publisher_rejects_disabled_publish_host(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = DisabledPublishHostPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    with pytest.raises(XiaoHongShuPublishingError, match="发布按钮不可用"):
+        make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "publish")
+
+    assert not any(
+        action[0] == "locator_click"
+        and action[1] == 'xhs-publish-btn[submit-text="发布"]'
+        for action in page.actions
+    )
+
+
+def test_patchright_publisher_retries_publish_host_when_page_stays_idle_after_click(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    page = IdleFirstPublishPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).publish(fake_payload(image), fake_account(profile), "publish")
+
+    assert result.status == "published"
+    publish_clicks = [
+        action for action in page.actions
+        if action[0] == "locator_click"
+        and action[1] == 'xhs-publish-btn[submit-text="发布"]'
+    ]
+    assert len(publish_clicks) == 2
+
+
+def test_xiaohongshu_monitor_expression_includes_publish_control_state():
+    expression = XiaoHongShuPatchrightPublisher._monitor_expression()
+
+    assert "publishControls" in expression
+    assert "xhs-publish-btn" in expression
+    assert "submit-disabled" in expression
+    assert "submit-loading" in expression
+    assert "save-disabled" in expression
 
 
 def test_patchright_publisher_prefers_storage_state_context_over_persistent_profile(tmp_path: Path):
