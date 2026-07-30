@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -9,6 +10,7 @@ from .models import PublishAction, PublishResult
 
 
 XHS_IMAGE_PUBLISH_URL = "https://creator.xiaohongshu.com/publish/publish?from=homepage&target=image"
+XHS_CREATOR_HOME_URL = "https://creator.xiaohongshu.com/new/home"
 XHS_CREATOR_HOST = "creator.xiaohongshu.com"
 XHS_PUBLISH_PATH = "/publish/publish"
 XHS_SUCCESS_PATH = "/publish/success"
@@ -60,6 +62,27 @@ def _start_patchright() -> Any:
     except ModuleNotFoundError:
         from playwright.sync_api import sync_playwright
     return sync_playwright().start()
+
+
+def _parse_metric_number(value: str | int | float | None) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    raw = str(value).strip().replace(",", "")
+    if not raw:
+        return 0
+    multiplier = 1
+    if raw[-1:] == "万":
+        multiplier = 10000
+        raw = raw[:-1]
+    elif raw[-1:].lower() == "k":
+        multiplier = 1000
+        raw = raw[:-1]
+    try:
+        return max(0, int(float(raw) * multiplier))
+    except ValueError:
+        return 0
 
 
 class XiaoHongShuPatchrightPublisher:
@@ -144,6 +167,65 @@ class XiaoHongShuPatchrightPublisher:
                 with _suppress_exceptions():
                     playwright.stop()
 
+    def sync_account_data(self, account: Mapping[str, Any]) -> dict[str, Any]:
+        profile_path = self._profile_path(account)
+        storage_state_path = self._storage_state_path(account)
+        playwright = None
+        context = None
+        page = None
+        try:
+            playwright = self.playwright_factory()
+            self._trace("xhs.account_sync.launch")
+            context = self._launch_context(playwright, profile_path, storage_state_path)
+            self._close_previous_publish_pages(context)
+            page = context.new_page()
+            page.goto(XHS_CREATOR_HOME_URL, wait_until="domcontentloaded", timeout=60000)
+            self._trace("xhs.account_sync.goto_home", url=self._current_url(page))
+            self._require_authenticated(context, page)
+            page.wait_for_timeout(3000)
+            payload = self._collect_account_sync_payload(page)
+            text = str(payload.get("text") or "")
+            works = [
+                self._normalize_sync_work(work)
+                for work in payload.get("works") or []
+                if str(work.get("title") or "").strip()
+            ]
+            metrics = self._extract_account_metrics(text, works)
+            if not any(int(value or 0) for value in metrics.values()) and not works:
+                raise XiaoHongShuPublishingError("小红书账号页面未返回可同步数据")
+            self._trace(
+                "xhs.account_sync.metrics_collected",
+                metrics_keys=[key for key, value in metrics.items() if int(value or 0) > 0],
+                works_count=len(works),
+            )
+            return {
+                "source": "patchright",
+                "account_name": str(account.get("name") or payload.get("accountName") or "").strip(),
+                "external_id": str(account.get("external_id") or "").strip(),
+                "metrics": metrics,
+                "works": works,
+            }
+        except XiaoHongShuPublishingError:
+            if page is not None:
+                self._capture_failure_snapshot(page, "xiaohongshu_account_sync_error")
+            raise
+        except Exception as exc:
+            if page is not None:
+                self._capture_failure_snapshot(page, "xiaohongshu_account_sync_unexpected_error")
+            raise XiaoHongShuPublishingError(f"小红书账号数据同步失败：{exc}") from exc
+        finally:
+            if context is not None:
+                self._close_publish_pages(context)
+                with _suppress_exceptions():
+                    context.close()
+                browser = getattr(context, "_xhs_browser", None)
+                if browser is not None:
+                    with _suppress_exceptions():
+                        browser.close()
+            if playwright is not None:
+                with _suppress_exceptions():
+                    playwright.stop()
+
     def _publish(
         self,
         payload: dict[str, Any],
@@ -213,24 +295,42 @@ class XiaoHongShuPatchrightPublisher:
         launcher = getattr(playwright, "chromium", None)
         if launcher is None:
             raise XiaoHongShuPublishingError("Patchright 未提供 chromium 浏览器")
-        if storage_state_path is not None:
-            browser = launcher.launch(
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = browser.new_context(
-                storage_state=str(storage_state_path),
-                viewport={"width": 1200, "height": 707},
-            )
-            with _suppress_exceptions():
-                setattr(context, "_xhs_browser", browser)
-            return context
-        return launcher.launch_persistent_context(
+        if storage_state_path is not None and storage_state_path.is_file():
+            browser = None
+            try:
+                browser = launcher.launch(
+                    headless=False,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                context = browser.new_context(
+                    storage_state=str(storage_state_path),
+                    viewport={"width": 1200, "height": 707},
+                )
+                with _suppress_exceptions():
+                    setattr(context, "_xhs_browser", browser)
+                self._trace(
+                    "xhs.patchright.context_launch",
+                    auth_state_source="storage_state",
+                    storage_state_exists=True,
+                )
+                return context
+            except Exception as exc:
+                if browser is not None:
+                    with _suppress_exceptions():
+                        browser.close()
+                self._trace(
+                    "xhs.patchright.context_launch_fallback",
+                    auth_state_source="persistent_profile",
+                    reason=str(exc),
+                )
+        context = launcher.launch_persistent_context(
             user_data_dir=str(profile_path),
             headless=False,
             viewport={"width": 1200, "height": 707},
             args=["--disable-blink-features=AutomationControlled"],
         )
+        self._trace("xhs.patchright.context_launch", auth_state_source="persistent_profile")
+        return context
 
     def _require_authenticated(self, context: Any, page: Any) -> None:
         cookie_names = {
@@ -308,6 +408,103 @@ class XiaoHongShuPatchrightPublisher:
             int(state.get("upload_input_count") or 0) > 0
             or int(state.get("upload_entry_count") or 0) > 0
         )
+
+    @staticmethod
+    def _collect_account_sync_payload(page: Any) -> dict[str, Any]:
+        payload = page.evaluate(
+            """
+            () => {
+              const xhsAccountSyncData = true;
+              const textOf = (node) => (node?.innerText || node?.textContent || '').trim();
+              const visible = (node) => {
+                if (!node) return false;
+                const style = getComputedStyle(node);
+                return style.display !== 'none'
+                  && style.visibility !== 'hidden'
+                  && node.getClientRects().length > 0;
+              };
+              const accountSelectors = [
+                '[class*="user"] [class*="name"]',
+                '[class*="account"] [class*="name"]',
+                '[class*="nickname"]',
+                '.name'
+              ];
+              let accountName = '';
+              for (const selector of accountSelectors) {
+                const node = [...document.querySelectorAll(selector)].find(visible);
+                accountName = textOf(node);
+                if (accountName) break;
+              }
+              const cards = [...document.querySelectorAll('a[href*="/note"], a[href*="/explore"], [class*="note"], [class*="work"]')]
+                .filter(visible)
+                .slice(0, 20)
+                .map((node) => {
+                  const link = node.matches?.('a') ? node : node.querySelector?.('a[href]');
+                  const titleNode = node.querySelector?.('[class*="title"], [class*="name"], h1, h2, h3');
+                  return {
+                    title: textOf(titleNode) || textOf(node).split('\\n')[0] || '',
+                    publish_url: link?.href || '',
+                    text: textOf(node),
+                  };
+                })
+                .filter((item) => item.title);
+              return {
+                text: document.body?.innerText || '',
+                accountName,
+                works: cards,
+              };
+            }
+            """
+        )
+        if not isinstance(payload, dict):
+            raise XiaoHongShuPublishingError("小红书账号页面未返回可同步数据")
+        return payload
+
+    @classmethod
+    def _normalize_sync_work(cls, work: Mapping[str, Any]) -> dict[str, Any]:
+        text = str(work.get("text") or "")
+        return {
+            "title": str(work.get("title") or "").strip(),
+            "content_type": "图文",
+            "status": "已发布",
+            "publish_url": str(work.get("publish_url") or ""),
+            "published_at": "",
+            "reads": cls._metric_after_label(text, "阅读量", "观看数", "播放量"),
+            "recommends": cls._metric_after_label(text, "曝光数", "推荐数"),
+            "likes": cls._metric_after_label(text, "获赞", "点赞数", "点赞"),
+            "comments": cls._metric_after_label(text, "评论数", "评论"),
+            "shares": cls._metric_after_label(text, "分享数", "分享"),
+            "favorites": cls._metric_after_label(text, "收藏数", "收藏"),
+        }
+
+    @classmethod
+    def _extract_account_metrics(
+        cls, text: str, works: list[dict[str, Any]]
+    ) -> dict[str, int]:
+        totals = {
+            key: sum(int(work.get(key) or 0) for work in works)
+            for key in ("reads", "recommends", "likes", "comments", "shares", "favorites")
+        }
+        return {
+            "fans": cls._metric_after_label(text, "粉丝", "粉丝数"),
+            "reads": cls._metric_after_label(text, "阅读量", "观看数", "播放量") or totals["reads"],
+            "recommends": cls._metric_after_label(text, "曝光数", "推荐数") or totals["recommends"],
+            "likes": cls._metric_after_label(text, "获赞", "点赞数", "点赞") or totals["likes"],
+            "comments": cls._metric_after_label(text, "评论数", "评论") or totals["comments"],
+            "shares": cls._metric_after_label(text, "分享数", "分享") or totals["shares"],
+            "favorites": cls._metric_after_label(text, "收藏数", "收藏") or totals["favorites"],
+        }
+
+    @staticmethod
+    def _metric_after_label(text: str, *labels: str) -> int:
+        for label in labels:
+            match = re.search(
+                rf"{re.escape(label)}\s*[:：]?\s*([0-9][0-9,]*(?:\.[0-9]+)?\s*[万kK]?)",
+                text,
+            )
+            if match:
+                return _parse_metric_number(match.group(1))
+        return 0
 
     def _count_selectors(self, page: Any, selectors: tuple[str, ...]) -> int:
         return sum(self._locator_count(page, selector) for selector in selectors)

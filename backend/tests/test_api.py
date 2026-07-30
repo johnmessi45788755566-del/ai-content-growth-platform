@@ -205,6 +205,16 @@ class XhsPreflightDetailFailingPublisher(FakeMultiPlatformPublisher):
         raise RuntimeError("Patchright 启动失败：Profile 被占用")
 
 
+class XhsTransientFailingPublisher(FakeMultiPlatformPublisher):
+    def publish(self, payload, account, action):
+        if account["platform"] == "小红书":
+            self.calls.append((payload, account, action))
+            raise RuntimeError(
+                "小红书发布页登录态未通过，请重新扫码登录：Page.goto: net::ERR_CONNECTION_CLOSED"
+            )
+        return super().publish(payload, account, action)
+
+
 class FailingPlatformPublisher:
     def publish(self, payload, account, action):
         raise RuntimeError("微信接口错误 40164：IP 不在白名单")
@@ -2662,7 +2672,7 @@ def test_xiaohongshu_offline_matrix_status_recovers_after_publish_preflight(tmp_
 
     assert executed["status"] == "已发布"
     assert account["login_status"] == "在线"
-    assert account["sync_status"] == "待同步"
+    assert account["sync_status"] == "已同步"
     assert account["sync_error"] == ""
     assert publisher.verify_accounts[0]["id"] == xhs_id
 
@@ -2722,6 +2732,95 @@ def test_xiaohongshu_offline_preflight_failure_keeps_diagnostic_reason(tmp_path:
     assert [record["event"] for record in records] == ["preflight_start", "preflight_failed"]
     assert records[-1]["profile_suffix"] == "-profile"
     assert records[-1]["error"] == "Patchright 启动失败：Profile 被占用"
+
+
+def test_xiaohongshu_transient_publish_failure_does_not_mark_account_offline(tmp_path: Path):
+    publisher = XhsTransientFailingPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=publisher,
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    xhs_id = add_authorized_account(app.state.content_service, "找房子的派大星", platform="小红书")
+    app.state.content_service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '在线', sync_status = '已同步', sync_error = '',
+            last_sync_at = '2026-07-14 08:00:00'
+        WHERE id = ?
+        """,
+        (xhs_id,),
+    )
+    task = client.post(
+        "/api/tasks",
+        json={
+            "platform": "小红书",
+            "account_id": xhs_id,
+            "account_name": "找房子的派大星",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "小红书图文生成",
+            "topic": "网络瞬断不应要求重新扫码",
+            "publish_action": "publish",
+        },
+    ).json()
+
+    executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    account = client.get(f"/api/accounts/{xhs_id}").json()
+
+    assert executed["status"] == "失败"
+    assert "ERR_CONNECTION_CLOSED" in executed["failure_reason"]
+    assert account["login_status"] == "在线"
+    assert account["sync_status"] == "已同步"
+    assert account["sync_error"] == ""
+
+
+def test_xiaohongshu_successful_publish_refreshes_account_login_state(tmp_path: Path):
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        platform_publisher=FakeMultiPlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    xhs_id = add_authorized_account(app.state.content_service, "找房子的派大星", platform="小红书")
+    storage_state = tmp_path / "xhs-state.json"
+    storage_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+    app.state.content_service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '在线', sync_status = '同步失败',
+            sync_error = '上一轮页面渲染失败',
+            storage_state_path = ?
+        WHERE id = ?
+        """,
+        (str(storage_state), xhs_id),
+    )
+    task = client.post(
+        "/api/tasks",
+        json={
+            "platform": "小红书",
+            "account_id": xhs_id,
+            "account_name": "找房子的派大星",
+            "execute_time": "2026-07-14 09:30",
+            "task_type": "小红书图文生成",
+            "topic": "成功发布后刷新账号状态",
+            "publish_action": "publish",
+        },
+    ).json()
+
+    executed = app.state.content_service.execute_task(task["id"], datetime(2026, 7, 14, 9, 30))
+    account = client.get(f"/api/accounts/{xhs_id}").json()
+
+    assert executed["status"] == "已发布"
+    assert account["login_status"] == "在线"
+    assert account["sync_status"] == "已同步"
+    assert account["sync_error"] == ""
+    assert account["last_sync_at"]
+    assert account["storage_state_updated_at"]
 
 
 def test_accounts_api_returns_login_status_for_matrix_display(tmp_path: Path):
@@ -2892,17 +2991,99 @@ def test_xiaohongshu_auth_completion_stores_storage_state_without_public_path(tm
     private = service.get_account(account["id"])
 
     assert private["storage_state_path"] == str(storage_state)
+    assert private["login_status"] == "在线"
+    assert private["sync_status"] == "已同步"
+    assert private["sync_error"] == ""
+    assert private["last_sync_at"]
     assert account["has_storage_state"] is True
     assert "storage_state_path" not in account
 
 
-def test_xiaohongshu_account_sync_writes_rows_used_by_analytics(tmp_path: Path):
+def test_sync_due_accounts_skips_xiaohongshu_publish_login_accounts(tmp_path: Path):
+    class FailingSyncBrowserAuthManager(FakeBrowserAuthManager):
+        def sync(self, account):
+            raise AssertionError("小红书不应被后台自动同步")
+
     app = create_app(
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
-        browser_auth_manager=FakeBrowserAuthManager(),
+        browser_auth_manager=FailingSyncBrowserAuthManager(),
         platform_publisher=FakePlatformPublisher(),
+        scheduler_enabled=False,
+    )
+    service = app.state.content_service
+    xhs_id = add_authorized_account(service, "找房子的派大星", platform="小红书")
+    service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '在线', sync_status = '已同步', sync_error = '',
+            last_sync_at = ''
+        WHERE id = ?
+        """,
+        (xhs_id,),
+    )
+
+    result = service.sync_due_accounts(datetime(2026, 7, 29, 10, 0))
+    account = service.get_public_account(xhs_id)
+
+    assert result == {"synced": 0, "failed": 0}
+    assert account["login_status"] == "在线"
+    assert account["sync_status"] == "已同步"
+
+
+def test_xiaohongshu_account_sync_writes_rows_used_by_analytics(tmp_path: Path):
+    class LegacySyncMustNotRun(FakeBrowserAuthManager):
+        def sync(self, account):
+            raise AssertionError("小红书账号同步不应再走旧浏览器同步器")
+
+    class XiaoHongShuReadOnlyPublisher(FakePlatformPublisher):
+        def __init__(self):
+            super().__init__()
+            self.synced_accounts = []
+
+        def verify_login(self, account):
+            return {"verified": True}
+
+        def sync_account_data(self, account):
+            self.synced_accounts.append(account["id"])
+            return {
+                "source": "patchright",
+                "account_name": account["name"],
+                "external_id": account["external_id"],
+                "metrics": {
+                    "fans": 321,
+                    "reads": 654,
+                    "recommends": 21,
+                    "likes": 34,
+                    "comments": 5,
+                    "shares": 8,
+                    "favorites": 13,
+                },
+                "works": [
+                    {
+                        "title": "真实平台作品",
+                        "content_type": "图文",
+                        "status": "已发布",
+                        "publish_url": "https://example.com/real-work",
+                        "published_at": "2026-07-09 12:00",
+                        "reads": 144,
+                        "recommends": 12,
+                        "likes": 9,
+                        "comments": 2,
+                        "shares": 3,
+                        "favorites": 4,
+                    }
+                ],
+            }
+
+    publisher = XiaoHongShuReadOnlyPublisher()
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=LegacySyncMustNotRun(),
+        platform_publisher=publisher,
         scheduler_enabled=False,
     )
     client = TestClient(app)
@@ -2913,6 +3094,9 @@ def test_xiaohongshu_account_sync_writes_rows_used_by_analytics(tmp_path: Path):
     work_rows = client.get("/api/analytics/works", params={"platform": "小红书"}).json()["works"]
 
     assert response.status_code == 200
+    assert response.json()["source"] == "patchright"
+    assert publisher.calls == []
+    assert publisher.synced_accounts == [account_id]
     assert account_rows[0]["account_name"] == "小红书同步账号"
     assert account_rows[0]["fans"] == 321
     assert work_rows[0]["account_name"] == "小红书同步账号"
@@ -2942,17 +3126,51 @@ def test_non_login_sync_failure_keeps_online_login_status(tmp_path: Path):
     assert account["login_status"] == "在线"
 
 
+def test_xiaohongshu_manual_sync_preflight_transient_failure_keeps_online(tmp_path: Path):
+    class TransientPreflightPublisher(FakePlatformPublisher):
+        def sync_account_data(self, account):
+            raise RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED")
+
+    app = create_app(
+        database_path=tmp_path / "content.db",
+        upload_dir=tmp_path / "uploads",
+        ai_client=FakeAIClient(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        platform_publisher=TransientPreflightPublisher(),
+        scheduler_enabled=False,
+    )
+    client = TestClient(app)
+    account_id = add_authorized_account(app.state.content_service, "网络瞬断小红书", platform="小红书")
+    app.state.content_service.db.execute(
+        """
+        UPDATE platform_accounts
+        SET login_status = '在线', sync_status = '已同步', sync_error = ''
+        WHERE id = ?
+        """,
+        (account_id,),
+    )
+
+    response = client.post(f"/api/accounts/{account_id}/sync")
+    account = client.get(f"/api/accounts/{account_id}").json()
+
+    assert response.status_code == 502
+    assert "ERR_CONNECTION_CLOSED" in response.json()["detail"]
+    assert account["login_status"] == "在线"
+    assert account["sync_status"] == "同步失败"
+    assert "ERR_CONNECTION_CLOSED" in account["sync_error"]
+
+
 def test_login_expired_sync_failure_marks_account_offline(tmp_path: Path):
-    class LoginExpiredBrowserAuthManager(FakeBrowserAuthManager):
-        def sync(self, account):
+    class LoginExpiredPublisher(FakePlatformPublisher):
+        def sync_account_data(self, account):
             raise RuntimeError("平台登录态已失效，请重新扫码登录")
 
     app = create_app(
         database_path=tmp_path / "content.db",
         upload_dir=tmp_path / "uploads",
         ai_client=FakeAIClient(),
-        browser_auth_manager=LoginExpiredBrowserAuthManager(),
-        platform_publisher=FakePlatformPublisher(),
+        browser_auth_manager=FakeBrowserAuthManager(),
+        platform_publisher=LoginExpiredPublisher(),
         scheduler_enabled=False,
     )
     client = TestClient(app)
@@ -5125,6 +5343,7 @@ def test_xiaohongshu_task_title_prompt_uses_xiaohongshu_platform_language(tmp_pa
     prompt = ai_client.topic_prompts[-1]
     assert "适合小红书图文笔记的标题建议" in prompt
     assert "适合公众号图文" not in prompt
+    assert "标题不得超过20个字" in prompt
     assert "正文不可超过1000字" in prompt
 
 

@@ -315,6 +315,8 @@ describe('Accounts authentication', () => {
   });
 
   it('syncs one account into analytics data from the matrix row', async () => {
+    const refreshListener = vi.fn();
+    window.addEventListener('analytics-refresh', refreshListener);
     api.accounts.mockResolvedValue({ accounts: [account] });
     api.syncAccount.mockResolvedValue({ synced: true, account });
 
@@ -324,5 +326,8 @@ describe('Accounts authentication', () => {
 
     await screen.findByText('账号数据已同步到数据分析');
     expect(api.syncAccount).toHaveBeenCalledWith(account.id);
+    expect(window.localStorage.getItem('analytics-refresh-at')).toBeTruthy();
+    expect(refreshListener).toHaveBeenCalledTimes(1);
+    window.removeEventListener('analytics-refresh', refreshListener);
   });
 });

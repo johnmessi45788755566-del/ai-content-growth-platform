@@ -110,6 +110,24 @@ class FakePage:
         self.actions.append(("page_close",))
 
 
+class AccountSyncPage(FakePage):
+    def goto(self, url, **kwargs):
+        self.actions.append(("goto", url, kwargs))
+        self.url = url
+
+    def evaluate(self, expression):
+        self.actions.append(("evaluate", expression))
+        if "location.href" in expression:
+            return self.url
+        if "xhsAccountSyncData" in expression:
+            return {
+                "text": "账号：找房子的派大星\n粉丝 321\n阅读量 654\n曝光数 21\n点赞 34\n评论 5\n分享 8\n收藏 13",
+                "accountName": "找房子的派大星",
+                "works": [],
+            }
+        return super().evaluate(expression)
+
+
 class UploadEntryLocator(FakeLocator):
     def count(self):
         if "input" in self.selector and (
@@ -400,8 +418,12 @@ class FakeChromium:
         self.context = context
         self.launch_calls = []
         self.new_context_calls = []
+        self.persistent_error = None
+        self.new_context_error = None
 
     def launch_persistent_context(self, user_data_dir, **kwargs):
+        if self.persistent_error is not None:
+            raise self.persistent_error
         self.launch_calls.append((user_data_dir, kwargs))
         return self.context
 
@@ -410,6 +432,8 @@ class FakeChromium:
         return self
 
     def new_context(self, **kwargs):
+        if self.new_context_error is not None:
+            raise self.new_context_error
         self.new_context_calls.append(kwargs)
         return self.context
 
@@ -476,6 +500,27 @@ def test_patchright_publisher_clicks_publish_with_locator_and_never_cdp_mouse(tm
     assert progress == ["uploading_assets", "filling_content", "publishing"]
     assert playwright.context.closed is True
     assert playwright.stopped is True
+
+
+def test_patchright_publisher_prefers_storage_state_over_persistent_profile(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    storage_state = tmp_path / "storage-state.json"
+    storage_state.write_text('{"cookies":[],"origins":[]}', encoding="utf-8")
+    image = tmp_path / "cover.jpg"
+    image.write_bytes(b"fake")
+    playwright = FakePlaywright()
+
+    result = make_publisher(playwright).publish(
+        fake_payload(image),
+        fake_account(profile, storage_state),
+        "publish",
+    )
+
+    assert result.status == "published"
+    assert playwright.chromium.launch_calls[0][0] == "launch"
+    assert playwright.chromium.new_context_calls[0]["storage_state"] == str(storage_state)
+    assert not any(call[0] == str(profile) for call in playwright.chromium.launch_calls)
 
 
 def test_patchright_publisher_draft_uses_private_visibility_publish_without_save_draft(tmp_path: Path):
@@ -701,7 +746,7 @@ def test_xiaohongshu_monitor_expression_includes_publish_control_state():
     assert "save-disabled" in expression
 
 
-def test_patchright_publisher_prefers_storage_state_context_over_persistent_profile(tmp_path: Path):
+def test_patchright_publisher_falls_back_to_profile_when_storage_state_launch_fails(tmp_path: Path):
     profile = tmp_path / "profile"
     profile.mkdir()
     storage_state = tmp_path / "xhs-state.json"
@@ -709,6 +754,7 @@ def test_patchright_publisher_prefers_storage_state_context_over_persistent_prof
     image = tmp_path / "cover.jpg"
     image.write_bytes(b"fake")
     playwright = FakePlaywright()
+    playwright.chromium.new_context_error = RuntimeError("storage state invalid")
 
     result = make_publisher(playwright).publish(
         fake_payload(image),
@@ -717,8 +763,7 @@ def test_patchright_publisher_prefers_storage_state_context_over_persistent_prof
     )
 
     assert result.status == "platform_draft"
-    assert playwright.chromium.new_context_calls[0]["storage_state"] == str(storage_state)
-    assert not any(call[0] == str(profile) for call in playwright.chromium.launch_calls)
+    assert any(call[0] == str(profile) for call in playwright.chromium.launch_calls)
 
 
 def test_patchright_publisher_uploads_images_with_set_input_files(tmp_path: Path):
@@ -820,6 +865,30 @@ def test_patchright_publisher_accepts_login_cookie_marker_even_when_cookie_value
 
     assert result["verified"] is True
     assert result["platform_url"].startswith("https://creator.xiaohongshu.com/publish/publish")
+
+
+def test_patchright_publisher_sync_account_data_reads_metrics_without_publish_actions(tmp_path: Path):
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    page = AccountSyncPage()
+    playwright = FakePlaywright(FakeContext(page=page))
+
+    result = make_publisher(playwright).sync_account_data(fake_account(profile))
+
+    assert result["source"] == "patchright"
+    assert result["account_name"] == "找房子的派大星"
+    assert result["metrics"] == {
+        "fans": 321,
+        "reads": 654,
+        "recommends": 21,
+        "likes": 34,
+        "comments": 5,
+        "shares": 8,
+        "favorites": 13,
+    }
+    assert ("goto", "https://creator.xiaohongshu.com/new/home", {"wait_until": "domcontentloaded", "timeout": 60000}) in page.actions
+    assert not any(action[0] == "set_input_files" for action in page.actions)
+    assert not any(action[0] == "locator_click" and "发布" in action[1] for action in page.actions)
 
 
 def test_default_router_uses_patchright_xiaohongshu_publisher():

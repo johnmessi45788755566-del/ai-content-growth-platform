@@ -153,6 +153,8 @@ class ContentService:
 
     @staticmethod
     def _login_status_from_sync_error(error: str) -> str:
+        if ContentService._xiaohongshu_failure_is_transient(error):
+            return "在线"
         lowered = error.lower()
         expired_markers = (
             "登录态已失效",
@@ -764,42 +766,51 @@ class ContentService:
                 (normalized_platform, name),
             )
         if existing:
+            xhs_preflight_synced = normalized_platform == "小红书" and publish_preflight_verified
             self.db.execute(
                 """
                 UPDATE platform_accounts
-                SET name = ?, external_id = ?, auth_status = '已授权', monitor_status = '监测中', sync_status = '待同步',
+                SET name = ?, external_id = ?, auth_status = '已授权', monitor_status = '监测中',
+                    sync_status = CASE WHEN ? THEN '已同步' ELSE '待同步' END,
                     sync_error = '', login_status = '在线',
                     auth_method = '真实浏览器扫码', profile_path = ?,
                     storage_state_path = ?, storage_state_updated_at = CASE WHEN ? != '' THEN CURRENT_TIMESTAMP ELSE storage_state_updated_at END,
-                    login_url = ?, updated_at = CURRENT_TIMESTAMP
+                    login_url = ?,
+                    last_sync_at = CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE last_sync_at END,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
                 (
                     name,
                     external_id,
+                    int(xhs_preflight_synced),
                     profile_path,
                     storage_state_path,
                     storage_state_path,
                     login_url,
+                    int(xhs_preflight_synced),
                     existing["id"],
                 ),
             )
             account_id = int(existing["id"])
         else:
+            xhs_preflight_synced = normalized_platform == "小红书" and publish_preflight_verified
             account_id = self.db.execute(
                 """
                 INSERT INTO platform_accounts (
                   platform, name, external_id, owner, tag, auth_status, login_status, monitor_status, sync_status,
                   role, audience, style, taboo, preference, auth_method, profile_path,
-                  storage_state_path, storage_state_updated_at, login_url
+                  storage_state_path, storage_state_updated_at, login_url, last_sync_at
                 )
-                VALUES (?, ?, ?, '未分配', '', '已授权', '在线', '监测中', '待同步', ?, ?, ?, ?, ?,
-                        '真实浏览器扫码', ?, ?, CASE WHEN ? != '' THEN CURRENT_TIMESTAMP ELSE '' END, ?)
+                VALUES (?, ?, ?, '未分配', '', '已授权', '在线', '监测中', ?, ?, ?, ?, ?, ?,
+                        '真实浏览器扫码', ?, ?, CASE WHEN ? != '' THEN CURRENT_TIMESTAMP ELSE '' END, ?,
+                        CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE '' END)
                 """,
                 (
                     normalized_platform,
                     name,
                     external_id,
+                    "已同步" if xhs_preflight_synced else "待同步",
                     _default_role(normalized_platform),
                     _default_audience(normalized_platform),
                     _default_style(normalized_platform),
@@ -809,6 +820,7 @@ class ContentService:
                     storage_state_path,
                     storage_state_path,
                     login_url,
+                    int(xhs_preflight_synced),
                 ),
             )
         if isinstance(sync_data, dict):
@@ -937,11 +949,28 @@ class ContentService:
             )
             try:
                 if account["platform"] == "小红书":
-                    self._verify_xiaohongshu_publish_login(account)
-                data = self.browser_auth_manager.sync(account)
+                    self._trace_xiaohongshu_account_sync(account, "sync_start")
+                    data = self._sync_xiaohongshu_account_data(account)
+                else:
+                    data = self.browser_auth_manager.sync(account)
                 self._persist_account_sync(account_id, data)
+                if account["platform"] == "小红书":
+                    metrics = data.get("metrics") or {}
+                    self._trace_xiaohongshu_account_sync(
+                        account,
+                        "persist_success",
+                        source=str(data.get("source") or ""),
+                        metrics_keys=",".join(
+                            key for key, value in metrics.items() if int(value or 0) > 0
+                        ),
+                        works_count=len(data.get("works") or []),
+                    )
             except Exception as exc:
-                error = str(exc) or "平台数据同步失败"
+                error = self._root_exception_message(exc) or str(exc) or "平台数据同步失败"
+                if account["platform"] == "小红书":
+                    self._trace_xiaohongshu_account_sync(
+                        account, "sync_failed", error=error
+                    )
                 self.db.execute(
                     """
                     UPDATE platform_accounts
@@ -957,6 +986,12 @@ class ContentService:
             "account": self.get_public_account(account_id),
         }
 
+    def _sync_xiaohongshu_account_data(self, account: dict[str, Any]) -> dict[str, Any]:
+        syncer = getattr(self.platform_publisher, "sync_account_data", None)
+        if not callable(syncer):
+            raise RuntimeError("小红书账号同步服务未配置")
+        return syncer(account)
+
     def sync_due_accounts(self, now: datetime | None = None) -> dict[str, Any]:
         today = (now or datetime.now()).date().isoformat()
         accounts = self.db.fetch_all(
@@ -964,6 +999,7 @@ class ContentService:
             SELECT id
             FROM platform_accounts
             WHERE auth_status = '已授权'
+              AND platform != '小红书'
               AND (last_sync_at = '' OR date(last_sync_at) < date(?))
             """,
             (today,),
@@ -2149,6 +2185,7 @@ class ContentService:
         if platform == "小红书":
             platform_instruction = (
                 "请结合主题约束、账号信息和创作要求，给出适合小红书图文笔记的标题建议。"
+                "标题不得超过20个字，这是硬性条件。"
                 "后续正文不可超过1000字，这是硬性条件，标题应适配短笔记表达。"
             )
         else:
@@ -2736,6 +2773,30 @@ class ContentService:
         except Exception:
             return
 
+    def _trace_xiaohongshu_account_sync(
+        self, account: dict[str, Any], event: str, **fields: Any
+    ) -> None:
+        log_dir = self.upload_dir.parent / "logs" / "auth"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "event": event,
+                "platform": "小红书",
+                "account_id": int(account.get("id") or 0),
+                "login_status": str(account.get("login_status") or ""),
+                "sync_status": str(account.get("sync_status") or ""),
+                **{
+                    key: self._redact_account_diagnostic(str(value))
+                    for key, value in fields.items()
+                },
+            }
+            log_path = log_dir / f"xiaohongshu-sync-{datetime.now().strftime('%Y%m%d')}.jsonl"
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception:
+            return
+
     @staticmethod
     def _profile_suffix(profile_path: Any) -> str:
         value = str(profile_path or "").strip()
@@ -2755,6 +2816,22 @@ class ContentService:
             """
             UPDATE platform_accounts
             SET login_status = '在线', sync_status = '待同步', sync_error = '',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (account_id,),
+        )
+
+    def _refresh_xiaohongshu_publish_login_state(self, account_id: int) -> None:
+        self.db.execute(
+            """
+            UPDATE platform_accounts
+            SET login_status = '在线', sync_status = '已同步', sync_error = '',
+                last_sync_at = CURRENT_TIMESTAMP,
+                storage_state_updated_at = CASE
+                    WHEN storage_state_path != '' THEN CURRENT_TIMESTAMP
+                    ELSE storage_state_updated_at
+                END,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,
@@ -3206,7 +3283,7 @@ class ContentService:
         )
 
     def _persist_account_sync(self, account_id: int, data: dict[str, Any]) -> None:
-        if data.get("source") != "browser":
+        if data.get("source") not in {"browser", "patchright"}:
             raise RuntimeError("同步数据来源不是已登录平台")
         account = self.get_account(account_id)
         observed_name = str(data.get("account_name") or "").strip()
@@ -3347,6 +3424,8 @@ class ContentService:
             return
         if job["status"] not in {"platform_draft", "published"}:
             return
+        if job.get("platform") == "小红书":
+            self._refresh_xiaohongshu_publish_login_state(int(job["account_id"]))
         project = self.get_project(int(job["project_id"]))
         account = self.get_account(int(job["account_id"]))
         self._postprocess_publish_package(project, account, job)
@@ -3355,7 +3434,7 @@ class ContentService:
         if job.get("platform") != "小红书":
             return
         reason = str(job.get("failure_reason") or "")
-        if not any(marker in reason for marker in ("登录态失效", "重新扫码", "redirectReason=401", "/login")):
+        if not self._xiaohongshu_failure_means_auth_invalid(reason):
             return
         self.db.execute(
             """
@@ -3366,6 +3445,35 @@ class ContentService:
             """,
             (reason or "小红书登录态失效，请重新扫码登录", int(job["account_id"])),
         )
+
+    @staticmethod
+    def _xiaohongshu_failure_is_transient(reason: str) -> bool:
+        transient_markers = (
+            "ERR_CONNECTION_CLOSED",
+            "ERR_TIMED_OUT",
+            "ERR_NETWORK_CHANGED",
+            "Target page, context or browser has been closed",
+            "waiting for navigation",
+            "Locator.wait_for",
+            "页面未找到",
+            "发布按钮不可用",
+            "Timeout",
+        )
+        return any(marker in reason for marker in transient_markers)
+
+    @staticmethod
+    def _xiaohongshu_failure_means_auth_invalid(reason: str) -> bool:
+        if ContentService._xiaohongshu_failure_is_transient(reason):
+            return False
+        auth_markers = (
+            "登录态失效",
+            "redirectReason=401",
+            "/login",
+            "缺少登录 cookie",
+            "发布页登录态未通过",
+            "重新扫码",
+        )
+        return any(marker in reason for marker in auth_markers)
 
     def _create_work_from_project(
         self,

@@ -65,6 +65,12 @@ class PlatformPublisherRouter:
             return verifier(account)
         return {"verified": True}
 
+    def sync_account_data(self, account: Mapping[str, Any]) -> dict[str, Any]:
+        syncer = getattr(self._publisher(account), "sync_account_data", None)
+        if callable(syncer):
+            return syncer(account)
+        raise RuntimeError(f"{str(account.get('platform') or '未知平台')}暂未接入账号数据同步")
+
     def bind_confirmation_expiry(self, job_context: Mapping[str, Any], callback: Any) -> None:
         for publisher in self.publishers.values():
             binder = getattr(publisher, "bind_confirmation_expiry", None)

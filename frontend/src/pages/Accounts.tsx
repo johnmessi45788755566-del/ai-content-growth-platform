@@ -164,6 +164,8 @@ export default function Accounts() {
     try {
       await api.syncAccount(account.id);
       await loadAccounts();
+      window.localStorage.setItem('analytics-refresh-at', String(Date.now()));
+      window.dispatchEvent(new Event('analytics-refresh'));
       message.success('账号数据已同步到数据分析');
     } catch (error) {
       message.error(error instanceof Error ? error.message : '同步失败');

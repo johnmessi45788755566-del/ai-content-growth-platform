@@ -1,5 +1,5 @@
 import { Card, Empty, Input, message, Select, Space, Tabs, Table } from 'antd';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { MetricCards, Platform, Status } from '@/components/Common';
 import { api } from '@/services/api';
 import type { AccountAnalyticsRow, WorkAnalyticsRow } from '@/types';
@@ -18,7 +18,7 @@ export default function Analytics() {
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(false);
 
-  async function loadAnalytics() {
+  const loadAnalytics = useCallback(async () => {
     setLoading(true);
     try {
       const params = new URLSearchParams({ range: '30d' });
@@ -35,11 +35,25 @@ export default function Analytics() {
     } finally {
       setLoading(false);
     }
-  }
+  }, [platform, search]);
 
   useEffect(() => {
     loadAnalytics();
   }, [platform]);
+
+  useEffect(() => {
+    function handleRefresh() {
+      void loadAnalytics();
+    }
+
+    window.addEventListener('analytics-refresh', handleRefresh);
+    window.addEventListener('storage', handleRefresh);
+
+    return () => {
+      window.removeEventListener('analytics-refresh', handleRefresh);
+      window.removeEventListener('storage', handleRefresh);
+    };
+  }, [loadAnalytics]);
 
   const summary = useMemo(() => {
     const reads = accountRows.reduce((sum, item) => sum + Number(item.reads || 0), 0);

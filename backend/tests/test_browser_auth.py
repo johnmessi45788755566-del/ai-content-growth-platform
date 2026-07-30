@@ -266,6 +266,85 @@ def test_xiaohongshu_login_uses_patchright_context_instead_of_system_chrome(tmp_
     assert playwright.stopped is True
 
 
+def test_xiaohongshu_login_retries_transient_home_goto_failure(tmp_path, monkeypatch):
+    class Page:
+        def __init__(self):
+            self.url = ""
+            self.goto_calls = []
+
+        def goto(self, url, **kwargs):
+            self.goto_calls.append((url, kwargs))
+            if url == "https://creator.xiaohongshu.com/new/home" and len(self.goto_calls) == 1:
+                raise Exception("Page.goto: net::ERR_CONNECTION_CLOSED")
+            self.url = url
+
+        def wait_for_timeout(self, timeout):
+            return None
+
+        def evaluate(self, expression):
+            return "找房子的派大星" if "document.querySelector" in expression else self.url
+
+    class Context:
+        def __init__(self):
+            self.page = Page()
+            self.closed = False
+
+        def new_page(self):
+            return self.page
+
+        def cookies(self):
+            return [
+                {"name": "access-token-creator.xiaohongshu.com", "value": "token"},
+                {"name": "x-user-id-creator.xiaohongshu.com", "value": "xhs-user-id"},
+            ]
+
+        def close(self):
+            self.closed = True
+
+    class Chromium:
+        def __init__(self, context):
+            self.context = context
+
+        def launch_persistent_context(self, **kwargs):
+            return self.context
+
+    class Playwright:
+        def __init__(self):
+            self.context = Context()
+            self.chromium = Chromium(self.context)
+            self.stopped = False
+
+        def stop(self):
+            self.stopped = True
+
+    class Thread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            self.kwargs["target"](*self.kwargs["args"])
+
+    playwright = Playwright()
+    monkeypatch.setattr(browser_auth.threading, "Thread", Thread)
+    monkeypatch.setattr(browser_auth.time, "sleep", lambda seconds: None)
+    manager = BrowserAuthManager(
+        tmp_path / "profiles",
+        chrome_path=tmp_path / "missing-chrome",
+        xiaohongshu_playwright_factory=lambda: playwright,
+    )
+
+    session = manager.start("小红书", "找房子的派大星", lambda account: {"id": 7, **account})
+
+    assert session["status"] == "success"
+    home_gotos = [
+        call for call in playwright.context.page.goto_calls
+        if call[0] == "https://creator.xiaohongshu.com/new/home"
+    ]
+    assert len(home_gotos) == 2
+    assert playwright.context.closed is True
+    assert playwright.stopped is True
+
+
 def test_xiaohongshu_login_defers_patchright_start_to_worker_thread(tmp_path, monkeypatch):
     class Thread:
         def __init__(self, **kwargs):

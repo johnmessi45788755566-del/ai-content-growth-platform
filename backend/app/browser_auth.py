@@ -238,9 +238,11 @@ class BrowserAuthManager:
                 viewport={"width": 1200, "height": 707},
                 args=["--disable-blink-features=AutomationControlled"],
             )
+            self._trace_xiaohongshu_auth(session, "context_launched")
             page = context.new_page()
+            self._trace_xiaohongshu_auth(session, "page_created")
             login_url = PLATFORM_LOGIN_URLS[platform]
-            page.goto(login_url, wait_until="domcontentloaded", timeout=60000)
+            login_url = self._open_xiaohongshu_login_page(session, page, login_url)
             cancelled = False
             with self._lock:
                 session = self.sessions[session_id]
@@ -273,6 +275,64 @@ class BrowserAuthManager:
         except ModuleNotFoundError:
             from playwright.sync_api import sync_playwright
         return sync_playwright().start()
+
+    def _open_xiaohongshu_login_page(self, session: dict[str, Any], page: Any, login_url: str) -> str:
+        attempts = (
+            (login_url, "commit", 20000),
+            (login_url, "domcontentloaded", 30000),
+            (XIAOHONGSHU_IMAGE_PUBLISH_URL, "commit", 20000),
+        )
+        last_error = ""
+        for index, (target_url, wait_until, timeout) in enumerate(attempts, start=1):
+            self._trace_xiaohongshu_auth(
+                session,
+                "login_goto_start",
+                attempt=index,
+                wait_until=wait_until,
+                target=self._public_login_url(target_url),
+            )
+            try:
+                page.goto(target_url, wait_until=wait_until, timeout=timeout)
+                self._trace_xiaohongshu_auth(
+                    session,
+                    "login_goto_success",
+                    attempt=index,
+                    current_url=self._public_login_url(self._patchright_page_url(page) or target_url),
+                )
+                return target_url
+            except TypeError:
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=timeout)
+                    self._trace_xiaohongshu_auth(
+                        session,
+                        "login_goto_success",
+                        attempt=index,
+                        current_url=self._public_login_url(self._patchright_page_url(page) or target_url),
+                    )
+                    return target_url
+                except Exception as exc:
+                    last_error = str(exc)
+            except Exception as exc:
+                last_error = str(exc)
+            page_closed = False
+            is_closed = getattr(page, "is_closed", None)
+            if callable(is_closed):
+                with suppress(Exception):
+                    page_closed = bool(is_closed())
+            self._trace_xiaohongshu_auth(
+                session,
+                "login_goto_failed",
+                attempt=index,
+                error=last_error,
+                page_closed=page_closed,
+                current_url=self._public_login_url(self._patchright_page_url(page)),
+            )
+            if index < len(attempts) and not page_closed:
+                self._trace_xiaohongshu_auth(session, "login_goto_retry", next_attempt=index + 1)
+                time.sleep(2)
+                continue
+            break
+        raise RuntimeError(last_error or "小红书登录页打开失败")
 
     def sync(self, account: dict[str, Any]) -> dict[str, Any]:
         platform = str(account.get("platform") or "")
